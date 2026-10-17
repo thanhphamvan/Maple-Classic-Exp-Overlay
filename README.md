@@ -223,6 +223,10 @@ py -3 -m pip install -r requirements.txt
 run.bat
 ```
 
+**On macOS** (from source only, with the game running through CrossOver, Whisky, Parallels or a game stream): `brew install tesseract`, then `python3 -m pip install -r requirements.txt` and `python3 maple_exp.py`. The first time, allow your Terminal (or Python) in **System Settings > Privacy & Security > Screen Recording**, then start it again. The window is found by "MapleStory" in its title; if it isn't, use **Select area**. Hotkeys aren't available on macOS yet.
+
+Everything that differs between Windows and macOS (finding the game window, screen scaling, hotkeys, the one-copy-at-a-time lock) is in `platforms/`: one `Platform` interface in `base.py`, one implementation per OS, and `create_platform()` picks the one for the OS it's on.
+
 **Build the download** (puts `Maple-Classic-Exp-Overlay-v<version>.zip` in `release/`, and a copy to use right away in the project folder: `Maple Classic Exp Overlay.exe` with its `_internal` folder):
 
 ```
@@ -233,13 +237,29 @@ py -3 build.py
 **Run the tests:**
 
 ```
+py -3 tests/run_all.py            (all of them; or one at a time:)
 py -3 tests/test_logic.py
 py -3 tests/test_screen.py
+py -3 tests/test_pipeline.py
+py -3 tests/test_ocr.py
+```
+
+`test_pipeline.py` runs the whole reading pipeline, from the game window to EXP/hr, on any OS with no game: `tests/harness/` stands in for the OS (`FakePlatform`, the same `Platform` interface the real ones have), the screen (`FakeScreen`, in place of mss) and the clock (`FakeClock`). The game window is put together from the real crops in `tests/frames/` at three UI sizes (`Scene(gh=7).exp(68681, 71.76).inventory().party(3)`), and `Pipeline` feeds each reading to the trackers as the app does.
+
+Character recognition is in `ocr/`, apart from the readers that use it: a `GlyphMatcher` says which character of the game's font is at a spot (`TemplateMatcher`, from examples like `assets/digits.npz`), and a `TextOCR` reads a line of text (`TesseractOCR`, or `NoTextOCR` without Tesseract; `create_text_ocr()` picks one, and `MAPLE_EXP_OCR=none` turns it off). The readers in `maple_exp.py` (EXP bar, mesos, map name, class) are handed one, and decide where to look and what to believe. `test_ocr.py` tests the backends on their own, and each reader with a fake backend (`FakeTextOCR`, `FakeGlyphMatcher`) that gives scripted answers.
+
+**Benchmark** how long each step of reading the screen takes, at each UI size, and how much of a CPU core that is at one poll every 1.5 s:
+
+```
+py -3 bench/bench.py                         (--quick for fewer runs, --only poll for some cases)
+py -3 bench/bench.py --live                  also real screenshots and this OS's window calls
+py -3 bench/bench.py --json before.json      save the results, then after a change:
+py -3 bench/bench.py --compare before.json   fails if a case got 1.5x slower (--threshold to change)
 ```
 
 To build with exactly the packages the releases use: `py -3 -m pip install --require-hashes -r requirements-build.txt`.
 
-GitHub runs the logic tests on every push ([Tests workflow](.github/workflows/tests.yml)). The [Build workflow](.github/workflows/build.yml) builds the download on GitHub (Actions tab, **Build**, **Run workflow**), runs all the tests first, and signs the .exe once code signing is set up. Pushing a version tag also attests the zip and drafts the release with it; releases are only ever made that way.
+GitHub runs the logic and pipeline tests and a quick benchmark on every push ([Tests workflow](.github/workflows/tests.yml)). The [Build workflow](.github/workflows/build.yml) builds the download on GitHub (Actions tab, **Build**, **Run workflow**), runs all the tests first, and signs the .exe once code signing is set up. Pushing a version tag also attests the zip and drafts the release with it; releases are only ever made that way.
 
 **The stats site** is in `server/`: a Cloudflare Pages site with a D1 database (free tier). The page is `server/public/`, the API is `server/src/index.js`. `npm --prefix server install`, then `npm --prefix server run dev` runs it locally, `py -3 server/test_server.py http://localhost:8787` tests it, and `npm --prefix server run deploy` puts it online.
 
@@ -249,8 +269,9 @@ GitHub runs the logic tests on every push ([Tests workflow](.github/workflows/te
 - A reading only counts if the EXP and % agree with how much EXP that level needs, so misreads are ignored.
 - Mesos are read the same way. The mesos box is found by its outline, which also works while the inventory is see-through.
 - The party size is the number of HP bars in the party list.
-- Map names are read with Tesseract.
-- Settings, the log and `errors.log` are saved in `%APPDATA%\MapleEXP` (from its old name, Maple EXP/hr, so updates keep them).
+- Map names and the class are read with Tesseract (`ocr/tesseract.py`), each a few ways (all in one Tesseract run); the most common answer wins.
+- A picture that looks exactly as it did at the last look (the EXP bar or mesos between kills) isn't read again. On macOS, where a screenshot costs the same at any size, each look takes one of the game window and cuts the parts out of it.
+- Settings, the log and `errors.log` are saved in `%APPDATA%\MapleEXP` (`~/Library/Application Support/MapleEXP` on macOS; from its old name, Maple EXP/hr, so updates keep them).
 
 </details>
 

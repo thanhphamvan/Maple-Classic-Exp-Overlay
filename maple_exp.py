@@ -11,20 +11,19 @@ map, level and party size.
 
 It only looks at the screen: it never reads or changes the game's files or memory and
 never sends input to the game. Your settings and log are kept in the MapleEXP folder
-inside %APPDATA% (named after its old name, Maple EXP/hr, so updating keeps them).
+inside %APPDATA% on Windows, ~/Library/Application Support on macOS (named after its old
+name, Maple EXP/hr, so updating keeps them). It runs on Windows and macOS: what differs
+between them is in platforms/.
 """
-import ctypes
 import hashlib
 import hmac
 import json
 import math
 import os
-import platform
 import queue
 import re
 import secrets
 import shutil
-import subprocess
 import sys
 import threading
 import time
@@ -34,7 +33,6 @@ import urllib.parse
 import urllib.request
 import webbrowser
 from collections import Counter, deque, namedtuple
-from ctypes import wintypes
 from datetime import date
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -43,18 +41,19 @@ from tkinter import font as tkfont, messagebox, simpledialog, ttk
 import cv2
 import mss
 import numpy as np
-import pytesseract
 from PIL import Image, ImageDraw, ImageTk
 
-# Use physical pixels so window positions, tkinter and mss screenshots all agree on
-# scaled displays.
-try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(2)
-except Exception:
-    try:
-        ctypes.windll.user32.SetProcessDPIAware()
-    except Exception:
-        pass
+# The overlay's images are small, and it only looks every 1.5 s: spreading each step over
+# every core (OpenCV's default) is a little quicker but costs 15-45% more CPU in all.
+cv2.setNumThreads(1)
+
+from ocr import CANON, NoTextOCR, TemplateMatcher, create_text_ocr, glyph_patch
+from platforms import create_platform, hotkey_text, parse_hotkey
+
+# Everything that differs between Windows and macOS (finding the game window, screen scaling,
+# hotkeys...) is behind this one object: see platforms/.
+PLATFORM = create_platform()
+PLATFORM.setup_process()
 
 VERSION = "0.9.6-beta"
 WINDOW_TITLE = "Maple Classic Exp Overlay"    # the version is shown in Settings
@@ -65,7 +64,7 @@ OLD_TITLES = ("Maple EXP/hr",)               # what versions before 0.9.3 were c
 APP_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 ASSETS = APP_DIR / "assets"
 HOME_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
-DATA_DIR = Path(os.environ.get("MAPLE_EXP_DATA") or Path(os.environ.get("APPDATA") or Path.home()) / "MapleEXP")
+DATA_DIR = Path(os.environ.get("MAPLE_EXP_DATA") or PLATFORM.data_root() / "MapleEXP")
 
 CONFIG_PATH = DATA_DIR / "config.json"
 ERROR_LOG_PATH = DATA_DIR / "errors.log"
@@ -104,9 +103,6 @@ EXP_TABLE = [
     3709829, 3913127, 4127566, 4353756, 4592341, 4844001, 5109452, 5389449, 5684790, 11938059,
     25069923, 52646838, 110558359, 232172553, 487562361, 1023880958, 2150150011, 4515315023, 9482161548,
 ]
-
-tesseract_ok = False        # set in main(); Tesseract is only a fallback
-
 
 # --------------------------------------------------------------------------- files
 
@@ -197,19 +193,8 @@ def find_tesseract():
     """The Tesseract that comes with the download, else an installed one. Never one in the
     folder the overlay happens to be started from (Windows' usual search looks there first,
     so a tesseract.exe someone left in, say, Downloads could be run)."""
-    on_path = [Path(d) / "tesseract.exe" for d in os.environ.get("PATH", "").split(os.pathsep)
-               if d.strip() and os.path.isabs(d.strip())]
-    candidates = [
-        HOME_DIR / "tesseract" / "tesseract.exe",            # comes with the download
-        APP_DIR / "tesseract" / "tesseract.exe",
-        Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe"),
-        Path(r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"),
-        *on_path,
-    ]
-    for path in candidates:
-        if path.is_file():
-            return str(path)
-    return None
+    return next((str(p) for p in PLATFORM.tesseract_candidates(HOME_DIR, APP_DIR)
+                 if p.is_file() and os.access(p, os.X_OK)), None)
 
 
 # --------------------------------------------------------------------------- updates
@@ -267,211 +252,14 @@ def post_runs(install, runs, timeout=15):
 
 # --------------------------------------------------------------------------- hotkeys
 #
-# Shift+1 to 4 by default (changeable in Settings). They're Windows hotkeys, as Discord and
-# OBS use: they work while you play even though the game runs as administrator, and they
-# never touch the game. They're only on while MapleStory or the overlay is the window in
-# front, so other programs can still use those keys (e.g. to type "!").
+# Shift+1 to 4 by default (changeable in Settings). How they're caught is up to the OS
+# (PLATFORM.create_hotkeys); they're only on while MapleStory or the overlay is in front.
 
 HOTKEY_ACTIONS = {"start": "Start / Pause", "reset": "Reset", "skip": "Don't log", "compact": "Compact"}
 DEFAULT_HOTKEYS = {"start": "Shift+1", "reset": "Shift+2", "skip": "Shift+3", "compact": "Shift+4"}
-_HOTKEY_MODS = {"Ctrl": 0x2, "Alt": 0x1, "Shift": 0x4}          # MOD_CONTROL, MOD_ALT, MOD_SHIFT
 
 
-def _key_name(vk):
-    if 0x30 <= vk <= 0x39 or 0x41 <= vk <= 0x5A:
-        return chr(vk)
-    if 0x70 <= vk <= 0x7B:
-        return f"F{vk - 0x6F}"
-    return None
-
-
-def parse_hotkey(text):
-    """'Shift+1' -> (modifiers, virtual key), or None if it isn't a hotkey the overlay takes:
-    Ctrl, Alt and/or Shift with a number or letter, or an F key (with or without them)."""
-    if not isinstance(text, str) or not text:
-        return None
-    *mods, key = text.split("+")
-    if len(set(mods)) != len(mods) or any(m not in _HOTKEY_MODS for m in mods):
-        return None
-    vk = next((v for v in list(range(0x30, 0x3A)) + list(range(0x41, 0x5B)) + list(range(0x70, 0x7C))
-               if _key_name(v) == key), None)
-    if vk is None or (not mods and not key.startswith("F")):     # a plain letter would block typing
-        return None
-    return sum(_HOTKEY_MODS[m] for m in mods), vk
-
-
-def hotkey_text(ctrl, alt, shift, vk):
-    """The name of a key pressed with these modifiers (e.g. 'Shift+1'), or None if it can't be one."""
-    key = _key_name(vk)
-    text = "+".join([m for m, on in (("Ctrl", ctrl), ("Alt", alt), ("Shift", shift)) if on] + [key or "?"])
-    return text if key and parse_hotkey(text) else None
-
-
-class Hotkeys:
-    """Windows hotkeys on their own thread. They're registered only while MapleStory or the
-    overlay is the window in front; on_press(action) is called (from that thread) for each press."""
-
-    def __init__(self, on_press):
-        self.on_press = on_press
-        self.problems = {}                   # action -> why it couldn't be used (e.g. taken)
-        self._wanted, self._paused, self._changed = {}, False, True
-        self._lock = threading.Lock()
-        threading.Thread(target=self._run, daemon=True).start()
-
-    def set(self, keys, on=True):
-        """keys: action -> 'Shift+1' (or '' for off)."""
-        with self._lock:
-            self._wanted = {a: parse_hotkey(k) for a, k in keys.items() if on and parse_hotkey(k)}
-            self._changed = True
-
-    def pause(self, paused):
-        """Off for a moment (e.g. while a new hotkey is being chosen), then back on."""
-        with self._lock:
-            self._paused, self._changed = paused, True
-
-    def in_front(self):
-        hwnd = _GetForegroundWindow()
-        if not hwnd:
-            return False
-        pid = wintypes.DWORD()
-        _GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        if pid.value == os.getpid():
-            return True
-        cls = ctypes.create_unicode_buffer(64)
-        _GetClassName(hwnd, cls, 64)
-        return cls.value == "MapleStoryClass" or _process_name(hwnd) == "maplestory.exe"
-
-    def _run(self):
-        msg, active, was_on = wintypes.MSG(), {}, None    # active: hotkey id -> action
-        self.thread_id = _kernel32.GetCurrentThreadId()
-        _SetTimer(None, 0, 250, None)                     # a WM_TIMER every 250 ms, to check what's in front
-        while _GetMessage(ctypes.byref(msg), None, 0, 0) > 0:
-            if msg.message == 0x0312:                     # WM_HOTKEY
-                action = active.get(msg.wParam)
-                if action:
-                    self.on_press(action)
-            elif msg.message == 0x0113:                   # WM_TIMER
-                try:
-                    on = self.in_front()
-                except Exception:
-                    on = False
-                with self._lock:
-                    changed, wanted, paused, self._changed = self._changed, dict(self._wanted), self._paused, False
-                on = on and not paused
-                if not changed and on == was_on:
-                    continue
-                for hid in active:
-                    _UnregisterHotKey(None, hid)
-                active, was_on = {}, on
-                if on:
-                    for hid, (action, (mods, vk)) in enumerate(wanted.items(), start=1):
-                        if _RegisterHotKey(None, hid, mods | 0x4000, vk):     # MOD_NOREPEAT
-                            active[hid] = action
-                            self.problems.pop(action, None)
-                        else:
-                            self.problems[action] = "used by another program"
-
-
-# --------------------------------------------------------------------------- game window
-
-_user32 = ctypes.WinDLL("user32", use_last_error=True)
-_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-
-
-def _api(fn, restype, *argtypes):
-    fn.restype, fn.argtypes = restype, list(argtypes)
-    return fn
-
-
-_EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-_EnumWindows = _api(_user32.EnumWindows, wintypes.BOOL, _EnumWindowsProc, wintypes.LPARAM)
-_IsWindow = _api(_user32.IsWindow, wintypes.BOOL, wintypes.HWND)
-_IsWindowVisible = _api(_user32.IsWindowVisible, wintypes.BOOL, wintypes.HWND)
-_IsIconic = _api(_user32.IsIconic, wintypes.BOOL, wintypes.HWND)
-_GetClassName = _api(_user32.GetClassNameW, ctypes.c_int, wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
-_GetWindowText = _api(_user32.GetWindowTextW, ctypes.c_int, wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
-_GetClientRect = _api(_user32.GetClientRect, wintypes.BOOL, wintypes.HWND, ctypes.POINTER(wintypes.RECT))
-_ClientToScreen = _api(_user32.ClientToScreen, wintypes.BOOL, wintypes.HWND, ctypes.POINTER(wintypes.POINT))
-_GetWindowThreadProcessId = _api(_user32.GetWindowThreadProcessId, wintypes.DWORD,
-                                 wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
-_OpenProcess = _api(_kernel32.OpenProcess, wintypes.HANDLE, wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
-_QueryFullProcessImageName = _api(_kernel32.QueryFullProcessImageNameW, wintypes.BOOL, wintypes.HANDLE,
-                                  wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD))
-_CloseHandle = _api(_kernel32.CloseHandle, wintypes.BOOL, wintypes.HANDLE)
-_GetAncestor = _api(_user32.GetAncestor, wintypes.HWND, wintypes.HWND, wintypes.UINT)
-_GetWindowRect = _api(_user32.GetWindowRect, wintypes.BOOL, wintypes.HWND, ctypes.POINTER(wintypes.RECT))
-_ShowWindow = _api(_user32.ShowWindow, wintypes.BOOL, wintypes.HWND, ctypes.c_int)
-_SetForegroundWindow = _api(_user32.SetForegroundWindow, wintypes.BOOL, wintypes.HWND)
-_CreateMutex = _api(_kernel32.CreateMutexW, wintypes.HANDLE, wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
-_MonitorFromPoint = _api(_user32.MonitorFromPoint, wintypes.HANDLE, wintypes.POINT, wintypes.DWORD)
-_GetForegroundWindow = _api(_user32.GetForegroundWindow, wintypes.HWND)
-_RegisterHotKey = _api(_user32.RegisterHotKey, wintypes.BOOL, wintypes.HWND, ctypes.c_int, wintypes.UINT,
-                       wintypes.UINT)
-_UnregisterHotKey = _api(_user32.UnregisterHotKey, wintypes.BOOL, wintypes.HWND, ctypes.c_int)
-_SetTimer = _api(_user32.SetTimer, ctypes.c_size_t, wintypes.HWND, ctypes.c_size_t, wintypes.UINT, ctypes.c_void_p)
-_GetMessage = _api(_user32.GetMessageW, wintypes.BOOL, ctypes.POINTER(wintypes.MSG), wintypes.HWND,
-                   wintypes.UINT, wintypes.UINT)
-
-
-def screen_dpi(x, y):
-    """The DPI of the screen at (x, y), or None. Screens can have different Windows scaling
-    (e.g. 200% on a 5K screen and 125% on a 1440p one), so text is sized for each."""
-    try:
-        dx, dy = ctypes.c_uint(), ctypes.c_uint()
-        monitor = _MonitorFromPoint(wintypes.POINT(int(x), int(y)), 2)      # MONITOR_DEFAULTTONEAREST
-        if ctypes.windll.shcore.GetDpiForMonitor(monitor, 0, ctypes.byref(dx), ctypes.byref(dy)) == 0:
-            return dx.value
-    except Exception:
-        pass
-    return None
-
-
-def _process_name(hwnd):
-    pid = wintypes.DWORD()
-    _GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-    handle = _OpenProcess(0x1000, False, pid.value)       # PROCESS_QUERY_LIMITED_INFORMATION
-    if not handle:
-        return ""
-    try:
-        buf = ctypes.create_unicode_buffer(1024)
-        size = wintypes.DWORD(len(buf))
-        ok = _QueryFullProcessImageName(handle, 0, buf, ctypes.byref(size))
-        return os.path.basename(buf.value).lower() if ok else ""
-    finally:
-        _CloseHandle(handle)
-
-
-def client_rect(hwnd):
-    """(left, top, width, height) of the window's game area in screen pixels, or None."""
-    if not _IsWindow(hwnd) or _IsIconic(hwnd):
-        return None
-    r, pt = wintypes.RECT(), wintypes.POINT(0, 0)
-    if not _GetClientRect(hwnd, ctypes.byref(r)) or not _ClientToScreen(hwnd, ctypes.byref(pt)):
-        return None
-    if r.right < 100 or r.bottom < 100:
-        return None
-    return pt.x, pt.y, r.right, r.bottom
-
-
-def find_game_window():
-    """Handle of the MapleStory game window (the biggest, if there are several), or None."""
-    found = []
-
-    def check(hwnd, _):
-        if _IsWindowVisible(hwnd):
-            cls = ctypes.create_unicode_buffer(256)
-            title = ctypes.create_unicode_buffer(256)
-            _GetClassName(hwnd, cls, 256)
-            _GetWindowText(hwnd, title, 256)
-            if cls.value == "MapleStoryClass" or (
-                    "maple" in title.value.lower() and _process_name(hwnd) == "maplestory.exe"):
-                rect = client_rect(hwnd)
-                found.append((rect[2] * rect[3] if rect else 0, hwnd))
-        return True
-
-    _EnumWindows(_EnumWindowsProc(check), 0)
-    return max(found)[1] if found else None
-
+# --------------------------------------------------------------------------- screenshots
 
 def grab(sct, left, top, width, height):
     """Screenshot of a screen rectangle, clipped to the monitors: (bgr, left, top) or None."""
@@ -481,8 +269,15 @@ def grab(sct, left, top, width, height):
     y1 = min(top + height, v["top"] + v["height"])
     if x1 - x0 < 8 or y1 - y0 < 8:
         return None
-    shot = np.array(sct.grab({"left": x0, "top": y0, "width": x1 - x0, "height": y1 - y0}))
-    return np.ascontiguousarray(shot[:, :, :3]), x0, y0
+    shot = np.asarray(sct.grab({"left": x0, "top": y0, "width": x1 - x0, "height": y1 - y0}))    # BGRA
+    return cv2.cvtColor(shot, cv2.COLOR_BGRA2BGR), x0, y0           # (one copy, without the A)
+
+
+
+def _hsv(bgr, hsv=None):
+    """bgr in HSV, or hsv if the caller already has it (a look at the whole window converts
+    its shot once, for everything it looks for there)."""
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV) if hsv is None else hsv
 
 
 # --------------------------------------------------------------------------- reading the bar
@@ -490,15 +285,13 @@ def grab(sct, left, top, width, height):
 # The status bar shows "EXP. 38,849 [61.02%]": white digits and green brackets. The game
 # draws it in a small pixel font scaled up to the window size, so once a digit is rescaled
 # to a standard height it can be recognised by comparing it pixel by pixel with saved
-# examples of each digit (digits.npz).
+# examples of each digit (digits.npz). How a digit is recognised is up to a GlyphMatcher
+# (ocr/): these readers find where the digits are and decide whether to believe them.
 
 Blob = namedtuple("Blob", "i x y w h")
 # cells are digit positions (centre x, width, "digit" or "wide"); V is the brightness image
 Layout = namedtuple("Layout", "gh cy exp pct box V")
 
-CANON = 24                  # digits are compared at this height
-PH, PW = 28, 19             # size of one digit patch at that height
-SHIFT = 3                   # px of wiggle room when lining a digit up with an example
 MIN_SCORE = 0.75            # correlation the best digit needs (true matches score ~0.9+)
 MIN_LEAD = 0.03             # ...and how far ahead of the runner-up it must be
 
@@ -530,7 +323,7 @@ def _cells(blobs, gh):
 
 def find_exp(bgr):
     """Locate the EXP text in a screenshot. Returns a Layout or None."""
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    hsv = _hsv(bgr)
     hue, sat, val = cv2.split(hsv)
     green = (sat >= 90) & (val >= 110) & (hue >= 26) & (hue <= 50)
     white = (sat < 70) & (val >= 140)
@@ -579,59 +372,18 @@ def find_exp(bgr):
     return max((f for f in found if f.cy >= low - 0.5 * f.gh), key=lambda f: f.box[0])
 
 
-def digit_patch(V, cx, cy, gh, shift):
-    """Brightness patch around one digit, rescaled so the digit is CANON px tall."""
-    k = gh / CANON
-    x0 = cx - (PW / 2 + shift) * k
-    y0 = cy - (PH / 2 + shift) * k
-    M = np.float32([[1 / k, 0, -x0 / k], [0, 1 / k, -y0 / k]])
-    return cv2.warpAffine(V, M, (PW + 2 * shift, PH + 2 * shift), flags=cv2.INTER_LINEAR,
-                          borderMode=cv2.BORDER_REPLICATE)
+def _match_all(matcher, lay, cells):
+    """(digit, score, lead) for each digit position of a Layout, from a GlyphMatcher (all at
+    once: much faster than one at a time)."""
+    return matcher.match_many(lay.V, [(c[0], lay.cy, lay.gh) for c in cells])
 
 
-def _unit_rows(a):
-    a = a - a.mean(axis=1, keepdims=True)
-    return a / np.maximum(np.linalg.norm(a, axis=1, keepdims=True), 1e-6)
-
-
-class DigitTemplates:
-    """Example patches of each digit; scores a patch against all of them at once."""
-
-    def __init__(self, examples):
-        labels, rows = [], []
-        for digit, patches in sorted(examples.items()):
-            for p in patches:
-                labels.append(digit)
-                rows.append(np.asarray(p, np.float32).reshape(-1))
-        self.labels = np.array(labels)
-        self.digits = sorted(set(labels))
-        self.mat = _unit_rows(np.stack(rows))
+class DigitTemplates(TemplateMatcher):
+    """The EXP bar's digits: a TemplateMatcher with the examples in assets/digits.npz."""
 
     @classmethod
     def load(cls, path=TEMPLATE_PATH):
-        try:
-            data = np.load(path)
-            if int(data["canon"]) != CANON:
-                return None
-            return cls({k[1:]: data[k] for k in data.files if k.startswith("d")})
-        except Exception:
-            return None
-
-    def scores(self, patch):
-        """Best correlation per digit, trying every small shift of the patch."""
-        windows = np.lib.stride_tricks.sliding_window_view(patch, (PH, PW)).reshape(-1, PH * PW)
-        s = (_unit_rows(windows) @ self.mat.T).max(axis=0)
-        return {d: float(s[self.labels == d].max()) for d in self.digits}
-
-    def match(self, lay, cell):
-        """(digit, score, lead over the runner-up) for one digit position."""
-        best = {}
-        for f in (0.95, 1.0, 1.05):         # allow for small errors in the size estimate
-            for d, s in self.scores(digit_patch(lay.V, cell[0], lay.cy, lay.gh * f, SHIFT)).items():
-                best[d] = max(best.get(d, -1.0), s)
-        ranked = sorted(best.values(), reverse=True)
-        lead = ranked[0] - ranked[1] if len(ranked) > 1 else 1.0
-        return max(best, key=best.get), ranked[0], lead
+        return super().load(path)
 
 
 def _pct_cells(lay):
@@ -640,21 +392,22 @@ def _pct_cells(lay):
 
 
 def _read_digits(tpl, lay, cells):
-    s = ""
-    for cell in cells:
-        if cell[2] != "digit":
-            return None
-        digit, score, lead = tpl.match(lay, cell)
-        if score < MIN_SCORE or lead < MIN_LEAD:
-            return None
-        s += digit
-    return s
+    """The digits at cells as a string, or None if any isn't clearly a digit."""
+    if any(c[2] != "digit" for c in cells):
+        return None
+    got = _match_all(tpl, lay, cells)
+    if any(score < MIN_SCORE or lead < MIN_LEAD for _, score, lead in got):
+        return None
+    return "".join(digit for digit, _, _ in got)
 
 
 def read_layout(tpl, lay):
     """(exp, pct) read with the digit templates, or None if any digit is unclear."""
-    exp_s = _read_digits(tpl, lay, lay.exp)
-    pct_s = _read_digits(tpl, lay, _pct_cells(lay))
+    exp_cells, pct_cells = list(lay.exp), _pct_cells(lay)
+    both = _read_digits(tpl, lay, exp_cells + pct_cells)          # both numbers in one go
+    if both is None:
+        return None
+    exp_s, pct_s = both[:len(exp_cells)], both[len(exp_cells):]
     if not exp_s or not pct_s or not 3 <= len(pct_s) <= 5:
         return None
     if (len(exp_s) > 1 and exp_s[0] == "0") or (len(pct_s) > 3 and pct_s[0] == "0"):
@@ -662,8 +415,8 @@ def read_layout(tpl, lay):
     return int(exp_s), int(pct_s) / 100          # the game always shows 2 decimals
 
 
-def _ocr_cells(bgr, lay, cells):
-    """Tesseract on the area covering cells, two ways. Returns digit strings."""
+def _ocr_pictures(bgr, lay, cells):
+    """The area covering cells as pictures for the text OCR, made two ways."""
     if not cells:
         return []
     g = lay.gh
@@ -677,20 +430,18 @@ def _ocr_cells(bgr, lay, cells):
     white = (((hsv[..., 1] < 70) & (hsv[..., 2] >= 140)) * 255).astype(np.uint8)
     white = cv2.dilate(white, np.ones((3, 3), np.uint8))
     _, bright = cv2.threshold(hsv[..., 2], 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    out = []
-    for mask in (white, bright):
-        img = cv2.copyMakeBorder(255 - mask, 12, 12, 12, 12, cv2.BORDER_CONSTANT, value=255)
-        text = pytesseract.image_to_string(img, config="--psm 7 -c tessedit_char_whitelist=0123456789,.")
-        out.append(re.sub(r"\D", "", text))
-    return out
+    return [cv2.copyMakeBorder(255 - mask, 12, 12, 12, 12, cv2.BORDER_CONSTANT, value=255)
+            for mask in (white, bright)]
 
 
-def tesseract_candidates(bgr, lay):
-    """Fallback: (exp, pct) guesses from Tesseract. The tracker picks one that adds up."""
-    if not tesseract_ok:
+def ocr_candidates(bgr, lay, ocr):
+    """Fallback: (exp, pct) guesses from the text OCR. The tracker picks one that adds up."""
+    if not ocr.available:
         return []
-    exps = {int(s) for s in _ocr_cells(bgr, lay, lay.exp) if s}
-    pcts = {int(s) / 100 for s in _ocr_cells(bgr, lay, _pct_cells(lay))
+    exp_pics, pct_pics = _ocr_pictures(bgr, lay, lay.exp), _ocr_pictures(bgr, lay, _pct_cells(lay))
+    texts = [re.sub(r"\D", "", t) for t in ocr.read_lines(exp_pics + pct_pics, chars="0123456789,.")]  # in one go
+    exps = {int(s) for s in texts[:len(exp_pics)] if s}
+    pcts = {int(s) / 100 for s in texts[len(exp_pics):]
             if 3 <= len(s) <= 5}
     return [(e, p) for e in sorted(exps) for p in sorted(pcts)]
 
@@ -712,15 +463,16 @@ def build_templates(samples, scales=(1.0, 0.75, 0.55, 0.4, 0.3), path=TEMPLATE_P
             if len(exp_cells) != len(exp_t) or len(pct_cells) != len(pct_t):
                 continue
             for cell, ch in zip(exp_cells + pct_cells, exp_t + pct_t):
-                examples.setdefault(ch, []).append(digit_patch(lay.V, cell[0], lay.cy, lay.gh, 0))
-    np.savez(path, canon=CANON, **{f"d{k}": np.stack(v) for k, v in examples.items()})
+                examples.setdefault(ch, []).append(glyph_patch(lay.V, cell[0], lay.cy, lay.gh))
+    TemplateMatcher.save(path, examples)
     return {k: len(v) for k, v in sorted(examples.items())}
 
 
 # --------------------------------------------------------------------------- map name and level
 #
 # The minimap's light-blue info box shows the region and, under it, the map name in white
-# text. It's read with Tesseract a few different ways, and the most common answer wins.
+# text. It's read with the text OCR (ocr/, Tesseract) a few different ways, and the most
+# common answer wins.
 # The level comes from the EXP table: each level needs a different amount of EXP.
 
 def level_for_req(req):
@@ -766,7 +518,7 @@ def _clean_job(text):
     return t if len(t) >= 3 else ""
 
 
-def read_job(bgr, x0, cy, g):
+def read_job(bgr, x0, cy, g, ocr):
     """The job name in the status bar (e.g. 'Bandit'), from a shot where the EXP number's
     first digit is at x0 and its middle at cy, or None if it can't be read clearly.
 
@@ -806,7 +558,7 @@ def read_job(bgr, x0, cy, g):
     if glyph_h > 10:                                  # big screens: read at small-window size,
         k = 10.0 / glyph_h                            # where Tesseract reads this font best
         crop, glyph_h = cv2.resize(crop, None, fx=k, fy=k, interpolation=cv2.INTER_AREA), 10.0
-    votes = _ocr_votes(crop.astype(np.float32), glyph_h, "--psm 7", _clean_job)
+    votes = _ocr_votes(crop.astype(np.float32), glyph_h, ocr, _clean_job)
     text, n = votes.most_common(1)[0] if votes else ("", 0)
     if n < 2:
         return None
@@ -821,24 +573,26 @@ def _whiteness(bgr):
     return np.clip((hsv[..., 2] - 150) / 90, 0, 1) * np.clip((80 - hsv[..., 1]) / 50, 0, 1)
 
 
-def _ocr_votes(whiteness, glyph_h, config, clean):
-    """Tesseract on white text at a few sizes, with and without smoothing. Counts answers."""
-    votes = Counter()
+def _ocr_votes(whiteness, glyph_h, ocr, clean, chars=None):
+    """The text OCR on white text at a few sizes, with and without smoothing. Counts answers."""
+    pictures = []
     for target in (36, 48, 60):
         s = target / glyph_h
         big = cv2.resize(whiteness, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC)
         for img in ((big > 0.5) * 255.0, np.clip(big, 0, 1) * 255):
-            img = cv2.copyMakeBorder((255 - img).astype(np.uint8), 24, 24, 24, 24,
-                                     cv2.BORDER_CONSTANT, value=255)
-            text = clean(pytesseract.image_to_string(img, config=config))
-            if text:
-                votes[text] += 1
+            pictures.append(cv2.copyMakeBorder((255 - img).astype(np.uint8), 24, 24, 24, 24,
+                                               cv2.BORDER_CONSTANT, value=255))
+    votes = Counter()
+    for text in ocr.read_lines(pictures, chars):         # all six in one go
+        text = clean(text)
+        if text:
+            votes[text] += 1
     return votes
 
 
 def find_map_box(bgr, gh):
     """(x, y, w, h) of the minimap's info box in a shot of the window's top-left, or None."""
-    hue, sat, val = [c.astype(np.int16) for c in cv2.split(cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV))]
+    hue, sat, val = [c.astype(np.int16) for c in cv2.split(_hsv(bgr))]
     box = (abs(hue - 100) <= 8) & (abs(sat - 64) <= 30) & (abs(val - 204) <= 30)
     n, _, stats, _ = cv2.connectedComponentsWithStats(box.astype(np.uint8), connectivity=8)
     if n < 2:
@@ -860,7 +614,7 @@ def _clean_map_name(text):
     return t if len(t) >= 3 else ""
 
 
-def read_map_name(bgr, gh):
+def read_map_name(bgr, gh, ocr):
     """The map name (the lower line of white text) from a shot of the minimap's info box."""
     white = _whiteness(bgr[:, int(0.85 * bgr.shape[0]):])      # skip the map's icon
     _, blobs = _blobs(white > 0.5)
@@ -879,7 +633,7 @@ def read_map_name(bgr, gh):
     ln = lines[-1]
     x0, x1 = max(0, min(b.x for b in ln) - 2), max(b.x + b.w for b in ln) + 2
     y0, y1 = max(0, min(b.y for b in ln) - 2), max(b.y + b.h for b in ln) + 2
-    votes = _ocr_votes(white[y0:y1, x0:x1], max(b.h for b in ln), "--psm 7", _clean_map_name)
+    votes = _ocr_votes(white[y0:y1, x0:x1], max(b.h for b in ln), ocr, _clean_map_name)
     name, n = votes.most_common(1)[0] if votes else (None, 0)
     return name if n >= 2 else None
 
@@ -894,24 +648,26 @@ def read_map_name(bgr, gh):
 # font's digits are used, which match these closely enough.
 # Party: the small party list shows one HP bar per member, in an evenly spaced column.
 
-def find_mesos_field(bgr, gh=None):
+def find_mesos_field(bgr, gh=None, hsv=None):
     """(x, y, w, h) of the solid white mesos box (gold coin on its left), or None.
 
     With gh (the EXP digit height), the box must also be the mesos box's size at that scale:
     about 19.1 x 1.82 EXP digits."""
-    hue, sat, val = cv2.split(cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV))
-    n, _, stats, _ = cv2.connectedComponentsWithStats(((val > 225) & (sat < 30)).astype(np.uint8),
-                                                      connectivity=8)
-    coin = (hue >= 12) & (hue <= 35) & (sat >= 100) & (val >= 140)
+    hsv = _hsv(bgr, hsv)
+    white = cv2.inRange(hsv, (0, 0, 226), (255, 29, 255))          # val > 225, sat < 30
+    n, _, stats, _ = cv2.connectedComponentsWithStats(white, connectivity=8)
+    x, y, w, h, area = stats[1:].T.astype(np.int64)
+    ok = (h >= 8) & (7 * h <= w) & (w <= 16 * h) & (area >= 0.6 * w * h)      # box-shaped (all at once:
+    if gh:                                                                      # a busy shot has thousands)
+        ok &= (16.2 * gh <= w) & (w <= 22 * gh) & (1.45 * gh <= h) & (h <= 2.2 * gh)
     best = None
-    for i in range(1, n):
+    for i in np.flatnonzero(ok) + 1:
         x, y, w, h, area = map(int, stats[i])
-        if h < 8 or not 7 * h <= w <= 16 * h or area < 0.6 * w * h:
+        left = hsv[y:y + h, max(0, x - int(1.6 * h)):x]                         # the gold coin, left of it
+        if left.size == 0:
             continue
-        if gh and not (16.2 * gh <= w <= 22 * gh and 1.45 * gh <= h <= 2.2 * gh):
-            continue
-        left = coin[y:y + h, max(0, x - int(1.6 * h)):x]
-        if left.size == 0 or left.mean() < 0.15:
+        coin = cv2.inRange(left, (12, 100, 140), (35, 255, 255))
+        if np.count_nonzero(coin) / coin.size < 0.15:
             continue
         if best is None or area > best[4]:
             best = (x, y, w, h, area)
@@ -984,11 +740,21 @@ def _mesos_spot(field, i):
     return x + w - (MESOS_FIRST + i * MESOS_PITCH + (max(i, 0) // 3) * MESOS_COMMA) * h
 
 
+def around_mesos(img, field):
+    """The part of a shot that reading the mesos box at field looks at (what a poll grabs
+    for it), and where the box is in that part. Reading there gives the same answer as in
+    the whole shot, for much less work."""
+    x, y, w, h = field
+    x0, y0 = max(0, x - 2 * h), max(0, y - h)
+    x1, y1 = min(img.shape[1], x + w + 2 * h), min(img.shape[0], y + 2 * h)
+    return img[y0:y1, x0:x1], (x - x0, y - y0, w, h)
+
+
 def _mesos_strokes(bgr, field):
     """A Layout for matching digits in the mesos box: how much darker each pixel is than
     the box around it (works solid or see-through)."""
     x, y, w, h = field
-    V = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)[..., 2].astype(np.float32)
+    V = _hsv(bgr)[..., 2].astype(np.float32)
     k = max(3, int(round(0.35 * 0.615 * h)) | 1)
     strokes = cv2.morphologyEx(V, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8)) - V
     return Layout(0.615 * h, y + 0.525 * h, [], [], (0, 0, 0, 0), strokes)
@@ -1000,8 +766,8 @@ def mesos_box_lines_up(bgr, field, templates):
     a '1'), and just right of it there must be no digit (else the box is a digit too far
     left and the number would be read short)."""
     lay, h = _mesos_strokes(bgr, field), field[3]
-    _, first, _ = templates.match(lay, (_mesos_spot(field, 0), 0.4 * h, "digit"))
-    _, after, _ = templates.match(lay, (_mesos_spot(field, -1), 0.4 * h, "digit"))
+    (_, first, _), (_, after, _) = _match_all(templates, lay, [(_mesos_spot(field, 0), 0.4 * h, "digit"),
+                                                               (_mesos_spot(field, -1), 0.4 * h, "digit")])
     return first >= 0.85 and after < 0.84
 
 
@@ -1018,12 +784,15 @@ def read_mesos_positions(bgr, field, templates, digit_count=None):
     """
     x, y, w, h = field
     lay = _mesos_strokes(bgr, field)
-    digits, cells, scores, leads, ended = "", [], [], [], 0
+    spots = []                                        # right to left, up to the box's left edge
     for i in range(16):
         cx = _mesos_spot(field, i)
         if cx - 0.3 * h < x:
             break
-        digit, score, lead = templates.match(lay, (cx, 0.4 * h, "digit"))
+        spots.append(cx)
+    matches = _match_all(templates, lay, [(cx, 0.4 * h, "digit") for cx in spots])     # all spots at once
+    digits, cells, scores, leads, ended = "", [], [], [], 0
+    for cx, (digit, score, lead) in zip(spots, matches):
         empty = bool(digits) and score < 0.65
         if ended:
             # A clear digit after the end means one was missed in between. (Only a clear
@@ -1053,18 +822,15 @@ def read_mesos_positions(bgr, field, templates, digit_count=None):
 
 def read_mesos_digits(lay, templates):
     """The number in the mesos box, or None if any digit is unclear."""
-    s = ""
-    for cell in lay.exp:
-        digit, score, lead = templates.match(lay, cell)
-        if score < 0.70 or lead < 0.04:
-            return None
-        s += digit
-    return int(s)
+    got = _match_all(templates, lay, lay.exp)
+    if any(score < 0.70 or lead < 0.04 for _, score, lead in got):
+        return None
+    return int("".join(digit for digit, _, _ in got))
 
 
-def tesseract_mesos(lay):
-    """(number, how many of 6 Tesseract tries agreed) for the mesos box, or (None, 0)."""
-    if not tesseract_ok:
+def ocr_mesos(lay, ocr):
+    """(number, how many of 6 text OCR tries agreed) for the mesos box, or (None, 0)."""
+    if not ocr.available:
         return None, 0
     first, last = lay.exp[0], lay.exp[-1]
     x0, x1 = max(0, int(first[0] - first[1] / 2 - 0.5 * lay.gh)), int(last[0] + last[1] / 2 + 0.5 * lay.gh)
@@ -1074,8 +840,7 @@ def tesseract_mesos(lay):
     def clean(text):
         return re.sub(r"\D", "", text) if re.fullmatch(r"[\d,.\s]+", text.strip() or "x") else ""
 
-    votes = _ocr_votes(img.astype(np.float32), lay.gh,
-                       "--psm 7 -c tessedit_char_whitelist=0123456789,", clean)
+    votes = _ocr_votes(img.astype(np.float32), lay.gh, ocr, clean, chars="0123456789,")
     digits, n = votes.most_common(1)[0] if votes else ("", 0)
     return (int(digits), n) if n >= 4 else (None, n)
 
@@ -1104,7 +869,7 @@ class MesosDigits:
 
     def templates(self):
         if self._templates is None and self.examples:
-            self._templates = DigitTemplates({d: np.stack(v) for d, v in self.examples.items()})
+            self._templates = TemplateMatcher({d: np.stack(v) for d, v in self.examples.items()})
         return self._templates
 
     def learn(self, lay, value):
@@ -1115,19 +880,19 @@ class MesosDigits:
         for cell, ch in zip(lay.exp, digits):
             examples = self.examples.setdefault(ch, [])
             if len(examples) < self.PER_DIGIT:
-                examples.append(digit_patch(lay.V, cell[0], lay.cy, lay.gh, 0))
+                examples.append(glyph_patch(lay.V, cell[0], lay.cy, lay.gh))
                 added = True
         if added:
             self._templates = None
             try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
-                np.savez(self.path, canon=CANON, **{f"d{k}": np.stack(v) for k, v in self.examples.items()})
+                TemplateMatcher.save(self.path, self.examples)
             except Exception as e:
                 log_error("saving the learned mesos digits", e)
 
 
-def _edges(bgr):
-    v = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)[..., 2].astype(np.float32)
+def _edges(bgr, hsv=None):
+    v = _hsv(bgr, hsv)[..., 2].astype(np.float32)
     return cv2.magnitude(cv2.Sobel(v, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(v, cv2.CV_32F, 0, 1, ksize=3))
 
 
@@ -1163,7 +928,7 @@ class MesosBoxFinder:
              int((x - x0 + 0.12 * h) * s):int((x - x0 + w - 0.12 * h) * s)] = 0
         np.savez(path, edges=edges, mask=mask, box=np.float32([(x - x0) * s, (y - y0) * s, w * s, h * s]))
 
-    def find(self, bgr, gh):
+    def find(self, bgr, gh, hsv=None):
         """(x, y, w, h) of the best-matching mesos box in a screenshot, or None.
 
         Compared with the EXP digits the box is drawn bigger in small game windows (in real
@@ -1173,7 +938,8 @@ class MesosBoxFinder:
         distances from the right edge."""
         if self.edges is None:
             return None
-        edges0 = _edges(bgr)
+        hsv = _hsv(bgr, hsv)
+        edges0 = _edges(bgr, hsv)
         expect = 0.961 + 1.092 / gh
         found = None
         for size in (expect, expect * 1.025, expect / 1.025):
@@ -1196,7 +962,7 @@ class MesosBoxFinder:
         x, y, w, h = found[1]
         # Line up the right edge (the digits are read from there) with the inside of the
         # box's border: leaving the box it gets darker, solid or see-through.
-        gx = cv2.Sobel(cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)[..., 2].astype(np.float32),
+        gx = cv2.Sobel(hsv[..., 2].astype(np.float32),
                        cv2.CV_32F, 1, 0, ksize=3)
         rows = gx[max(0, y + h // 4):y + 3 * h // 4 + 1].sum(axis=0)
         reach = max(2, int(0.25 * h))
@@ -1210,14 +976,14 @@ def _agrees(value, last):
     return last is not None and len(str(value)) == len(str(last)) and abs(value - last) <= max(1000, 0.02 * last)
 
 
-def find_party_bars(bgr, gh):
+def find_party_bars(bgr, gh, hsv=None):
     """HP bars of the party list's members: the longest evenly spaced column of identical
     HP-bar outlines. A single bar (or none) means you're on your own."""
-    val = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)[..., 2]
-    n, _, stats, _ = cv2.connectedComponentsWithStats((val < 70).astype(np.uint8), connectivity=8)
-    bars = sorted((tuple(map(int, stats[i][:4])) for i in range(1, n)
-                   if 7.5 * gh <= stats[i][2] <= 10.5 * gh and 1.3 * gh <= stats[i][3] <= 1.85 * gh),
-                  key=lambda b: b[1])
+    dark = cv2.inRange(_hsv(bgr, hsv), (0, 0, 0), (255, 255, 69))           # val < 70
+    n, _, stats, _ = cv2.connectedComponentsWithStats(dark, connectivity=8)
+    w, h = stats[1:, 2], stats[1:, 3]
+    ok = (7.5 * gh <= w) & (w <= 10.5 * gh) & (1.3 * gh <= h) & (h <= 1.85 * gh)   # HP-bar sized
+    bars = sorted((tuple(map(int, stats[i][:4])) for i in np.flatnonzero(ok) + 1), key=lambda b: b[1])
     best = []
     for i, first in enumerate(bars):
         same = [b for b in bars[i:] if abs(b[0] - first[0]) <= 0.5 * gh
@@ -1257,6 +1023,56 @@ def _problem(where, text):
     return f"Selected area: {text}" if where == "Selected area" else text
 
 
+class _OneShot:
+    """In place of mss for one look: one screenshot of the game window, taken when it's first
+    needed, with each part read cut out of it. For an OS where a screenshot costs the same at
+    any size (Platform.flat_screenshot_cost), that's one instead of two or three a look; the
+    parts also all come from the same moment. A part outside the window is shot on its own."""
+
+    def __init__(self, sct, rect):
+        self.sct, self.frame = sct, None
+        v = sct.monitors[0]                           # (the part of the window on the screens)
+        x0, y0 = max(rect[0], v["left"]), max(rect[1], v["top"])
+        x1 = min(rect[0] + rect[2], v["left"] + v["width"])
+        y1 = min(rect[1] + rect[3], v["top"] + v["height"])
+        self.box = (x0, y0, x1, y1)
+
+    @property
+    def monitors(self):
+        return self.sct.monitors
+
+    def grab(self, region):
+        x0, y0, x1, y1 = self.box
+        left, top, w, h = region["left"], region["top"], region["width"], region["height"]
+        if not (x0 <= left and y0 <= top and left + w <= x1 and top + h <= y1):
+            return self.sct.grab(region)
+        if self.frame is None:
+            self.frame = np.asarray(self.sct.grab({"left": x0, "top": y0, "width": x1 - x0, "height": y1 - y0}))
+        return self.frame[top - y0:top - y0 + h, left - x0:left - x0 + w]
+
+
+class _LastLook:
+    """The answer for the last picture of something, given again for an identical one.
+
+    Between EXP gains the EXP bar (and a solid mesos box) look exactly the same at every
+    poll, so reading them again would only come to the same answer. Comparing the pixels
+    costs a few microseconds; any change at all, and it's read again."""
+
+    def __init__(self):
+        self.img = self.key = self.answer = None
+
+    def get(self, img, key):
+        """(True, the answer) if img and key are as last time, else (False, None)."""
+        last = self.img
+        if last is not None and key == self.key and last.shape == img.shape and np.array_equal(last, img):
+            return True, self.answer
+        return False, None
+
+    def put(self, img, key, answer):
+        self.img, self.key, self.answer = img, key, answer
+        return answer
+
+
 class ScreenReader:
     """Finds the EXP text on screen and reads it, following the game window around.
 
@@ -1264,8 +1080,9 @@ class ScreenReader:
     the inventory's mesos and, every few seconds, counts the members in the party list.
     """
 
-    def __init__(self, templates, mode="window", region=None):
-        self.templates = templates
+    def __init__(self, templates, mode="window", region=None, text_ocr=None):
+        self.templates = templates          # GlyphMatcher for the EXP bar's digits
+        self.text_ocr = text_ocr or NoTextOCR()     # TextOCR for map names, the class, new mesos
         self.mode, self.region = mode, region
         self.hwnd = None
         self.size = None
@@ -1295,6 +1112,8 @@ class ScreenReader:
         self.exp_anchor = None      # where the EXP number starts, relative to the game window
         self.job = None             # the class shown in the status bar
         self.next_job_read = 0.0
+        self.last_exp = _LastLook()         # the EXP bar's last picture and its reading
+        self.last_mesos = _LastLook()       # the mesos box's last picture and its reading
 
     def use_window(self):
         self.mode, self.hwnd, self.box = "window", None, None
@@ -1325,8 +1144,12 @@ class ScreenReader:
             self.look_again_requested = False
             self._forget_places()
         rect = self._game_rect()
+        if rect and self.mode == "window" and PLATFORM.flat_screenshot_cost:
+            sct = _OneShot(sct, rect)                   # one screenshot for this whole look
         if self.mode == "region":
             reading = self._read_region(sct, rect)
+        elif not self.hwnd and PLATFORM.missing_permission():
+            return Reading(PLATFORM.missing_permission())
         elif not self.hwnd:
             return Reading("MapleStory window not found. Is the game running?")
         elif not rect:
@@ -1343,7 +1166,7 @@ class ScreenReader:
     def _read_job(self, sct, rect):
         """Reads the class from the status bar now and then (it only changes at a job advance)."""
         now = time.monotonic()
-        if not tesseract_ok or now < self.next_job_read:
+        if not self.text_ocr.available or now < self.next_job_read:
             return
         wx, wy, _, _ = rect
         ax, ay = self.exp_anchor
@@ -1353,15 +1176,15 @@ class ScreenReader:
             self.next_job_read = now + 5
             return
         shot = grab(sct, x0, y0, w, h)
-        job = read_job(shot[0], wx + ax - shot[1], wy + ay - shot[2], g) if shot else None
+        job = read_job(shot[0], wx + ax - shot[1], wy + ay - shot[2], g, self.text_ocr) if shot else None
         if job:
             self.job = job
         self.next_job_read = now + (60 if job else 10)
 
     def _game_rect(self):
-        if not (self.hwnd and _IsWindow(self.hwnd)):
-            self.hwnd, self.box, self.map_box = find_game_window(), None, None
-        rect = client_rect(self.hwnd) if self.hwnd else None
+        if not (self.hwnd and PLATFORM.window_exists(self.hwnd)):
+            self.hwnd, self.box, self.map_box = PLATFORM.find_game_window(), None, None
+        rect = PLATFORM.client_rect(self.hwnd) if self.hwnd else None
         if rect and rect[2:] != self.size:                  # resized: find everything again
             self.size, self.box, self.map_box, self.gh = rect[2:], None, None, None
             self.exp_anchor, self.next_job_read = None, 0.0
@@ -1454,6 +1277,14 @@ class ScreenReader:
         if not shot:
             return Reading(_problem(where, "The EXP bar is off screen.")), None
         img = shot[0]
+        if lay is None:                         # (where it was: often just as it was)
+            same, answer = self.last_exp.get(img, where)
+            if same:
+                return answer
+            return self.last_exp.put(img, where, self._read_new(img, where, None))
+        return self._read_new(img, where, lay)
+
+    def _read_new(self, img, where, lay):
         lay = lay or find_exp(img)
         if not lay:
             return Reading(_problem(where, "Can't find the EXP bar.")), None
@@ -1463,7 +1294,7 @@ class ScreenReader:
             return Reading(where, [got], True, f"{got[0]:,} [{got[1]:.2f}%]", view, boxes), lay
         # Unclear digits, or a reading that fits no level: not trusted. Readings that do fit
         # a level go first, so the tracker tries those.
-        cands = ([got] if got else []) + [c for c in tesseract_candidates(img, lay) if c != got]
+        cands = ([got] if got else []) + [c for c in ocr_candidates(img, lay, self.text_ocr) if c != got]
         cands.sort(key=lambda c: not fits_exp_table(*c))
         if cands:
             e, p = cands[0]
@@ -1483,13 +1314,14 @@ class ScreenReader:
             shot = self._hide_own(grab(sct, wx, wy, ww, wh))
             if shot:
                 img, sx, sy = shot
-                field = find_mesos_field(img, g)      # the solid box is easy to spot
+                hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)   # once, for all that's looked for here
+                field = find_mesos_field(img, g, hsv)  # the solid box is easy to spot
                 if field and not self._readable(img, field):
                     field = None                      # a white patch in the scene, not the box
                 # Look for it by its outline too if it's lost, or this window is in the way of
                 # where it was (it may have been moved from there).
                 if field is None and (self.mesos_box is None or self.mesos_fails >= 10 or self.mesos_covered):
-                    field = self._find_seethrough_box(img, g)
+                    field = self._find_seethrough_box(img, g, hsv)
                 if field:
                     box = (sx - wx + field[0], sy - wy + field[1], field[2], field[3])
                     old = self.mesos_box
@@ -1500,7 +1332,7 @@ class ScreenReader:
                 if area and self._covered(*area):
                     notes.append("This window is covering the party list.")
                 else:
-                    bars = find_party_bars(img, g)
+                    bars = find_party_bars(img, g, hsv)
                     party = max(1, len(bars))
                     if len(bars) >= 2:
                         x0, y0 = min(b[0] for b in bars), min(b[1] for b in bars)
@@ -1526,21 +1358,22 @@ class ScreenReader:
         """Clear mesos digits at field? (Always yes while the mesos font is still being
         learned: then Tesseract checks every new number instead.)"""
         learned = self.mesos_digits
-        return not learned.complete or read_mesos_positions(img, field, learned.templates()) is not None
+        return not learned.complete or read_mesos_positions(*around_mesos(img, field), learned.templates()) is not None
 
-    def _find_seethrough_box(self, img, g):
+    def _find_seethrough_box(self, img, g, hsv=None):
         """The mesos box by its outline, checked by reading clear digits there.
 
         The digits are read at fixed spots from the box's right edge, so a box found a bit
         off could read a wrong number: it must also line up with the number."""
-        field = self.box_finder.find(img, g)
+        field = self.box_finder.find(img, g, hsv)
         if not field:
             return None
         learned = self.mesos_digits
         templates = learned.templates() if learned.complete else self.templates
-        if not templates or not mesos_box_lines_up(img, field, templates):
+        part, there = around_mesos(img, field)
+        if not templates or not mesos_box_lines_up(part, there, templates):
             return None
-        return field if read_mesos_positions(img, field, templates) else None
+        return field if read_mesos_positions(part, there, templates) else None
 
     def _read_mesos(self, sct, x, y, w, h):
         """Reads the mesos box at (x, y, w, h) on screen. Returns (number, image, boxes)."""
@@ -1558,7 +1391,10 @@ class ScreenReader:
 
         learned = self.mesos_digits
         if learned.complete:                          # all ten mesos digits learned
-            got = read_mesos_positions(img, (fx, fy, w, h), learned.templates())
+            templates, field = learned.templates(), (fx, fy, w, h)
+            same, got = self.last_mesos.get(img, (field, templates))
+            if not same:
+                got = self.last_mesos.put(img, (field, templates), read_mesos_positions(img, field, templates))
             if not got:
                 self.mesos_fails += 1
                 return None, img, ()
@@ -1591,7 +1427,7 @@ class ScreenReader:
         if now < self.next_mesos_check or (not solid and value is None):
             return None, img, boxes
         self.next_mesos_check = now + (2 if value is not None else 5)
-        checked, votes = tesseract_mesos(lay)
+        checked, votes = ocr_mesos(lay, self.text_ocr)
         if checked is None or (not solid and checked != value):
             return None, img, boxes
         self.mesos_checked = checked
@@ -1601,7 +1437,7 @@ class ScreenReader:
 
     def _read_info(self, sct, rect):
         """Returns (map name if it was just read, note)."""
-        if not tesseract_ok:
+        if not self.text_ocr.available:
             return None, "Map names can't be read: Tesseract OCR is missing (see the README)."
         if self.own_rect is None:
             return None, None                   # wait until we know where this app's window is
@@ -1638,7 +1474,7 @@ class ScreenReader:
                         self.map_box, self.next_map_search = None, now + 1
                         self.map_unread, self.next_map_read = True, 0.0
                     elif self.map_unread and now >= self.next_map_read:
-                        name = read_map_name(shot[0], g)
+                        name = read_map_name(shot[0], g, self.text_ocr)
                         self.map_unread = name is None
                         self.next_map_read = now + 5          # if unreadable, try again later
                     self.map_print = picture
@@ -2599,7 +2435,7 @@ class RegionSelector:
         self.win.attributes("-topmost", True)
         self.canvas = tk.Canvas(self.win, bg="black", cursor="cross", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
-        self.canvas.create_text(v["width"] // 2, 60, fill="white", font=("Segoe UI", 20, "bold"),
+        self.canvas.create_text(v["width"] // 2, 60, fill="white", font=(*PLATFORM.font("Segoe UI", "bold"), 20),
                                 text="Drag a box around the EXP numbers  (Esc to cancel)")
         self.start = None
         self.rect = None
@@ -2648,11 +2484,11 @@ LOG_HINT = "Right-click a line to copy, rename or delete it."
 
 
 class App:
-    def __init__(self, root, templates):
+    def __init__(self, root, templates, text_ocr=None):
         self.root = root
         self.cfg = {**DEFAULTS, **load_config()}
         mode = self.cfg.get("mode", "window")
-        self.reader = ScreenReader(templates, mode, self.cfg.get("region"))
+        self.reader = ScreenReader(templates, mode, self.cfg.get("region"), text_ocr)
         saved = self.cfg.get("mesos_box")
         if isinstance(saved, list) and len(saved) == 6:
             self.reader.saved_mesos = tuple(saved)
@@ -2680,13 +2516,14 @@ class App:
         self.stop_evt = threading.Event()
         self.last_capture = None
 
-        self.fonts = {name: tkfont.Font(root, family=family, weight=weight, underline=underline)
+        self.fonts = {name: tkfont.Font(root, underline=underline, **dict(zip(("family", "weight"),
+                                                                               PLATFORM.font(family, weight))))
                       for name, (family, _, weight, underline) in FONTS.items()}
         pos = self.cfg.get("pos")
-        self._dpi = (screen_dpi(pos[0] + 40, pos[1] + 15) if pos else None) or root.winfo_fpixels("1i")
+        self._dpi = (PLATFORM.screen_dpi(pos[0] + 40, pos[1] + 15) if pos else None) or root.winfo_fpixels("1i")
         self._apply_ui_scale()
         self.hotkey_note = None
-        self.hotkeys = Hotkeys(lambda action: self.q.put(("hotkey", action)))
+        self.hotkeys = PLATFORM.create_hotkeys(lambda action: self.q.put(("hotkey", action)))
         self.hotkeys.set(self.cfg["hotkeys"], self.cfg["hotkeys_on"])
         self.compact = False
 
@@ -2943,7 +2780,7 @@ class App:
         """Resizes the text when the window is moved to a screen with different Windows scaling
         (judged by its title bar, which stays put when the window changes size)."""
         r = self._window_rect()
-        dpi = screen_dpi(r[0] + 40, r[1] + 15) if r else None
+        dpi = PLATFORM.screen_dpi(r[0] + 40, r[1] + 15) if r else None
         if dpi and dpi != self._dpi:
             self._dpi = dpi
             self._apply_ui_scale()
@@ -3206,6 +3043,10 @@ class App:
         the keys; Esc keeps it as it was, Backspace turns it off)."""
         box = tk.Frame(w, bg=BG)
         box.grid(row=row, column=0, sticky="w", padx=10, pady=(10, 0))
+        if not self.hotkeys.supported:
+            tk.Label(box, text=f"Hotkeys aren't available on {PLATFORM.name} yet: use the buttons.",
+                     bg=BG, fg=DIM, font=self.fonts["text"]).grid(row=0, column=0, sticky="w")
+            return
         on = tk.BooleanVar(value=self.cfg["hotkeys_on"])
         tk.Checkbutton(box, text="Hotkeys, while MapleStory or the overlay is in front:", variable=on, bg=BG,
                        fg=FG, selectcolor=FIELD, activebackground=BG, activeforeground=FG,
@@ -3279,7 +3120,7 @@ class App:
     def open_data_folder(self):
         try:
             DATA_DIR.mkdir(parents=True, exist_ok=True)
-            os.startfile(DATA_DIR)
+            PLATFORM.open_folder(DATA_DIR)
         except Exception as e:
             self._oops("opening the data folder", e)
 
@@ -3298,13 +3139,9 @@ class App:
     def _window_rect(self):
         """This app's window on screen (physical pixels), or None."""
         try:
-            hwnd = _GetAncestor(self.root.winfo_id(), 2)       # GA_ROOT: the framed window
-            r = wintypes.RECT()
-            if _GetWindowRect(hwnd, ctypes.byref(r)):
-                return r.left, r.top, r.right - r.left, r.bottom - r.top
+            return PLATFORM.own_window_rect(self.root)
         except Exception:
-            pass
-        return None
+            return None
 
     # ---- background capture loop
     def _worker(self):
@@ -3765,7 +3602,7 @@ class App:
         webbrowser.open(f"https://github.com/{GITHUB_REPO}/issues/new?{query}")
         if picture:
             try:
-                subprocess.Popen(["explorer", f"/select,{picture}"])
+                PLATFORM.show_file(picture)
             except Exception as e:
                 log_error("opening the bug report picture's folder", e)
 
@@ -3813,7 +3650,7 @@ class App:
              if picture else "(If you can, add a screenshot of the game and the overlay.)"), "",
             "---", "<details><summary>Details (filled in by the overlay)</summary>", "",
             f"- Version: {VERSION} ({'download' if getattr(sys, 'frozen', False) else 'from source'})",
-            f"- Windows: {platform.version()}",
+            f"- System: {PLATFORM.version()}",
             f"- Game window: {'x'.join(map(str, self.reader.size)) if self.reader.size else 'not found'}"
             f" (EXP digits {fmt_num(self.reader.gh) if self.reader.gh else '?'} px)",
             f"- Last EXP read: {r.text if r else 'nothing'}",
@@ -3827,7 +3664,7 @@ class App:
             f"- Sharing runs: {'on' if self.cfg.get('share_runs') else 'off'}"
             f" ({len(self.autolog.runs)} runs, {len(self.autolog.unshared_runs())} not sent)",
             f"- Settings: pause after {self.cfg['gap_seconds']} s, transparency {self.cfg['transparency']}%,"
-            f" map names {'on' if tesseract_ok else 'off (no Tesseract)'}",
+            f" map names {'on' if self.reader.text_ocr.available else 'off (no Tesseract)'}",
         ]
         if errors:
             lines += ["", "Recent errors:", "```", errors.strip(), "```"]
@@ -3857,35 +3694,18 @@ class App:
 
 
 def main():
-    global tesseract_ok, _single_instance
     # Only one copy at a time (per data folder): two copies would each keep their own log.
     # If it's already running, bring that window to the front instead. (The lock keeps the old
     # name, so an older version and this one can't run at the same time either.)
-    lock ="Local\\MapleEXP-" + hashlib.md5(str(DATA_DIR).lower().encode()).hexdigest()[:12]
-    _single_instance = _CreateMutex(None, False, lock)
-    if ctypes.get_last_error() == 183:                      # ERROR_ALREADY_EXISTS
-        found = []
-
-        def check(hwnd, _):                                 # any version's main window
-            title = ctypes.create_unicode_buffer(256)
-            _GetWindowText(hwnd, title, 256)
-            if title.value.startswith((WINDOW_TITLE, *OLD_TITLES)) and _IsWindowVisible(hwnd):
-                found.append(hwnd)
-            return True
-        _EnumWindows(_EnumWindowsProc(check), 0)
-        if found:
-            _ShowWindow(found[0], 9)                        # SW_RESTORE
-            _SetForegroundWindow(found[0])
-        else:
-            ctypes.windll.user32.MessageBoxW(None, f"{WINDOW_TITLE} is already running.", WINDOW_TITLE, 0x40)
+    key = hashlib.md5(str(DATA_DIR).lower().encode()).hexdigest()[:12]
+    if not PLATFORM.claim_single_instance(key, WINDOW_TITLE, OLD_TITLES):
         return
+    PLATFORM.ask_permissions()
     move_old_data()
-    tess = find_tesseract()
-    if tess:
-        pytesseract.pytesseract.tesseract_cmd = tess
-        tesseract_ok = True
+    # MAPLE_EXP_OCR=none turns the text OCR off (e.g. to see how the overlay does without it).
+    text_ocr = create_text_ocr(os.environ.get("MAPLE_EXP_OCR", "auto"), find_tesseract())
     root = tk.Tk()
-    App(root, DigitTemplates.load())
+    App(root, DigitTemplates.load(), text_ocr)
     root.mainloop()
 
 

@@ -4,6 +4,13 @@
 
 **New**
 - **One log line per party**: playing a map in a party, people join and leave, and each party size used to get its own line. Now a map's party sizes on a day share one line (e.g. "4–5ppl ▸"), with EXP/hr and mesos/hr over all of that time. Click it to see a line for each party size, to compare them. Solo play keeps its own line. Your log itself isn't changed, only how it's shown.
+- **macOS** (running from source): works on a Mac with the game in CrossOver, Whisky, Parallels or a game stream. It finds the game window by itself, as on Windows. See "For developers" in the README. Hotkeys aren't available on macOS yet.
+
+**Lighter**
+- **About half the CPU while tracking**, and almost none between kills: the EXP bar and mesos aren't read again while they look exactly as they did. Reads just the same as before.
+- Reading the map name and your class takes about a quarter of the CPU it did (Tesseract reads all its tries in one go, instead of starting once for each).
+- Each step works on one CPU core instead of all of them, which for these small pictures was only extra work.
+- On macOS, one screenshot of the game a look instead of two or three (each costs the same there, at any size).
 
 **Safer**
 - Downloads are now built by GitHub from this code, never on a PC, from exact package files checked against their SHA-256. Each one gets an attestation anyone can check (`gh attestation verify`), and its SHA-256 is on the release page. See "Where the download comes from" in the README.

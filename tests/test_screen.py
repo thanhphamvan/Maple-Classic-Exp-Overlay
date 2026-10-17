@@ -114,11 +114,10 @@ for key, info in sorted(PARTS["party"].items(), key=lambda kv: kv[1]["gh"]):
     check(f"no party list on screen means solo, EXP digits {gh:.0f} px", clean)
 
 # ---- the class, from the status bar (the character name line is blanked in these)
-m.pytesseract.pytesseract.tesseract_cmd = m.find_tesseract()
-m.tesseract_ok = bool(m.pytesseract.pytesseract.tesseract_cmd)
-if m.tesseract_ok:
+ocr = m.create_text_ocr(tesseract_cmd=m.find_tesseract())
+if ocr.available:
     for name, info in sorted(PARTS["status"].items()):
-        got = m.read_job(cv2.imread(str(FRAMES / name)), info["x0"], info["cy"], info["gh"])
+        got = m.read_job(cv2.imread(str(FRAMES / name)), info["x0"], info["cy"], info["gh"], ocr)
         check(f"reads the class at EXP digits {info['gh']:.0f} px: {got}", got == info["job"])
 else:
     print("     (Tesseract isn't installed: class reading not tested)")
