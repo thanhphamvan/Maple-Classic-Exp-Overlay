@@ -43,6 +43,10 @@ import mss
 import numpy as np
 from PIL import Image, ImageDraw, ImageTk
 
+# The overlay's images are small, and it only looks every 1.5 s: spreading each step over
+# every core (OpenCV's default) is a little quicker but costs 15-45% more CPU in all.
+cv2.setNumThreads(1)
+
 from ocr import CANON, NoTextOCR, TemplateMatcher, create_text_ocr, glyph_patch
 from platforms import create_platform, hotkey_text, parse_hotkey
 
@@ -265,8 +269,15 @@ def grab(sct, left, top, width, height):
     y1 = min(top + height, v["top"] + v["height"])
     if x1 - x0 < 8 or y1 - y0 < 8:
         return None
-    shot = np.array(sct.grab({"left": x0, "top": y0, "width": x1 - x0, "height": y1 - y0}))
-    return np.ascontiguousarray(shot[:, :, :3]), x0, y0
+    shot = np.asarray(sct.grab({"left": x0, "top": y0, "width": x1 - x0, "height": y1 - y0}))    # BGRA
+    return cv2.cvtColor(shot, cv2.COLOR_BGRA2BGR), x0, y0           # (one copy, without the A)
+
+
+
+def _hsv(bgr, hsv=None):
+    """bgr in HSV, or hsv if the caller already has it (a look at the whole window converts
+    its shot once, for everything it looks for there)."""
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV) if hsv is None else hsv
 
 
 # --------------------------------------------------------------------------- reading the bar
@@ -312,7 +323,7 @@ def _cells(blobs, gh):
 
 def find_exp(bgr):
     """Locate the EXP text in a screenshot. Returns a Layout or None."""
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    hsv = _hsv(bgr)
     hue, sat, val = cv2.split(hsv)
     green = (sat >= 90) & (val >= 110) & (hue >= 26) & (hue <= 50)
     white = (sat < 70) & (val >= 140)
@@ -361,9 +372,10 @@ def find_exp(bgr):
     return max((f for f in found if f.cy >= low - 0.5 * f.gh), key=lambda f: f.box[0])
 
 
-def _match(matcher, lay, cell):
-    """(digit, score, lead) for one digit position of a Layout, from a GlyphMatcher."""
-    return matcher.match(lay.V, cell[0], lay.cy, lay.gh)
+def _match_all(matcher, lay, cells):
+    """(digit, score, lead) for each digit position of a Layout, from a GlyphMatcher (all at
+    once: much faster than one at a time)."""
+    return matcher.match_many(lay.V, [(c[0], lay.cy, lay.gh) for c in cells])
 
 
 class DigitTemplates(TemplateMatcher):
@@ -380,21 +392,22 @@ def _pct_cells(lay):
 
 
 def _read_digits(tpl, lay, cells):
-    s = ""
-    for cell in cells:
-        if cell[2] != "digit":
-            return None
-        digit, score, lead = _match(tpl, lay, cell)
-        if score < MIN_SCORE or lead < MIN_LEAD:
-            return None
-        s += digit
-    return s
+    """The digits at cells as a string, or None if any isn't clearly a digit."""
+    if any(c[2] != "digit" for c in cells):
+        return None
+    got = _match_all(tpl, lay, cells)
+    if any(score < MIN_SCORE or lead < MIN_LEAD for _, score, lead in got):
+        return None
+    return "".join(digit for digit, _, _ in got)
 
 
 def read_layout(tpl, lay):
     """(exp, pct) read with the digit templates, or None if any digit is unclear."""
-    exp_s = _read_digits(tpl, lay, lay.exp)
-    pct_s = _read_digits(tpl, lay, _pct_cells(lay))
+    exp_cells, pct_cells = list(lay.exp), _pct_cells(lay)
+    both = _read_digits(tpl, lay, exp_cells + pct_cells)          # both numbers in one go
+    if both is None:
+        return None
+    exp_s, pct_s = both[:len(exp_cells)], both[len(exp_cells):]
     if not exp_s or not pct_s or not 3 <= len(pct_s) <= 5:
         return None
     if (len(exp_s) > 1 and exp_s[0] == "0") or (len(pct_s) > 3 and pct_s[0] == "0"):
@@ -402,8 +415,8 @@ def read_layout(tpl, lay):
     return int(exp_s), int(pct_s) / 100          # the game always shows 2 decimals
 
 
-def _ocr_cells(bgr, lay, cells, ocr):
-    """Text OCR on the area covering cells, two ways. Returns digit strings."""
+def _ocr_pictures(bgr, lay, cells):
+    """The area covering cells as pictures for the text OCR, made two ways."""
     if not cells:
         return []
     g = lay.gh
@@ -417,19 +430,18 @@ def _ocr_cells(bgr, lay, cells, ocr):
     white = (((hsv[..., 1] < 70) & (hsv[..., 2] >= 140)) * 255).astype(np.uint8)
     white = cv2.dilate(white, np.ones((3, 3), np.uint8))
     _, bright = cv2.threshold(hsv[..., 2], 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    out = []
-    for mask in (white, bright):
-        img = cv2.copyMakeBorder(255 - mask, 12, 12, 12, 12, cv2.BORDER_CONSTANT, value=255)
-        out.append(re.sub(r"\D", "", ocr.read_line(img, chars="0123456789,.")))
-    return out
+    return [cv2.copyMakeBorder(255 - mask, 12, 12, 12, 12, cv2.BORDER_CONSTANT, value=255)
+            for mask in (white, bright)]
 
 
 def ocr_candidates(bgr, lay, ocr):
     """Fallback: (exp, pct) guesses from the text OCR. The tracker picks one that adds up."""
     if not ocr.available:
         return []
-    exps = {int(s) for s in _ocr_cells(bgr, lay, lay.exp, ocr) if s}
-    pcts = {int(s) / 100 for s in _ocr_cells(bgr, lay, _pct_cells(lay), ocr)
+    exp_pics, pct_pics = _ocr_pictures(bgr, lay, lay.exp), _ocr_pictures(bgr, lay, _pct_cells(lay))
+    texts = [re.sub(r"\D", "", t) for t in ocr.read_lines(exp_pics + pct_pics, chars="0123456789,.")]  # in one go
+    exps = {int(s) for s in texts[:len(exp_pics)] if s}
+    pcts = {int(s) / 100 for s in texts[len(exp_pics):]
             if 3 <= len(s) <= 5}
     return [(e, p) for e in sorted(exps) for p in sorted(pcts)]
 
@@ -563,22 +575,24 @@ def _whiteness(bgr):
 
 def _ocr_votes(whiteness, glyph_h, ocr, clean, chars=None):
     """The text OCR on white text at a few sizes, with and without smoothing. Counts answers."""
-    votes = Counter()
+    pictures = []
     for target in (36, 48, 60):
         s = target / glyph_h
         big = cv2.resize(whiteness, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC)
         for img in ((big > 0.5) * 255.0, np.clip(big, 0, 1) * 255):
-            img = cv2.copyMakeBorder((255 - img).astype(np.uint8), 24, 24, 24, 24,
-                                     cv2.BORDER_CONSTANT, value=255)
-            text = clean(ocr.read_line(img, chars))
-            if text:
-                votes[text] += 1
+            pictures.append(cv2.copyMakeBorder((255 - img).astype(np.uint8), 24, 24, 24, 24,
+                                               cv2.BORDER_CONSTANT, value=255))
+    votes = Counter()
+    for text in ocr.read_lines(pictures, chars):         # all six in one go
+        text = clean(text)
+        if text:
+            votes[text] += 1
     return votes
 
 
 def find_map_box(bgr, gh):
     """(x, y, w, h) of the minimap's info box in a shot of the window's top-left, or None."""
-    hue, sat, val = [c.astype(np.int16) for c in cv2.split(cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV))]
+    hue, sat, val = [c.astype(np.int16) for c in cv2.split(_hsv(bgr))]
     box = (abs(hue - 100) <= 8) & (abs(sat - 64) <= 30) & (abs(val - 204) <= 30)
     n, _, stats, _ = cv2.connectedComponentsWithStats(box.astype(np.uint8), connectivity=8)
     if n < 2:
@@ -634,24 +648,26 @@ def read_map_name(bgr, gh, ocr):
 # font's digits are used, which match these closely enough.
 # Party: the small party list shows one HP bar per member, in an evenly spaced column.
 
-def find_mesos_field(bgr, gh=None):
+def find_mesos_field(bgr, gh=None, hsv=None):
     """(x, y, w, h) of the solid white mesos box (gold coin on its left), or None.
 
     With gh (the EXP digit height), the box must also be the mesos box's size at that scale:
     about 19.1 x 1.82 EXP digits."""
-    hue, sat, val = cv2.split(cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV))
-    n, _, stats, _ = cv2.connectedComponentsWithStats(((val > 225) & (sat < 30)).astype(np.uint8),
-                                                      connectivity=8)
-    coin = (hue >= 12) & (hue <= 35) & (sat >= 100) & (val >= 140)
+    hsv = _hsv(bgr, hsv)
+    white = cv2.inRange(hsv, (0, 0, 226), (255, 29, 255))          # val > 225, sat < 30
+    n, _, stats, _ = cv2.connectedComponentsWithStats(white, connectivity=8)
+    x, y, w, h, area = stats[1:].T.astype(np.int64)
+    ok = (h >= 8) & (7 * h <= w) & (w <= 16 * h) & (area >= 0.6 * w * h)      # box-shaped (all at once:
+    if gh:                                                                      # a busy shot has thousands)
+        ok &= (16.2 * gh <= w) & (w <= 22 * gh) & (1.45 * gh <= h) & (h <= 2.2 * gh)
     best = None
-    for i in range(1, n):
+    for i in np.flatnonzero(ok) + 1:
         x, y, w, h, area = map(int, stats[i])
-        if h < 8 or not 7 * h <= w <= 16 * h or area < 0.6 * w * h:
+        left = hsv[y:y + h, max(0, x - int(1.6 * h)):x]                         # the gold coin, left of it
+        if left.size == 0:
             continue
-        if gh and not (16.2 * gh <= w <= 22 * gh and 1.45 * gh <= h <= 2.2 * gh):
-            continue
-        left = coin[y:y + h, max(0, x - int(1.6 * h)):x]
-        if left.size == 0 or left.mean() < 0.15:
+        coin = cv2.inRange(left, (12, 100, 140), (35, 255, 255))
+        if np.count_nonzero(coin) / coin.size < 0.15:
             continue
         if best is None or area > best[4]:
             best = (x, y, w, h, area)
@@ -724,11 +740,21 @@ def _mesos_spot(field, i):
     return x + w - (MESOS_FIRST + i * MESOS_PITCH + (max(i, 0) // 3) * MESOS_COMMA) * h
 
 
+def around_mesos(img, field):
+    """The part of a shot that reading the mesos box at field looks at (what a poll grabs
+    for it), and where the box is in that part. Reading there gives the same answer as in
+    the whole shot, for much less work."""
+    x, y, w, h = field
+    x0, y0 = max(0, x - 2 * h), max(0, y - h)
+    x1, y1 = min(img.shape[1], x + w + 2 * h), min(img.shape[0], y + 2 * h)
+    return img[y0:y1, x0:x1], (x - x0, y - y0, w, h)
+
+
 def _mesos_strokes(bgr, field):
     """A Layout for matching digits in the mesos box: how much darker each pixel is than
     the box around it (works solid or see-through)."""
     x, y, w, h = field
-    V = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)[..., 2].astype(np.float32)
+    V = _hsv(bgr)[..., 2].astype(np.float32)
     k = max(3, int(round(0.35 * 0.615 * h)) | 1)
     strokes = cv2.morphologyEx(V, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8)) - V
     return Layout(0.615 * h, y + 0.525 * h, [], [], (0, 0, 0, 0), strokes)
@@ -740,8 +766,8 @@ def mesos_box_lines_up(bgr, field, templates):
     a '1'), and just right of it there must be no digit (else the box is a digit too far
     left and the number would be read short)."""
     lay, h = _mesos_strokes(bgr, field), field[3]
-    _, first, _ = _match(templates, lay, (_mesos_spot(field, 0), 0.4 * h, "digit"))
-    _, after, _ = _match(templates, lay, (_mesos_spot(field, -1), 0.4 * h, "digit"))
+    (_, first, _), (_, after, _) = _match_all(templates, lay, [(_mesos_spot(field, 0), 0.4 * h, "digit"),
+                                                               (_mesos_spot(field, -1), 0.4 * h, "digit")])
     return first >= 0.85 and after < 0.84
 
 
@@ -758,12 +784,15 @@ def read_mesos_positions(bgr, field, templates, digit_count=None):
     """
     x, y, w, h = field
     lay = _mesos_strokes(bgr, field)
-    digits, cells, scores, leads, ended = "", [], [], [], 0
+    spots = []                                        # right to left, up to the box's left edge
     for i in range(16):
         cx = _mesos_spot(field, i)
         if cx - 0.3 * h < x:
             break
-        digit, score, lead = _match(templates, lay, (cx, 0.4 * h, "digit"))
+        spots.append(cx)
+    matches = _match_all(templates, lay, [(cx, 0.4 * h, "digit") for cx in spots])     # all spots at once
+    digits, cells, scores, leads, ended = "", [], [], [], 0
+    for cx, (digit, score, lead) in zip(spots, matches):
         empty = bool(digits) and score < 0.65
         if ended:
             # A clear digit after the end means one was missed in between. (Only a clear
@@ -793,13 +822,10 @@ def read_mesos_positions(bgr, field, templates, digit_count=None):
 
 def read_mesos_digits(lay, templates):
     """The number in the mesos box, or None if any digit is unclear."""
-    s = ""
-    for cell in lay.exp:
-        digit, score, lead = _match(templates, lay, cell)
-        if score < 0.70 or lead < 0.04:
-            return None
-        s += digit
-    return int(s)
+    got = _match_all(templates, lay, lay.exp)
+    if any(score < 0.70 or lead < 0.04 for _, score, lead in got):
+        return None
+    return int("".join(digit for digit, _, _ in got))
 
 
 def ocr_mesos(lay, ocr):
@@ -865,8 +891,8 @@ class MesosDigits:
                 log_error("saving the learned mesos digits", e)
 
 
-def _edges(bgr):
-    v = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)[..., 2].astype(np.float32)
+def _edges(bgr, hsv=None):
+    v = _hsv(bgr, hsv)[..., 2].astype(np.float32)
     return cv2.magnitude(cv2.Sobel(v, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(v, cv2.CV_32F, 0, 1, ksize=3))
 
 
@@ -902,7 +928,7 @@ class MesosBoxFinder:
              int((x - x0 + 0.12 * h) * s):int((x - x0 + w - 0.12 * h) * s)] = 0
         np.savez(path, edges=edges, mask=mask, box=np.float32([(x - x0) * s, (y - y0) * s, w * s, h * s]))
 
-    def find(self, bgr, gh):
+    def find(self, bgr, gh, hsv=None):
         """(x, y, w, h) of the best-matching mesos box in a screenshot, or None.
 
         Compared with the EXP digits the box is drawn bigger in small game windows (in real
@@ -912,7 +938,8 @@ class MesosBoxFinder:
         distances from the right edge."""
         if self.edges is None:
             return None
-        edges0 = _edges(bgr)
+        hsv = _hsv(bgr, hsv)
+        edges0 = _edges(bgr, hsv)
         expect = 0.961 + 1.092 / gh
         found = None
         for size in (expect, expect * 1.025, expect / 1.025):
@@ -935,7 +962,7 @@ class MesosBoxFinder:
         x, y, w, h = found[1]
         # Line up the right edge (the digits are read from there) with the inside of the
         # box's border: leaving the box it gets darker, solid or see-through.
-        gx = cv2.Sobel(cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)[..., 2].astype(np.float32),
+        gx = cv2.Sobel(hsv[..., 2].astype(np.float32),
                        cv2.CV_32F, 1, 0, ksize=3)
         rows = gx[max(0, y + h // 4):y + 3 * h // 4 + 1].sum(axis=0)
         reach = max(2, int(0.25 * h))
@@ -949,14 +976,14 @@ def _agrees(value, last):
     return last is not None and len(str(value)) == len(str(last)) and abs(value - last) <= max(1000, 0.02 * last)
 
 
-def find_party_bars(bgr, gh):
+def find_party_bars(bgr, gh, hsv=None):
     """HP bars of the party list's members: the longest evenly spaced column of identical
     HP-bar outlines. A single bar (or none) means you're on your own."""
-    val = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)[..., 2]
-    n, _, stats, _ = cv2.connectedComponentsWithStats((val < 70).astype(np.uint8), connectivity=8)
-    bars = sorted((tuple(map(int, stats[i][:4])) for i in range(1, n)
-                   if 7.5 * gh <= stats[i][2] <= 10.5 * gh and 1.3 * gh <= stats[i][3] <= 1.85 * gh),
-                  key=lambda b: b[1])
+    dark = cv2.inRange(_hsv(bgr, hsv), (0, 0, 0), (255, 255, 69))           # val < 70
+    n, _, stats, _ = cv2.connectedComponentsWithStats(dark, connectivity=8)
+    w, h = stats[1:, 2], stats[1:, 3]
+    ok = (7.5 * gh <= w) & (w <= 10.5 * gh) & (1.3 * gh <= h) & (h <= 1.85 * gh)   # HP-bar sized
+    bars = sorted((tuple(map(int, stats[i][:4])) for i in np.flatnonzero(ok) + 1), key=lambda b: b[1])
     best = []
     for i, first in enumerate(bars):
         same = [b for b in bars[i:] if abs(b[0] - first[0]) <= 0.5 * gh
@@ -994,6 +1021,56 @@ def _view(img, lay):
 def _problem(where, text):
     """A status message about reading the EXP bar ("where" only matters for a selected area)."""
     return f"Selected area: {text}" if where == "Selected area" else text
+
+
+class _OneShot:
+    """In place of mss for one look: one screenshot of the game window, taken when it's first
+    needed, with each part read cut out of it. For an OS where a screenshot costs the same at
+    any size (Platform.flat_screenshot_cost), that's one instead of two or three a look; the
+    parts also all come from the same moment. A part outside the window is shot on its own."""
+
+    def __init__(self, sct, rect):
+        self.sct, self.frame = sct, None
+        v = sct.monitors[0]                           # (the part of the window on the screens)
+        x0, y0 = max(rect[0], v["left"]), max(rect[1], v["top"])
+        x1 = min(rect[0] + rect[2], v["left"] + v["width"])
+        y1 = min(rect[1] + rect[3], v["top"] + v["height"])
+        self.box = (x0, y0, x1, y1)
+
+    @property
+    def monitors(self):
+        return self.sct.monitors
+
+    def grab(self, region):
+        x0, y0, x1, y1 = self.box
+        left, top, w, h = region["left"], region["top"], region["width"], region["height"]
+        if not (x0 <= left and y0 <= top and left + w <= x1 and top + h <= y1):
+            return self.sct.grab(region)
+        if self.frame is None:
+            self.frame = np.asarray(self.sct.grab({"left": x0, "top": y0, "width": x1 - x0, "height": y1 - y0}))
+        return self.frame[top - y0:top - y0 + h, left - x0:left - x0 + w]
+
+
+class _LastLook:
+    """The answer for the last picture of something, given again for an identical one.
+
+    Between EXP gains the EXP bar (and a solid mesos box) look exactly the same at every
+    poll, so reading them again would only come to the same answer. Comparing the pixels
+    costs a few microseconds; any change at all, and it's read again."""
+
+    def __init__(self):
+        self.img = self.key = self.answer = None
+
+    def get(self, img, key):
+        """(True, the answer) if img and key are as last time, else (False, None)."""
+        last = self.img
+        if last is not None and key == self.key and last.shape == img.shape and np.array_equal(last, img):
+            return True, self.answer
+        return False, None
+
+    def put(self, img, key, answer):
+        self.img, self.key, self.answer = img, key, answer
+        return answer
 
 
 class ScreenReader:
@@ -1035,6 +1112,8 @@ class ScreenReader:
         self.exp_anchor = None      # where the EXP number starts, relative to the game window
         self.job = None             # the class shown in the status bar
         self.next_job_read = 0.0
+        self.last_exp = _LastLook()         # the EXP bar's last picture and its reading
+        self.last_mesos = _LastLook()       # the mesos box's last picture and its reading
 
     def use_window(self):
         self.mode, self.hwnd, self.box = "window", None, None
@@ -1065,6 +1144,8 @@ class ScreenReader:
             self.look_again_requested = False
             self._forget_places()
         rect = self._game_rect()
+        if rect and self.mode == "window" and PLATFORM.flat_screenshot_cost:
+            sct = _OneShot(sct, rect)                   # one screenshot for this whole look
         if self.mode == "region":
             reading = self._read_region(sct, rect)
         elif not self.hwnd and PLATFORM.missing_permission():
@@ -1196,6 +1277,14 @@ class ScreenReader:
         if not shot:
             return Reading(_problem(where, "The EXP bar is off screen.")), None
         img = shot[0]
+        if lay is None:                         # (where it was: often just as it was)
+            same, answer = self.last_exp.get(img, where)
+            if same:
+                return answer
+            return self.last_exp.put(img, where, self._read_new(img, where, None))
+        return self._read_new(img, where, lay)
+
+    def _read_new(self, img, where, lay):
         lay = lay or find_exp(img)
         if not lay:
             return Reading(_problem(where, "Can't find the EXP bar.")), None
@@ -1225,13 +1314,14 @@ class ScreenReader:
             shot = self._hide_own(grab(sct, wx, wy, ww, wh))
             if shot:
                 img, sx, sy = shot
-                field = find_mesos_field(img, g)      # the solid box is easy to spot
+                hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)   # once, for all that's looked for here
+                field = find_mesos_field(img, g, hsv)  # the solid box is easy to spot
                 if field and not self._readable(img, field):
                     field = None                      # a white patch in the scene, not the box
                 # Look for it by its outline too if it's lost, or this window is in the way of
                 # where it was (it may have been moved from there).
                 if field is None and (self.mesos_box is None or self.mesos_fails >= 10 or self.mesos_covered):
-                    field = self._find_seethrough_box(img, g)
+                    field = self._find_seethrough_box(img, g, hsv)
                 if field:
                     box = (sx - wx + field[0], sy - wy + field[1], field[2], field[3])
                     old = self.mesos_box
@@ -1242,7 +1332,7 @@ class ScreenReader:
                 if area and self._covered(*area):
                     notes.append("This window is covering the party list.")
                 else:
-                    bars = find_party_bars(img, g)
+                    bars = find_party_bars(img, g, hsv)
                     party = max(1, len(bars))
                     if len(bars) >= 2:
                         x0, y0 = min(b[0] for b in bars), min(b[1] for b in bars)
@@ -1268,21 +1358,22 @@ class ScreenReader:
         """Clear mesos digits at field? (Always yes while the mesos font is still being
         learned: then Tesseract checks every new number instead.)"""
         learned = self.mesos_digits
-        return not learned.complete or read_mesos_positions(img, field, learned.templates()) is not None
+        return not learned.complete or read_mesos_positions(*around_mesos(img, field), learned.templates()) is not None
 
-    def _find_seethrough_box(self, img, g):
+    def _find_seethrough_box(self, img, g, hsv=None):
         """The mesos box by its outline, checked by reading clear digits there.
 
         The digits are read at fixed spots from the box's right edge, so a box found a bit
         off could read a wrong number: it must also line up with the number."""
-        field = self.box_finder.find(img, g)
+        field = self.box_finder.find(img, g, hsv)
         if not field:
             return None
         learned = self.mesos_digits
         templates = learned.templates() if learned.complete else self.templates
-        if not templates or not mesos_box_lines_up(img, field, templates):
+        part, there = around_mesos(img, field)
+        if not templates or not mesos_box_lines_up(part, there, templates):
             return None
-        return field if read_mesos_positions(img, field, templates) else None
+        return field if read_mesos_positions(part, there, templates) else None
 
     def _read_mesos(self, sct, x, y, w, h):
         """Reads the mesos box at (x, y, w, h) on screen. Returns (number, image, boxes)."""
@@ -1300,7 +1391,10 @@ class ScreenReader:
 
         learned = self.mesos_digits
         if learned.complete:                          # all ten mesos digits learned
-            got = read_mesos_positions(img, (fx, fy, w, h), learned.templates())
+            templates, field = learned.templates(), (fx, fy, w, h)
+            same, got = self.last_mesos.get(img, (field, templates))
+            if not same:
+                got = self.last_mesos.put(img, (field, templates), read_mesos_positions(img, field, templates))
             if not got:
                 self.mesos_fails += 1
                 return None, img, ()

@@ -12,6 +12,7 @@ tracking code run on any OS, with no game, display or waiting.
 import contextlib
 import time
 
+import cv2
 import numpy as np
 
 import maple_exp as m
@@ -54,10 +55,13 @@ class FakeScreen:
         return [whole, dict(whole)]
 
     def desktop(self):
-        """The whole desktop, made again only when a window moved, changed or was minimized."""
+        """The whole desktop (BGR), made again only when a window moved, changed or was minimized."""
+        return self._bgra()[..., :3]
+
+    def _bgra(self):
         key = tuple((id(w.image), w.x, w.y, w.minimized) for w in self.windows)
         if getattr(self, "_key", None) != key:
-            self._key, self._desktop = key, self._paint()
+            self._key, self._desktop = key, cv2.cvtColor(self._paint(), cv2.COLOR_BGR2BGRA)
         return self._desktop
 
     def _paint(self):
@@ -77,9 +81,7 @@ class FakeScreen:
         x, y, w, h = region["left"], region["top"], region["width"], region["height"]
         self.grabs += 1
         self.pixels += w * h
-        out = np.full((h, w, 4), 255, np.uint8)
-        out[..., :3] = self.desktop()[y:y + h, x:x + w]
-        return out
+        return self._bgra()[y:y + h, x:x + w]          # (a view: like mss's buffer, read, never changed)
 
     def reset_counts(self):
         self.grabs = self.pixels = 0
@@ -114,6 +116,7 @@ class FakePlatform(Platform):
     calls counts each method used, so tests can see how often the OS is asked."""
 
     name = "Fake OS"
+    flat_screenshot_cost = False            # (set True to look as macOS does)
 
     def __init__(self, screen):
         self.screen = screen
@@ -242,7 +245,11 @@ class FakeTextOCR(TextOCR):
     name = "fake"
 
     def __init__(self, answers=""):
-        self.answers, self.calls = answers, []
+        self.answers, self.calls, self.batches = answers, [], []
+
+    def read_lines(self, images, chars=None):
+        self.batches.append(len(images))         # how many it was asked to read in one go
+        return [self.read_line(image, chars) for image in images]
 
     def read_line(self, image, chars=None):
         self.calls.append((image, chars))
@@ -260,7 +267,11 @@ class FakeGlyphMatcher(GlyphMatcher):
     calls keeps each (cx, cy, height) it was asked about."""
 
     def __init__(self, answers):
-        self.answers, self.calls = answers, []
+        self.answers, self.calls, self.batches = answers, [], []
+
+    def match_many(self, image, spots):
+        self.batches.append(len(spots))           # how many spots it was asked about in one go
+        return [self.match(image, *spot) for spot in spots]
 
     def match(self, image, cx, cy, height):
         self.calls.append((cx, cy, height))

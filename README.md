@@ -269,7 +269,8 @@ GitHub runs the logic and pipeline tests and a quick benchmark on every push ([T
 - A reading only counts if the EXP and % agree with how much EXP that level needs, so misreads are ignored.
 - Mesos are read the same way. The mesos box is found by its outline, which also works while the inventory is see-through.
 - The party size is the number of HP bars in the party list.
-- Map names and the class are read with Tesseract (`ocr/tesseract.py`), each a few ways; the most common answer wins.
+- Map names and the class are read with Tesseract (`ocr/tesseract.py`), each a few ways (all in one Tesseract run); the most common answer wins.
+- A picture that looks exactly as it did at the last look (the EXP bar or mesos between kills) isn't read again. On macOS, where a screenshot costs the same at any size, each look takes one of the game window and cuts the parts out of it.
 - Settings, the log and `errors.log` are saved in `%APPDATA%\MapleEXP` (`~/Library/Application Support/MapleEXP` on macOS; from its old name, Maple EXP/hr, so updates keep them).
 
 </details>

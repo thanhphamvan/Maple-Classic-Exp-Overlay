@@ -155,6 +155,37 @@ with Pipeline(gh=7) as p:
     c.check(f"moving the game window mid-run loses nothing (gained {p.session.exp.gained}, should be 170)",
             p.session.exp.gained == 170)
 
+# ---- one screenshot a look, where a screenshot costs the same at any size (macOS)
+c.section("one screenshot a look (macOS)")
+FIELDS = ("where", "candidates", "confident", "text", "map", "note", "mesos", "party", "mesos_at")
+for gh in (7, 28):
+    runs = {}
+    for flat in (False, True):
+        with Pipeline(gh=gh) as p:
+            p.platform.flat_screenshot_cost = flat
+            shots, readings = [], []
+            for step in range(12):
+                e, pct = LEVEL_30[min(step // 3, len(LEVEL_30) - 1)]
+                p.show(Scene(gh=gh).exp(e, pct).inventory().party(3))
+                if step == 7:
+                    p.platform.game.move(240, 120)
+                p.screen.reset_counts()
+                readings.append(p.poll())
+                shots.append(p.screen.grabs)
+            runs[flat] = (readings, shots)
+    same = all(getattr(a, k) == getattr(b, k) for a, b in zip(runs[False][0], runs[True][0]) for k in FIELDS)
+    c.check(f"EXP digits {gh} px: reads just the same from one shot of the window as from a shot of each part", same)
+    c.check(f"   one screenshot a look instead of {max(runs[False][1])} at most ({runs[True][1]})",
+            max(runs[True][1]) == 1 and sum(runs[True][1]) < sum(runs[False][1]))
+with Pipeline(gh=7, at=(100, 60)) as p:
+    p.platform.flat_screenshot_cost = True
+    p.show(Scene(gh=7))
+    p.poll()
+    p.reader.use_region({"left": 40, "top": 30, "width": 300, "height": 100})      # partly outside the window
+    p.screen.reset_counts()
+    p.poll()
+    c.check(f"a selected area is shot on its own ({p.screen.grabs} screenshot)", p.screen.grabs == 1)
+
 # ---- Select area (a box drawn around the EXP numbers instead of following the game)
 c.section("select area")
 with Pipeline(gh=11, at=(50, 40)) as p:

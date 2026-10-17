@@ -27,8 +27,14 @@ def glyph_patch(V, cx, cy, height, shift=0):
 
 
 def _unit_rows(a):
+    """Each row minus its mean, scaled to length 1 (so a dot product is a correlation)."""
     a = a - a.mean(axis=1, keepdims=True)
-    return a / np.maximum(np.linalg.norm(a, axis=1, keepdims=True), 1e-6)
+    return a / np.maximum(np.sqrt(np.einsum("ij,ij->i", a, a))[:, None], 1e-6)
+
+
+def _windows(patch):
+    """Every PH x PW window of a patch (one per small shift), as rows."""
+    return np.lib.stride_tricks.sliding_window_view(patch, (PH, PW)).reshape(-1, PH * PW)
 
 
 class TemplateMatcher(GlyphMatcher):
@@ -44,6 +50,9 @@ class TemplateMatcher(GlyphMatcher):
         self.labels = np.array(labels)
         self.digits = sorted(set(labels))
         self.mat = _unit_rows(np.stack(rows))
+        self._matT = np.ascontiguousarray(self.mat.T)
+        # labels are sorted, so each character's examples are one run of columns
+        self._starts = np.searchsorted(self.labels, self.digits)
 
     @classmethod
     def load(cls, path):
@@ -60,17 +69,34 @@ class TemplateMatcher(GlyphMatcher):
     def save(path, examples):
         np.savez(path, canon=CANON, **{f"d{k}": np.stack(v) for k, v in examples.items()})
 
+    def _best(self, windows, groups):
+        """Best correlation per character for each of `groups` equal runs of window rows."""
+        s = _unit_rows(windows) @ self._matT
+        s = s.reshape(groups, -1, s.shape[1]).max(axis=1)           # best shift (and size)
+        return np.maximum.reduceat(s, self._starts, axis=1)          # best example per character
+
     def scores(self, patch):
         """Best correlation per character, trying every small shift of the patch."""
-        windows = np.lib.stride_tricks.sliding_window_view(patch, (PH, PW)).reshape(-1, PH * PW)
-        s = (_unit_rows(windows) @ self.mat.T).max(axis=0)
-        return {d: float(s[self.labels == d].max()) for d in self.digits}
+        best = self._best(_windows(patch), 1)[0]
+        return {d: float(v) for d, v in zip(self.digits, best)}
 
     def match(self, image, cx, cy, height):
-        best = {}
-        for f in SIZES:
-            for d, s in self.scores(glyph_patch(image, cx, cy, height * f, SHIFT)).items():
-                best[d] = max(best.get(d, -1.0), s)
-        ranked = sorted(best.values(), reverse=True)
-        lead = ranked[0] - ranked[1] if len(ranked) > 1 else 1.0
-        return max(best, key=best.get), ranked[0], lead
+        return self.match_many(image, [(cx, cy, height)])[0]
+
+    def match_many(self, image, spots):
+        """All spots, at every size and shift, in one matrix product."""
+        if not len(spots):
+            return []
+        windows = np.concatenate([_windows(glyph_patch(image, cx, cy, height * f, SHIFT))
+                                  for cx, cy, height in spots for f in SIZES])
+        best = self._best(windows, len(spots))
+        out = []
+        for row in best:
+            i = int(np.argmax(row))                  # (the first of equal ones, as max() would)
+            if len(row) > 1:
+                top2 = np.partition(row, -2)[-2:]
+                lead = float(top2[1] - top2[0])
+            else:
+                lead = 1.0
+            out.append((self.digits[i], float(row[i]), lead))
+        return out

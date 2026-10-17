@@ -40,9 +40,17 @@ SCREENSHOTS = {}            # poll case -> screenshots one poll takes (counted b
 
 # --------------------------------------------------------------------------- timing
 
+def cpu_seconds():
+    """CPU time used so far: this process (all its threads) and the programs it ran and
+    waited for, like Tesseract. (Windows doesn't count the programs it ran: os.times()
+    gives 0 for them there.)"""
+    t = os.times()
+    return t.user + t.system + t.children_user + t.children_system
+
+
 def measure(fn, setup=None, seconds=1.0, min_runs=5, max_runs=2000, warmup=2):
     """Runs fn() until `seconds` have gone by (at least min_runs times); setup() before each
-    run isn't timed. Returns the run times in milliseconds."""
+    run isn't timed. Returns (wall time, CPU time) of each run, in milliseconds."""
     for _ in range(warmup):
         if setup:
             setup()
@@ -52,16 +60,18 @@ def measure(fn, setup=None, seconds=1.0, min_runs=5, max_runs=2000, warmup=2):
     while len(times) < min_runs or (time.perf_counter() < end and len(times) < max_runs):
         if setup:
             setup()
-        t0 = time.perf_counter_ns()
+        c0, t0 = cpu_seconds(), time.perf_counter_ns()
         fn()
-        times.append((time.perf_counter_ns() - t0) / 1e6)
+        times.append(((time.perf_counter_ns() - t0) / 1e6, (cpu_seconds() - c0) * 1000))
     return times
 
 
 def summary(times):
-    ordered = sorted(times)
+    """median, p95 and min of the wall times; the mean CPU time (os.times() only counts in
+    steps of 10 ms or so on some systems, so a mean over many runs is the useful number)."""
+    ordered = sorted(t for t, _ in times)
     return {"median_ms": statistics.median(ordered), "p95_ms": ordered[min(len(ordered) - 1, int(0.95 * len(ordered)))],
-            "min_ms": ordered[0], "runs": len(ordered)}
+            "min_ms": ordered[0], "cpu_ms": statistics.fmean(c for _, c in times), "runs": len(ordered)}
 
 
 # --------------------------------------------------------------------------- cases
@@ -80,17 +90,19 @@ def reading_cases(gh):
     lay = m.find_exp(bottom)
     mesos_tpl = m.MesosDigits().templates()
     field = m.find_mesos_field(scene, gh)
+    part, there = m.around_mesos(scene, field)            # what a poll reads it in
     yield f"find EXP bar in bottom strip, {gh} px", lambda _: (lambda: m.find_exp(bottom), None)
     yield f"read EXP digits, {gh} px", lambda _: (lambda: m.read_layout(tpl, lay), None)
     yield f"find mesos box in window, {gh} px", lambda _: (lambda: m.find_mesos_field(scene, gh), None)
-    yield f"read mesos digits, {gh} px", lambda _: (lambda: m.read_mesos_positions(scene, field, mesos_tpl), None)
+    yield f"read mesos digits, {gh} px", lambda _: (lambda: m.read_mesos_positions(part, there, mesos_tpl), None)
     yield f"count party in window, {gh} px", lambda _: (lambda: m.find_party_bars(scene, gh), None)
 
 
 def poll_cases(gh):
     """A whole poll (ScreenReader.read): the first one (finds everything), the usual one (EXP
-    bar and mesos where they were), and one that also looks over the whole window (every
-    SCAN_SECONDS, for the party list and a moved inventory)."""
+    bar and mesos where they were: read again if they changed, else the last reading is
+    kept), and one that also looks over the whole window (every SCAN_SECONDS, for the party
+    list and a moved inventory)."""
     scene = Scene(gh=gh).inventory().party(4)
 
     def cold(stack):
@@ -111,7 +123,15 @@ def poll_cases(gh):
         p.poll()
         return p
 
+    def changed(p):
+        """As if the EXP bar and mesos had changed since the last poll: read them again."""
+        p.reader.last_exp, p.reader.last_mesos = m._LastLook(), m._LastLook()
+
     def steady(stack):
+        p = ready(stack)
+        return (lambda: p.reader.read(p.screen)), (lambda: changed(p))
+
+    def unchanged(stack):
         p = ready(stack)
         return (lambda: p.reader.read(p.screen)), None
 
@@ -119,6 +139,7 @@ def poll_cases(gh):
         p = ready(stack)
 
         def setup():
+            changed(p)
             p.reader.next_scan = 0.0                       # the whole-window look is due
         return (lambda: p.reader.read(p.screen)), setup
 
@@ -138,6 +159,7 @@ def poll_cases(gh):
     _screen = []
     yield counted(f"poll: first (finds everything), {gh} px", cold)
     yield counted(f"poll: usual (EXP + mesos), {gh} px", steady)
+    yield counted(f"poll: usual, nothing changed, {gh} px", unchanged)
     yield counted(f"poll: with whole-window look, {gh} px", scan)
 
 
@@ -173,6 +195,7 @@ def ocr_cases():
     ImageDraw.Draw(img).text((12, 8), "Rocky Road II", fill=0, font=ImageFont.load_default(size=2 * CANON))
     line = np.array(img)
     yield "ocr: one line of text (Tesseract)", lambda _: (lambda: text_ocr.read_line(line), None)
+    yield "ocr: six lines in one run (Tesseract)", lambda _: (lambda: text_ocr.read_lines([line] * 6), None)
     status = cv2.imread(str(ROOT / "tests" / "frames" / "status_gh7.png"))
     yield "read class, 7 px (6 Tesseract reads)", \
         lambda _: (lambda: m.read_job(status, 462, 21.5, 7, text_ocr), None)
@@ -227,7 +250,9 @@ def meta():
 def poll_budget(results):
     """Average cost of a poll while tracking: the usual poll, plus a whole-window look once
     every SCAN_SECONDS. As a share of the time between polls, that's the CPU it uses. With
-    --live, real screenshots are added (the fake screen's are nearly free)."""
+    --live, real screenshots are added (the fake screen's are nearly free). It counts the
+    EXP bar and mesos as changed at every poll, so it's the most it costs: between kills,
+    when they don't change, a usual poll costs less ("nothing changed")."""
     live = results.get("live: screenshot 300x40 (EXP bar)")
     lines = []
     for gh in UI_SIZES:
@@ -237,32 +262,41 @@ def poll_budget(results):
             continue
         share = m.POLL_SECONDS / m.SCAN_SECONDS
         avg = usual["median_ms"] * (1 - share) + scan["median_ms"] * share
+        cpu = usual.get("cpu_ms", usual["median_ms"]) * (1 - share) + scan.get("cpu_ms", scan["median_ms"]) * share
         shots = usual.get("screenshots", 0) * (1 - share) + scan.get("screenshots", 0) * share
         w, h = SIZES[gh]["window"]
-        line = (f"  {w}x{h} game window ({gh} px digits): {avg:6.1f} ms a poll, "
-                f"{avg / (m.POLL_SECONDS * 1000):6.2%} of one core, {shots:.1f} screenshots")
+        line = (f"  {w}x{h} game window ({gh} px digits): {avg:6.1f} ms a poll ({cpu:5.1f} ms CPU), "
+                f"{cpu / (m.POLL_SECONDS * 1000):6.2%} of one core, {shots:.1f} screenshots")
         if live:
             # (a whole-window screenshot costs about the same as a small one on macOS, more on Windows)
-            real = avg + shots * live["median_ms"]
-            line += f"; with real screenshots {real:6.1f} ms, {real / (m.POLL_SECONDS * 1000):6.2%}"
+            real = cpu + shots * live.get("cpu_ms", live["median_ms"])
+            line += f"; with real screenshots {real:6.1f} ms CPU, {real / (m.POLL_SECONDS * 1000):6.2%}"
         lines.append(line)
     return lines
 
 
 def compare(results, baseline, threshold):
-    """Prints each case against the baseline; returns the names that got slower than threshold x."""
+    """Prints each case against the baseline (wall and CPU time); returns the names that got
+    more than threshold x slower in either."""
     slower = []
-    print(f"\n{'case':58} {'before':>9} {'now':>9} {'change':>8}")
+    print(f"\n{'case':58} {'before':>9} {'now':>9} {'change':>7}   {'CPU before':>10} {'now':>9} {'change':>7}")
     for name, now in results.items():
         before = baseline.get("results", {}).get(name)
         if not before:
             print(f"{name:58} {'—':>9} {now['median_ms']:8.2f}  (new)")
             continue
         ratio = now["median_ms"] / max(before["median_ms"], 1e-6)
-        flag = "  SLOWER" if ratio > threshold else ""
-        print(f"{name:58} {before['median_ms']:8.2f} {now['median_ms']:8.2f} {ratio - 1:+7.0%}{flag}")
-        if flag:
+        line = f"{name:58} {before['median_ms']:8.2f} {now['median_ms']:8.2f} {ratio - 1:+7.0%}"
+        worst = ratio
+        if "cpu_ms" in before and "cpu_ms" in now:
+            cpu_ratio = now["cpu_ms"] / max(before["cpu_ms"], 1e-6)
+            line += f"   {before['cpu_ms']:10.2f} {now['cpu_ms']:9.2f} {cpu_ratio - 1:+7.0%}"
+            if before["cpu_ms"] >= 0.5:               # (below that, CPU time is mostly rounding)
+                worst = max(worst, cpu_ratio)
+        if worst > threshold:
+            line += "  SLOWER"
             slower.append(name)
+        print(line)
     return slower
 
 
@@ -281,7 +315,7 @@ def main():
     info = meta()
     print(f"Maple Classic Exp Overlay {info['version']} ({info['commit'] or 'no git'}), {info['os']} "
           f"{info['machine']}, Python {info['python']}, OpenCV {info['opencv']}, {info['cpus']} CPUs\n")
-    print(f"{'case':58} {'median':>9} {'p95':>9} {'min':>9} {'runs':>6}")
+    print(f"{'case':58} {'median':>9} {'p95':>9} {'min':>9} {'cpu':>9} {'runs':>6}")
     results = {}
     for name, make in all_cases(args.live):
         if args.only.lower() not in name.lower():
@@ -291,7 +325,7 @@ def main():
             r = results[name] = summary(measure(fn, setup, seconds=seconds))
             if name in SCREENSHOTS:
                 r["screenshots"] = SCREENSHOTS[name]
-        print(f"{name:58} {r['median_ms']:8.2f}ms {r['p95_ms']:8.2f}ms {r['min_ms']:8.2f}ms {r['runs']:6}")
+        print(f"{name:58} {r['median_ms']:8.2f}ms {r['p95_ms']:8.2f}ms {r['min_ms']:8.2f}ms {r['cpu_ms']:8.2f}ms {r['runs']:6}")
 
     budget = poll_budget(results)
     if budget:

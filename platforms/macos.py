@@ -111,6 +111,7 @@ class MacHotkeys(Hotkeys):
 
 class MacPlatform(Platform):
     name = "macOS"
+    flat_screenshot_cost = True             # ~8 ms of the window server's CPU a shot, small or big
 
     def version(self):
         return f"macOS {platform.mac_ver()[0]}"

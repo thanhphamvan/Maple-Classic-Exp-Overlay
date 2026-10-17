@@ -11,6 +11,7 @@ Run from the project folder:  py -3 tests/test_ocr.py
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 os.environ["MAPLE_EXP_DATA"] = tempfile.mkdtemp()           # never touch your real data
@@ -29,6 +30,7 @@ from ocr.templates import CANON, PH, PW, TemplateMatcher, glyph_patch  # noqa: E
 c = Checks()
 rnd = np.random.default_rng(1)
 examples = {k[1:]: v for k, v in np.load(m.TEMPLATE_PATH).items() if k.startswith("d")}
+learned = m.MesosDigits(path=Path(tempfile.mkdtemp()) / "x.npz").templates()
 
 
 def on_canvas(patch, scale=1, size=(60, 60)):
@@ -191,10 +193,80 @@ m.ocr_mesos(mesos_lay, fake)
 c.check("   asks for digits and commas only", all(ch == "0123456789," for _, ch in fake.calls))
 c.check("no text OCR: (None, 0)", m.ocr_mesos(mesos_lay, ocr.NoTextOCR()) == (None, 0))
 
+# ===================================================================== doing no more work than needed
+c.section("doing no more work than needed")
+big = np.random.default_rng(2).integers(0, 255, (2160, 3840, 3), dtype=np.uint8)
+t0, c0 = time.perf_counter(), sum(os.times()[:2])
+for _ in range(10):
+    cv2.morphologyEx(cv2.cvtColor(big, cv2.COLOR_BGR2HSV), cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+wall, cpu = time.perf_counter() - t0, sum(os.times()[:2]) - c0
+c.check(f"OpenCV works on one thread: no more CPU than time taken ({cpu / wall:.2f}x; on all cores it's ~2.5x)",
+        cpu <= 1.3 * wall)
+img, cx, cy = on_canvas(np.asarray(examples["4"][0], np.float32))
+spots = [(cx, cy, CANON), (cx + 3, cy, CANON), (10, 10, CANON * 0.8)]
+c.check("matching many spots at once gives what matching them one at a time does",
+        all(a[0] == b[0] and abs(a[1] - b[1]) < 1e-5 and abs(a[2] - b[2]) < 1e-5
+            for a, b in zip(tm.match_many(img, spots), [tm.match(img, *s) for s in spots])))
+fake = FakeGlyphMatcher.reading("686017168")
+m.read_layout(fake, lay)
+c.check(f"the EXP bar's digits are matched in one go ({fake.batches})", fake.batches == [cells])
+for what, fn, want in (
+        ("map name", lambda f: m.read_map_name(box, gh, f), [6]),
+        ("class", lambda f: m.read_job(cv2.imread(str(FRAMES / "status_gh7.png")), 462, 21.5, 7, f), [6]),
+        ("mesos check", lambda f: m.ocr_mesos(mesos_lay, f), [6]),
+        ("EXP fallback", lambda f: m.ocr_candidates(cv2.imread(str(FRAMES / "exp_win-1280x720.png")), lay, f), [4])):
+    fake = FakeTextOCR("Bandit")
+    fn(fake)
+    c.check(f"the {what}'s tries go to the text OCR in one go ({fake.batches})", fake.batches == want)
+if tess.available:
+    pics = [line(t) for t in ("Rocky Road II", "68,601", "Kerning City")] + [np.full((60, 200), 255, np.uint8)]
+    before = tess.runs
+    batch = tess.read_lines(pics)
+    c.check(f"Tesseract reads a batch in one run ({tess.runs - before}), each as it would alone "
+            f"({[t.strip() for t in batch]})", tess.runs - before == 1 and batch == [tess.read_line(p) for p in pics])
+    c.check("   an empty batch doesn't start it", tess.read_lines([]) == [] and tess.runs == before + 1 + len(pics))
+    try:
+        ocr.create_text_ocr("tesseract", "/no/such/tesseract").read_line(pics[0])
+        failed = False
+    except Exception:
+        failed = True
+    c.check("a Tesseract that won't run is an error, not an empty answer", failed)
+
+with Pipeline(gh=7, templates=FakeGlyphMatcher.reading("686017168" * 100)) as p:
+    p.show(Scene(gh=7).inventory())
+    p.poll()
+    p.poll()
+    before = len(p.reader.templates.calls)
+    r = p.poll()
+    c.check(f"an EXP bar that looks just as it did isn't read again ({len(p.reader.templates.calls) - before} digits matched)",
+            len(p.reader.templates.calls) == before and r.confident)
+    p.show(Scene(gh=7).exp(68681, 71.76).inventory())
+    before = len(p.reader.templates.calls)
+    r = p.poll()
+    c.check(f"   a changed one is ({len(p.reader.templates.calls) - before} digits matched)",
+            len(p.reader.templates.calls) - before == cells)
+with Pipeline(gh=7) as p:
+    p.show(Scene(gh=7).inventory())
+    p.poll()
+    p.poll()
+    look = p.reader.last_mesos.answer
+    r = p.poll()
+    c.check(f"a mesos box that looks just as it did gives the same reading without reading it ({r.mesos})",
+            r.mesos == MESOS and p.reader.last_mesos.answer is look)
+    p.show(Scene(gh=7).inventory(alpha=0.7))
+    r = p.poll()
+    c.check(f"   one that changed is read again ({r.mesos})", p.reader.last_mesos.answer is not look)
+scene = Scene(gh=28).inventory().render()
+field = m.find_mesos_field(scene, 28)
+part, there = m.around_mesos(scene, field)
+whole, near = m.read_mesos_positions(scene, field, learned), m.read_mesos_positions(part, there, learned)
+c.check(f"reading the mesos box in just the part around it gives what the whole shot does "
+        f"({whole[0]}, {part.shape[1]}x{part.shape[0]} of {scene.shape[1]}x{scene.shape[0]})",
+        whole[0] == near[0] and abs(whole[2] - near[2]) < 1e-5 and abs(whole[3] - near[3]) < 1e-5)
+
 # ===================================================================== how they're wired together
 c.section("wiring")
 c.check("the EXP bar's examples load as a GlyphMatcher", isinstance(m.DigitTemplates.load(), ocr.GlyphMatcher))
-learned = m.MesosDigits(path=Path(tempfile.mkdtemp()) / "x.npz").templates()
 c.check("the mesos digits (as they come, before any are learned) make a GlyphMatcher", isinstance(learned, ocr.GlyphMatcher))
 c.check("a screen reader made without a text OCR has none", not m.ScreenReader(None).text_ocr.available)
 with Pipeline(gh=7) as p:

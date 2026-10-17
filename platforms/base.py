@@ -72,6 +72,10 @@ class Platform(ABC):
     """One OS. create_platform() picks the one the overlay is running on."""
 
     name = "?"
+    # True if a screenshot costs about the same at any size (macOS: the window server makes
+    # one of the whole screen each time). The overlay then takes one of the game window per
+    # look, and cuts the EXP bar, mesos and the rest out of it, instead of one shot of each.
+    flat_screenshot_cost = False
 
     def setup_process(self):
         """Called once at start, before any window or screenshot."""

@@ -19,6 +19,11 @@ class GlyphMatcher(ABC):
         `height` px tall. Returns (character, score, lead): score is how well it matches
         (about 0.9+ for a clear one, at most 1), lead how far ahead of the runner-up."""
 
+    def match_many(self, image, spots):
+        """match() for each (cx, cy, height) in spots, as a list. A backend can do them all
+        at once, which is faster than one at a time."""
+        return [self.match(image, cx, cy, height) for cx, cy, height in spots]
+
 
 class TextOCR(ABC):
     """Reads a line of text."""
@@ -32,6 +37,11 @@ class TextOCR(ABC):
         array, with a white border around the text). chars: only these characters can be in
         it (e.g. "0123456789,"). Returns a string, "" if nothing was read."""
 
+    def read_lines(self, images, chars=None):
+        """read_line() for each image, as a list. A backend can read them all in one go, which
+        can be much cheaper (Tesseract: one start instead of one per image)."""
+        return [self.read_line(image, chars) for image in images]
+
 
 class NoTextOCR(TextOCR):
     """Stands in when there's no text OCR: reads nothing, and says so (available is False),
@@ -42,3 +52,6 @@ class NoTextOCR(TextOCR):
 
     def read_line(self, image, chars=None):
         return ""
+
+    def read_lines(self, images, chars=None):
+        return [""] * len(images)
