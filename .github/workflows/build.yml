@@ -49,6 +49,7 @@ jobs:
         run: |
           python tests/test_logic.py
           python tests/test_screen.py
+          python tests/test_pipeline.py
       - name: Build
         run: python build.py
       - name: Keep the unsigned build

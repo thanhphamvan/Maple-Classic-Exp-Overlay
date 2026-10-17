@@ -237,13 +237,26 @@ py -3 build.py
 **Run the tests:**
 
 ```
+py -3 tests/run_all.py            (all of them; or one at a time:)
 py -3 tests/test_logic.py
 py -3 tests/test_screen.py
+py -3 tests/test_pipeline.py
+```
+
+`test_pipeline.py` runs the whole reading pipeline, from the game window to EXP/hr, on any OS with no game: `tests/harness/` stands in for the OS (`FakePlatform`, the same `Platform` interface the real ones have), the screen (`FakeScreen`, in place of mss) and the clock (`FakeClock`). The game window is put together from the real crops in `tests/frames/` at three UI sizes (`Scene(gh=7).exp(68681, 71.76).inventory().party(3)`), and `Pipeline` feeds each reading to the trackers as the app does.
+
+**Benchmark** how long each step of reading the screen takes, at each UI size, and how much of a CPU core that is at one poll every 1.5 s:
+
+```
+py -3 bench/bench.py                         (--quick for fewer runs, --only poll for some cases)
+py -3 bench/bench.py --live                  also real screenshots and this OS's window calls
+py -3 bench/bench.py --json before.json      save the results, then after a change:
+py -3 bench/bench.py --compare before.json   fails if a case got 1.5x slower (--threshold to change)
 ```
 
 To build with exactly the packages the releases use: `py -3 -m pip install --require-hashes -r requirements-build.txt`.
 
-GitHub runs the logic tests on every push ([Tests workflow](.github/workflows/tests.yml)). The [Build workflow](.github/workflows/build.yml) builds the download on GitHub (Actions tab, **Build**, **Run workflow**), runs all the tests first, and signs the .exe once code signing is set up. Pushing a version tag also attests the zip and drafts the release with it; releases are only ever made that way.
+GitHub runs the logic and pipeline tests and a quick benchmark on every push ([Tests workflow](.github/workflows/tests.yml)). The [Build workflow](.github/workflows/build.yml) builds the download on GitHub (Actions tab, **Build**, **Run workflow**), runs all the tests first, and signs the .exe once code signing is set up. Pushing a version tag also attests the zip and drafts the release with it; releases are only ever made that way.
 
 **The stats site** is in `server/`: a Cloudflare Pages site with a D1 database (free tier). The page is `server/public/`, the API is `server/src/index.js`. `npm --prefix server install`, then `npm --prefix server run dev` runs it locally, `py -3 server/test_server.py http://localhost:8787` tests it, and `npm --prefix server run deploy` puts it online.
 
