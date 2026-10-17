@@ -41,9 +41,9 @@ from tkinter import font as tkfont, messagebox, simpledialog, ttk
 import cv2
 import mss
 import numpy as np
-import pytesseract
 from PIL import Image, ImageDraw, ImageTk
 
+from ocr import CANON, NoTextOCR, TemplateMatcher, create_text_ocr, glyph_patch
 from platforms import create_platform, hotkey_text, parse_hotkey
 
 # Everything that differs between Windows and macOS (finding the game window, screen scaling,
@@ -99,9 +99,6 @@ EXP_TABLE = [
     3709829, 3913127, 4127566, 4353756, 4592341, 4844001, 5109452, 5389449, 5684790, 11938059,
     25069923, 52646838, 110558359, 232172553, 487562361, 1023880958, 2150150011, 4515315023, 9482161548,
 ]
-
-tesseract_ok = False        # set in main(); Tesseract is only a fallback
-
 
 # --------------------------------------------------------------------------- files
 
@@ -277,15 +274,13 @@ def grab(sct, left, top, width, height):
 # The status bar shows "EXP. 38,849 [61.02%]": white digits and green brackets. The game
 # draws it in a small pixel font scaled up to the window size, so once a digit is rescaled
 # to a standard height it can be recognised by comparing it pixel by pixel with saved
-# examples of each digit (digits.npz).
+# examples of each digit (digits.npz). How a digit is recognised is up to a GlyphMatcher
+# (ocr/): these readers find where the digits are and decide whether to believe them.
 
 Blob = namedtuple("Blob", "i x y w h")
 # cells are digit positions (centre x, width, "digit" or "wide"); V is the brightness image
 Layout = namedtuple("Layout", "gh cy exp pct box V")
 
-CANON = 24                  # digits are compared at this height
-PH, PW = 28, 19             # size of one digit patch at that height
-SHIFT = 3                   # px of wiggle room when lining a digit up with an example
 MIN_SCORE = 0.75            # correlation the best digit needs (true matches score ~0.9+)
 MIN_LEAD = 0.03             # ...and how far ahead of the runner-up it must be
 
@@ -366,59 +361,17 @@ def find_exp(bgr):
     return max((f for f in found if f.cy >= low - 0.5 * f.gh), key=lambda f: f.box[0])
 
 
-def digit_patch(V, cx, cy, gh, shift):
-    """Brightness patch around one digit, rescaled so the digit is CANON px tall."""
-    k = gh / CANON
-    x0 = cx - (PW / 2 + shift) * k
-    y0 = cy - (PH / 2 + shift) * k
-    M = np.float32([[1 / k, 0, -x0 / k], [0, 1 / k, -y0 / k]])
-    return cv2.warpAffine(V, M, (PW + 2 * shift, PH + 2 * shift), flags=cv2.INTER_LINEAR,
-                          borderMode=cv2.BORDER_REPLICATE)
+def _match(matcher, lay, cell):
+    """(digit, score, lead) for one digit position of a Layout, from a GlyphMatcher."""
+    return matcher.match(lay.V, cell[0], lay.cy, lay.gh)
 
 
-def _unit_rows(a):
-    a = a - a.mean(axis=1, keepdims=True)
-    return a / np.maximum(np.linalg.norm(a, axis=1, keepdims=True), 1e-6)
-
-
-class DigitTemplates:
-    """Example patches of each digit; scores a patch against all of them at once."""
-
-    def __init__(self, examples):
-        labels, rows = [], []
-        for digit, patches in sorted(examples.items()):
-            for p in patches:
-                labels.append(digit)
-                rows.append(np.asarray(p, np.float32).reshape(-1))
-        self.labels = np.array(labels)
-        self.digits = sorted(set(labels))
-        self.mat = _unit_rows(np.stack(rows))
+class DigitTemplates(TemplateMatcher):
+    """The EXP bar's digits: a TemplateMatcher with the examples in assets/digits.npz."""
 
     @classmethod
     def load(cls, path=TEMPLATE_PATH):
-        try:
-            data = np.load(path)
-            if int(data["canon"]) != CANON:
-                return None
-            return cls({k[1:]: data[k] for k in data.files if k.startswith("d")})
-        except Exception:
-            return None
-
-    def scores(self, patch):
-        """Best correlation per digit, trying every small shift of the patch."""
-        windows = np.lib.stride_tricks.sliding_window_view(patch, (PH, PW)).reshape(-1, PH * PW)
-        s = (_unit_rows(windows) @ self.mat.T).max(axis=0)
-        return {d: float(s[self.labels == d].max()) for d in self.digits}
-
-    def match(self, lay, cell):
-        """(digit, score, lead over the runner-up) for one digit position."""
-        best = {}
-        for f in (0.95, 1.0, 1.05):         # allow for small errors in the size estimate
-            for d, s in self.scores(digit_patch(lay.V, cell[0], lay.cy, lay.gh * f, SHIFT)).items():
-                best[d] = max(best.get(d, -1.0), s)
-        ranked = sorted(best.values(), reverse=True)
-        lead = ranked[0] - ranked[1] if len(ranked) > 1 else 1.0
-        return max(best, key=best.get), ranked[0], lead
+        return super().load(path)
 
 
 def _pct_cells(lay):
@@ -431,7 +384,7 @@ def _read_digits(tpl, lay, cells):
     for cell in cells:
         if cell[2] != "digit":
             return None
-        digit, score, lead = tpl.match(lay, cell)
+        digit, score, lead = _match(tpl, lay, cell)
         if score < MIN_SCORE or lead < MIN_LEAD:
             return None
         s += digit
@@ -449,8 +402,8 @@ def read_layout(tpl, lay):
     return int(exp_s), int(pct_s) / 100          # the game always shows 2 decimals
 
 
-def _ocr_cells(bgr, lay, cells):
-    """Tesseract on the area covering cells, two ways. Returns digit strings."""
+def _ocr_cells(bgr, lay, cells, ocr):
+    """Text OCR on the area covering cells, two ways. Returns digit strings."""
     if not cells:
         return []
     g = lay.gh
@@ -467,17 +420,16 @@ def _ocr_cells(bgr, lay, cells):
     out = []
     for mask in (white, bright):
         img = cv2.copyMakeBorder(255 - mask, 12, 12, 12, 12, cv2.BORDER_CONSTANT, value=255)
-        text = pytesseract.image_to_string(img, config="--psm 7 -c tessedit_char_whitelist=0123456789,.")
-        out.append(re.sub(r"\D", "", text))
+        out.append(re.sub(r"\D", "", ocr.read_line(img, chars="0123456789,.")))
     return out
 
 
-def tesseract_candidates(bgr, lay):
-    """Fallback: (exp, pct) guesses from Tesseract. The tracker picks one that adds up."""
-    if not tesseract_ok:
+def ocr_candidates(bgr, lay, ocr):
+    """Fallback: (exp, pct) guesses from the text OCR. The tracker picks one that adds up."""
+    if not ocr.available:
         return []
-    exps = {int(s) for s in _ocr_cells(bgr, lay, lay.exp) if s}
-    pcts = {int(s) / 100 for s in _ocr_cells(bgr, lay, _pct_cells(lay))
+    exps = {int(s) for s in _ocr_cells(bgr, lay, lay.exp, ocr) if s}
+    pcts = {int(s) / 100 for s in _ocr_cells(bgr, lay, _pct_cells(lay), ocr)
             if 3 <= len(s) <= 5}
     return [(e, p) for e in sorted(exps) for p in sorted(pcts)]
 
@@ -499,15 +451,16 @@ def build_templates(samples, scales=(1.0, 0.75, 0.55, 0.4, 0.3), path=TEMPLATE_P
             if len(exp_cells) != len(exp_t) or len(pct_cells) != len(pct_t):
                 continue
             for cell, ch in zip(exp_cells + pct_cells, exp_t + pct_t):
-                examples.setdefault(ch, []).append(digit_patch(lay.V, cell[0], lay.cy, lay.gh, 0))
-    np.savez(path, canon=CANON, **{f"d{k}": np.stack(v) for k, v in examples.items()})
+                examples.setdefault(ch, []).append(glyph_patch(lay.V, cell[0], lay.cy, lay.gh))
+    TemplateMatcher.save(path, examples)
     return {k: len(v) for k, v in sorted(examples.items())}
 
 
 # --------------------------------------------------------------------------- map name and level
 #
 # The minimap's light-blue info box shows the region and, under it, the map name in white
-# text. It's read with Tesseract a few different ways, and the most common answer wins.
+# text. It's read with the text OCR (ocr/, Tesseract) a few different ways, and the most
+# common answer wins.
 # The level comes from the EXP table: each level needs a different amount of EXP.
 
 def level_for_req(req):
@@ -553,7 +506,7 @@ def _clean_job(text):
     return t if len(t) >= 3 else ""
 
 
-def read_job(bgr, x0, cy, g):
+def read_job(bgr, x0, cy, g, ocr):
     """The job name in the status bar (e.g. 'Bandit'), from a shot where the EXP number's
     first digit is at x0 and its middle at cy, or None if it can't be read clearly.
 
@@ -593,7 +546,7 @@ def read_job(bgr, x0, cy, g):
     if glyph_h > 10:                                  # big screens: read at small-window size,
         k = 10.0 / glyph_h                            # where Tesseract reads this font best
         crop, glyph_h = cv2.resize(crop, None, fx=k, fy=k, interpolation=cv2.INTER_AREA), 10.0
-    votes = _ocr_votes(crop.astype(np.float32), glyph_h, "--psm 7", _clean_job)
+    votes = _ocr_votes(crop.astype(np.float32), glyph_h, ocr, _clean_job)
     text, n = votes.most_common(1)[0] if votes else ("", 0)
     if n < 2:
         return None
@@ -608,8 +561,8 @@ def _whiteness(bgr):
     return np.clip((hsv[..., 2] - 150) / 90, 0, 1) * np.clip((80 - hsv[..., 1]) / 50, 0, 1)
 
 
-def _ocr_votes(whiteness, glyph_h, config, clean):
-    """Tesseract on white text at a few sizes, with and without smoothing. Counts answers."""
+def _ocr_votes(whiteness, glyph_h, ocr, clean, chars=None):
+    """The text OCR on white text at a few sizes, with and without smoothing. Counts answers."""
     votes = Counter()
     for target in (36, 48, 60):
         s = target / glyph_h
@@ -617,7 +570,7 @@ def _ocr_votes(whiteness, glyph_h, config, clean):
         for img in ((big > 0.5) * 255.0, np.clip(big, 0, 1) * 255):
             img = cv2.copyMakeBorder((255 - img).astype(np.uint8), 24, 24, 24, 24,
                                      cv2.BORDER_CONSTANT, value=255)
-            text = clean(pytesseract.image_to_string(img, config=config))
+            text = clean(ocr.read_line(img, chars))
             if text:
                 votes[text] += 1
     return votes
@@ -647,7 +600,7 @@ def _clean_map_name(text):
     return t if len(t) >= 3 else ""
 
 
-def read_map_name(bgr, gh):
+def read_map_name(bgr, gh, ocr):
     """The map name (the lower line of white text) from a shot of the minimap's info box."""
     white = _whiteness(bgr[:, int(0.85 * bgr.shape[0]):])      # skip the map's icon
     _, blobs = _blobs(white > 0.5)
@@ -666,7 +619,7 @@ def read_map_name(bgr, gh):
     ln = lines[-1]
     x0, x1 = max(0, min(b.x for b in ln) - 2), max(b.x + b.w for b in ln) + 2
     y0, y1 = max(0, min(b.y for b in ln) - 2), max(b.y + b.h for b in ln) + 2
-    votes = _ocr_votes(white[y0:y1, x0:x1], max(b.h for b in ln), "--psm 7", _clean_map_name)
+    votes = _ocr_votes(white[y0:y1, x0:x1], max(b.h for b in ln), ocr, _clean_map_name)
     name, n = votes.most_common(1)[0] if votes else (None, 0)
     return name if n >= 2 else None
 
@@ -787,8 +740,8 @@ def mesos_box_lines_up(bgr, field, templates):
     a '1'), and just right of it there must be no digit (else the box is a digit too far
     left and the number would be read short)."""
     lay, h = _mesos_strokes(bgr, field), field[3]
-    _, first, _ = templates.match(lay, (_mesos_spot(field, 0), 0.4 * h, "digit"))
-    _, after, _ = templates.match(lay, (_mesos_spot(field, -1), 0.4 * h, "digit"))
+    _, first, _ = _match(templates, lay, (_mesos_spot(field, 0), 0.4 * h, "digit"))
+    _, after, _ = _match(templates, lay, (_mesos_spot(field, -1), 0.4 * h, "digit"))
     return first >= 0.85 and after < 0.84
 
 
@@ -810,7 +763,7 @@ def read_mesos_positions(bgr, field, templates, digit_count=None):
         cx = _mesos_spot(field, i)
         if cx - 0.3 * h < x:
             break
-        digit, score, lead = templates.match(lay, (cx, 0.4 * h, "digit"))
+        digit, score, lead = _match(templates, lay, (cx, 0.4 * h, "digit"))
         empty = bool(digits) and score < 0.65
         if ended:
             # A clear digit after the end means one was missed in between. (Only a clear
@@ -842,16 +795,16 @@ def read_mesos_digits(lay, templates):
     """The number in the mesos box, or None if any digit is unclear."""
     s = ""
     for cell in lay.exp:
-        digit, score, lead = templates.match(lay, cell)
+        digit, score, lead = _match(templates, lay, cell)
         if score < 0.70 or lead < 0.04:
             return None
         s += digit
     return int(s)
 
 
-def tesseract_mesos(lay):
-    """(number, how many of 6 Tesseract tries agreed) for the mesos box, or (None, 0)."""
-    if not tesseract_ok:
+def ocr_mesos(lay, ocr):
+    """(number, how many of 6 text OCR tries agreed) for the mesos box, or (None, 0)."""
+    if not ocr.available:
         return None, 0
     first, last = lay.exp[0], lay.exp[-1]
     x0, x1 = max(0, int(first[0] - first[1] / 2 - 0.5 * lay.gh)), int(last[0] + last[1] / 2 + 0.5 * lay.gh)
@@ -861,8 +814,7 @@ def tesseract_mesos(lay):
     def clean(text):
         return re.sub(r"\D", "", text) if re.fullmatch(r"[\d,.\s]+", text.strip() or "x") else ""
 
-    votes = _ocr_votes(img.astype(np.float32), lay.gh,
-                       "--psm 7 -c tessedit_char_whitelist=0123456789,", clean)
+    votes = _ocr_votes(img.astype(np.float32), lay.gh, ocr, clean, chars="0123456789,")
     digits, n = votes.most_common(1)[0] if votes else ("", 0)
     return (int(digits), n) if n >= 4 else (None, n)
 
@@ -891,7 +843,7 @@ class MesosDigits:
 
     def templates(self):
         if self._templates is None and self.examples:
-            self._templates = DigitTemplates({d: np.stack(v) for d, v in self.examples.items()})
+            self._templates = TemplateMatcher({d: np.stack(v) for d, v in self.examples.items()})
         return self._templates
 
     def learn(self, lay, value):
@@ -902,13 +854,13 @@ class MesosDigits:
         for cell, ch in zip(lay.exp, digits):
             examples = self.examples.setdefault(ch, [])
             if len(examples) < self.PER_DIGIT:
-                examples.append(digit_patch(lay.V, cell[0], lay.cy, lay.gh, 0))
+                examples.append(glyph_patch(lay.V, cell[0], lay.cy, lay.gh))
                 added = True
         if added:
             self._templates = None
             try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
-                np.savez(self.path, canon=CANON, **{f"d{k}": np.stack(v) for k, v in self.examples.items()})
+                TemplateMatcher.save(self.path, self.examples)
             except Exception as e:
                 log_error("saving the learned mesos digits", e)
 
@@ -1051,8 +1003,9 @@ class ScreenReader:
     the inventory's mesos and, every few seconds, counts the members in the party list.
     """
 
-    def __init__(self, templates, mode="window", region=None):
-        self.templates = templates
+    def __init__(self, templates, mode="window", region=None, text_ocr=None):
+        self.templates = templates          # GlyphMatcher for the EXP bar's digits
+        self.text_ocr = text_ocr or NoTextOCR()     # TextOCR for map names, the class, new mesos
         self.mode, self.region = mode, region
         self.hwnd = None
         self.size = None
@@ -1132,7 +1085,7 @@ class ScreenReader:
     def _read_job(self, sct, rect):
         """Reads the class from the status bar now and then (it only changes at a job advance)."""
         now = time.monotonic()
-        if not tesseract_ok or now < self.next_job_read:
+        if not self.text_ocr.available or now < self.next_job_read:
             return
         wx, wy, _, _ = rect
         ax, ay = self.exp_anchor
@@ -1142,7 +1095,7 @@ class ScreenReader:
             self.next_job_read = now + 5
             return
         shot = grab(sct, x0, y0, w, h)
-        job = read_job(shot[0], wx + ax - shot[1], wy + ay - shot[2], g) if shot else None
+        job = read_job(shot[0], wx + ax - shot[1], wy + ay - shot[2], g, self.text_ocr) if shot else None
         if job:
             self.job = job
         self.next_job_read = now + (60 if job else 10)
@@ -1252,7 +1205,7 @@ class ScreenReader:
             return Reading(where, [got], True, f"{got[0]:,} [{got[1]:.2f}%]", view, boxes), lay
         # Unclear digits, or a reading that fits no level: not trusted. Readings that do fit
         # a level go first, so the tracker tries those.
-        cands = ([got] if got else []) + [c for c in tesseract_candidates(img, lay) if c != got]
+        cands = ([got] if got else []) + [c for c in ocr_candidates(img, lay, self.text_ocr) if c != got]
         cands.sort(key=lambda c: not fits_exp_table(*c))
         if cands:
             e, p = cands[0]
@@ -1380,7 +1333,7 @@ class ScreenReader:
         if now < self.next_mesos_check or (not solid and value is None):
             return None, img, boxes
         self.next_mesos_check = now + (2 if value is not None else 5)
-        checked, votes = tesseract_mesos(lay)
+        checked, votes = ocr_mesos(lay, self.text_ocr)
         if checked is None or (not solid and checked != value):
             return None, img, boxes
         self.mesos_checked = checked
@@ -1390,7 +1343,7 @@ class ScreenReader:
 
     def _read_info(self, sct, rect):
         """Returns (map name if it was just read, note)."""
-        if not tesseract_ok:
+        if not self.text_ocr.available:
             return None, "Map names can't be read: Tesseract OCR is missing (see the README)."
         if self.own_rect is None:
             return None, None                   # wait until we know where this app's window is
@@ -1427,7 +1380,7 @@ class ScreenReader:
                         self.map_box, self.next_map_search = None, now + 1
                         self.map_unread, self.next_map_read = True, 0.0
                     elif self.map_unread and now >= self.next_map_read:
-                        name = read_map_name(shot[0], g)
+                        name = read_map_name(shot[0], g, self.text_ocr)
                         self.map_unread = name is None
                         self.next_map_read = now + 5          # if unreadable, try again later
                     self.map_print = picture
@@ -2437,11 +2390,11 @@ LOG_HINT = "Right-click a line to copy, rename or delete it."
 
 
 class App:
-    def __init__(self, root, templates):
+    def __init__(self, root, templates, text_ocr=None):
         self.root = root
         self.cfg = {**DEFAULTS, **load_config()}
         mode = self.cfg.get("mode", "window")
-        self.reader = ScreenReader(templates, mode, self.cfg.get("region"))
+        self.reader = ScreenReader(templates, mode, self.cfg.get("region"), text_ocr)
         saved = self.cfg.get("mesos_box")
         if isinstance(saved, list) and len(saved) == 6:
             self.reader.saved_mesos = tuple(saved)
@@ -3617,7 +3570,7 @@ class App:
             f"- Sharing runs: {'on' if self.cfg.get('share_runs') else 'off'}"
             f" ({len(self.autolog.runs)} runs, {len(self.autolog.unshared_runs())} not sent)",
             f"- Settings: pause after {self.cfg['gap_seconds']} s, transparency {self.cfg['transparency']}%,"
-            f" map names {'on' if tesseract_ok else 'off (no Tesseract)'}",
+            f" map names {'on' if self.reader.text_ocr.available else 'off (no Tesseract)'}",
         ]
         if errors:
             lines += ["", "Recent errors:", "```", errors.strip(), "```"]
@@ -3647,7 +3600,6 @@ class App:
 
 
 def main():
-    global tesseract_ok
     # Only one copy at a time (per data folder): two copies would each keep their own log.
     # If it's already running, bring that window to the front instead. (The lock keeps the old
     # name, so an older version and this one can't run at the same time either.)
@@ -3656,12 +3608,10 @@ def main():
         return
     PLATFORM.ask_permissions()
     move_old_data()
-    tess = find_tesseract()
-    if tess:
-        pytesseract.pytesseract.tesseract_cmd = tess
-        tesseract_ok = True
+    # MAPLE_EXP_OCR=none turns the text OCR off (e.g. to see how the overlay does without it).
+    text_ocr = create_text_ocr(os.environ.get("MAPLE_EXP_OCR", "auto"), find_tesseract())
     root = tk.Tk()
-    App(root, DigitTemplates.load())
+    App(root, DigitTemplates.load(), text_ocr)
     root.mainloop()
 
 

@@ -18,8 +18,12 @@ from .scenes import Scene
 
 
 class Pipeline:
-    def __init__(self, gh=7, screen_size=(2880, 1620), at=(100, 60), gap=15, overlay=None):
+    def __init__(self, gh=7, screen_size=(2880, 1620), at=(100, 60), gap=15, overlay=None,
+                 templates="game", text_ocr=None):
+        """templates: the GlyphMatcher for the EXP bar ("game": the real one, digits.npz);
+        text_ocr: the TextOCR (None: none, as when Tesseract isn't installed)."""
         self.gh = gh
+        self.templates, self.text_ocr = templates, text_ocr
         self.screen = FakeScreen(*screen_size)
         self.platform = FakePlatform(self.screen)
         self.clock = FakeClock()
@@ -32,7 +36,8 @@ class Pipeline:
         self._contexts = [use_platform(self.platform), self.clock]
         for c in self._contexts:
             c.__enter__()
-        self.reader = m.ScreenReader(m.DigitTemplates.load())
+        templates = m.DigitTemplates.load() if self.templates == "game" else self.templates
+        self.reader = m.ScreenReader(templates, text_ocr=self.text_ocr)
         self.session = m.Session(self.gap)
         self.party, self._party_seen = None, (None, 0)
         if self.overlay:

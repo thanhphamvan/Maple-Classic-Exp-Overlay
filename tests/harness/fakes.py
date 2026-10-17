@@ -1,5 +1,6 @@
 """Stand-ins for everything outside the overlay: the OS (FakePlatform), the screen
-(FakeScreen, in place of mss) and the clock (FakeClock). With them the real ScreenReader and
+(FakeScreen, in place of mss), the clock (FakeClock) and character recognition
+(FakeTextOCR, FakeGlyphMatcher). With them the real ScreenReader and
 tracking code run on any OS, with no game, display or waiting.
 
     screen = FakeScreen(1920, 1080)
@@ -14,6 +15,7 @@ import time
 import numpy as np
 
 import maple_exp as m
+from ocr.base import GlyphMatcher, TextOCR
 from platforms.base import Hotkeys, Platform
 
 # What the fake desktop looks like where no window is: a dull wallpaper, nothing like the game.
@@ -230,3 +232,44 @@ class FakeClock:
     def __exit__(self, *exc):
         m.time.monotonic = self._real
         return False
+
+
+class FakeTextOCR(TextOCR):
+    """A TextOCR that answers from a script, and keeps what it was asked (calls: a list of
+    (image, chars)). answers: one string for every call, a list used in turn (the last one
+    repeats), or a function (image, chars) -> string."""
+
+    name = "fake"
+
+    def __init__(self, answers=""):
+        self.answers, self.calls = answers, []
+
+    def read_line(self, image, chars=None):
+        self.calls.append((image, chars))
+        a = self.answers
+        if callable(a):
+            return a(image, chars)
+        if isinstance(a, str):
+            return a
+        return a[min(len(self.calls), len(a)) - 1] if a else ""
+
+
+class FakeGlyphMatcher(GlyphMatcher):
+    """A GlyphMatcher that answers from a script: answers is a list of (character, score,
+    lead) used in turn (the last one repeats), or a function (cx, cy, height) -> one.
+    calls keeps each (cx, cy, height) it was asked about."""
+
+    def __init__(self, answers):
+        self.answers, self.calls = answers, []
+
+    def match(self, image, cx, cy, height):
+        self.calls.append((cx, cy, height))
+        a = self.answers
+        if callable(a):
+            return a(cx, cy, height)
+        return a[min(len(self.calls), len(a)) - 1]
+
+    @classmethod
+    def reading(cls, text, score=0.95, lead=0.2):
+        """Answers each spot, in turn, with the next character of text."""
+        return cls([(ch, score, lead) for ch in text])

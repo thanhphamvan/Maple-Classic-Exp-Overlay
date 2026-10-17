@@ -241,9 +241,12 @@ py -3 tests/run_all.py            (all of them; or one at a time:)
 py -3 tests/test_logic.py
 py -3 tests/test_screen.py
 py -3 tests/test_pipeline.py
+py -3 tests/test_ocr.py
 ```
 
 `test_pipeline.py` runs the whole reading pipeline, from the game window to EXP/hr, on any OS with no game: `tests/harness/` stands in for the OS (`FakePlatform`, the same `Platform` interface the real ones have), the screen (`FakeScreen`, in place of mss) and the clock (`FakeClock`). The game window is put together from the real crops in `tests/frames/` at three UI sizes (`Scene(gh=7).exp(68681, 71.76).inventory().party(3)`), and `Pipeline` feeds each reading to the trackers as the app does.
+
+Character recognition is in `ocr/`, apart from the readers that use it: a `GlyphMatcher` says which character of the game's font is at a spot (`TemplateMatcher`, from examples like `assets/digits.npz`), and a `TextOCR` reads a line of text (`TesseractOCR`, or `NoTextOCR` without Tesseract; `create_text_ocr()` picks one, and `MAPLE_EXP_OCR=none` turns it off). The readers in `maple_exp.py` (EXP bar, mesos, map name, class) are handed one, and decide where to look and what to believe. `test_ocr.py` tests the backends on their own, and each reader with a fake backend (`FakeTextOCR`, `FakeGlyphMatcher`) that gives scripted answers.
 
 **Benchmark** how long each step of reading the screen takes, at each UI size, and how much of a CPU core that is at one poll every 1.5 s:
 
@@ -266,7 +269,7 @@ GitHub runs the logic and pipeline tests and a quick benchmark on every push ([T
 - A reading only counts if the EXP and % agree with how much EXP that level needs, so misreads are ignored.
 - Mesos are read the same way. The mesos box is found by its outline, which also works while the inventory is see-through.
 - The party size is the number of HP bars in the party list.
-- Map names are read with Tesseract.
+- Map names and the class are read with Tesseract (`ocr/tesseract.py`), each a few ways; the most common answer wins.
 - Settings, the log and `errors.log` are saved in `%APPDATA%\MapleEXP` (`~/Library/Application Support/MapleEXP` on macOS; from its old name, Maple EXP/hr, so updates keep them).
 
 </details>

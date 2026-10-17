@@ -50,6 +50,7 @@ jobs:
           python tests/test_logic.py
           python tests/test_screen.py
           python tests/test_pipeline.py
+          python tests/test_ocr.py
       - name: Build
         run: python build.py
       - name: Keep the unsigned build

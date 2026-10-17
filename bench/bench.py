@@ -155,6 +155,29 @@ def tracking_cases():
     yield "tracking: 200 readings through Session", observe
 
 
+def ocr_cases():
+    """The OCR backends on their own (ocr/): one digit of the game font, and one line of text
+    with Tesseract (the slow one: map names and the class take 6 of these each)."""
+    import numpy as np
+    from ocr import CANON, create_text_ocr
+    tpl = m.DigitTemplates.load()
+    lay = m.find_exp(Scene(gh=7).render())
+    cell = lay.exp[0]
+    yield "ocr: one digit (TemplateMatcher)", lambda _: (lambda: tpl.match(lay.V, cell[0], lay.cy, lay.gh), None)
+    text_ocr = create_text_ocr("auto", m.find_tesseract())
+    if not text_ocr.available:
+        print("     (Tesseract isn't installed: the text OCR isn't timed)")
+        return
+    from PIL import Image, ImageDraw, ImageFont
+    img = Image.new("L", (300, 2 * CANON + 32), 255)
+    ImageDraw.Draw(img).text((12, 8), "Rocky Road II", fill=0, font=ImageFont.load_default(size=2 * CANON))
+    line = np.array(img)
+    yield "ocr: one line of text (Tesseract)", lambda _: (lambda: text_ocr.read_line(line), None)
+    status = cv2.imread(str(ROOT / "tests" / "frames" / "status_gh7.png"))
+    yield "read class, 7 px (6 Tesseract reads)", \
+        lambda _: (lambda: m.read_job(status, 462, 21.5, 7, text_ocr), None)
+
+
 def live_cases():
     import mss
 
@@ -183,6 +206,7 @@ def all_cases(live):
     for gh in UI_SIZES:
         yield from poll_cases(gh)
     yield from tracking_cases()
+    yield from ocr_cases()
     if live:
         yield from live_cases()
 

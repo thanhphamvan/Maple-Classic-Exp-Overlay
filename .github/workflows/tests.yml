@@ -26,5 +26,7 @@ jobs:
         run: python tests/test_logic.py
       - name: Pipeline tests (the whole reading pipeline, on a fake screen)
         run: python tests/test_pipeline.py
+      - name: OCR tests (the backends, and the readers with fake backends)
+        run: python tests/test_ocr.py
       - name: Benchmark (a quick run, to see it works and how fast it is here)
         run: python bench/bench.py --quick
