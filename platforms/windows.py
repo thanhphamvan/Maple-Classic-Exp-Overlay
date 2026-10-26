@@ -176,6 +176,27 @@ class WindowsPlatform(Platform):
             *on_path,
         ]
 
+    def tessdata_candidates(self, exe):
+        return [exe.parent / "tessdata"]
+
+    def tessdata_arg(self, exe, folder):
+        # Tesseract reads its arguments in the PC's ANSI code page: a folder with letters outside
+        # it (a Cyrillic or Chinese user name on a Western PC) must be given by its short 8.3 name.
+        path = str(folder)
+        try:
+            path.encode("mbcs")
+            return path
+        except UnicodeEncodeError:
+            pass
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            ctypes.windll.kernel32.GetShortPathNameW(path, buf, len(buf))
+            short = buf.value
+            short.encode("mbcs")
+            return short or None
+        except Exception:
+            return None
+
     def claim_single_instance(self, key, title, old_titles=()):
         self._mutex = _CreateMutex(None, False, "Local\\MapleEXP-" + key)    # kept while it runs
         if ctypes.get_last_error() != 183:                                   # ERROR_ALREADY_EXISTS
@@ -238,8 +259,40 @@ class WindowsPlatform(Platform):
             pass
         return None
 
+    def dpi_awareness(self):
+        try:
+            level = ctypes.c_int()
+            if ctypes.windll.shcore.GetProcessDpiAwareness(0, ctypes.byref(level)) == 0:
+                return {0: "not aware", 1: "system", 2: "per-monitor"}.get(level.value)
+        except Exception:
+            pass
+        return None
+
     def create_hotkeys(self, on_press):
         return WindowsHotkeys(on_press)
+
+    def register_fonts(self, paths):
+        # Private to this program (FR_PRIVATE): nothing is installed, and they go when it closes.
+        try:
+            add = ctypes.windll.gdi32.AddFontResourceExW
+            add.argtypes, add.restype = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p], ctypes.c_int
+            return all(add(str(p), 0x10, None) for p in paths)
+        except Exception:
+            return False
+
+    def style_window(self, root, background, text):
+        """A dark title bar in the overlay's own colours (Windows 10 2004+ for dark, 11 for the colours)."""
+        def bgr(hex_):
+            r, g, b = (int(hex_[i:i + 2], 16) for i in (1, 3, 5))
+            return b << 16 | g << 8 | r
+        try:
+            root.update_idletasks()
+            hwnd = _GetAncestor(root.winfo_id(), 2)
+            set_attr = ctypes.windll.dwmapi.DwmSetWindowAttribute
+            for attr, value in ((20, 1), (35, bgr(background)), (34, bgr(background)), (36, bgr(text))):
+                set_attr(hwnd, attr, ctypes.byref(ctypes.c_int(value)), 4)   # dark mode, caption, border, text
+        except Exception:
+            pass
 
     def open_folder(self, path):
         os.startfile(path)

@@ -11,3 +11,9 @@
   X-Frame-Options: DENY
   Referrer-Policy: strict-origin-when-cross-origin
   Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=()
+
+# /api/latest is a plain file (no server work): pages opened before 2026-10-19 asked for it every
+# 90 seconds, and tabs left open all day used up the free plan's daily limit. The live answer is /api/recent.
+/api/latest
+  Content-Type: application/json
+  Cache-Control: public, max-age=300

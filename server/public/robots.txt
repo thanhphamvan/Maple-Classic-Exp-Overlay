@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://maple-classic-exp-overlay.pages.dev/sitemap.xml
+Sitemap: https://mcwo.app/sitemap.xml

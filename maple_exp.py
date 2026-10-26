@@ -15,11 +15,16 @@ inside %APPDATA% on Windows, ~/Library/Application Support on macOS (named after
 name, Maple EXP/hr, so updating keeps them). It runs on Windows and macOS: what differs
 between them is in platforms/.
 """
+import contextlib
 import hashlib
 import hmac
 import json
 import math
 import os
+
+for _name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_name, "1")        # (before numpy is imported)
+import platform
 import queue
 import re
 import secrets
@@ -29,6 +34,7 @@ import threading
 import time
 import tkinter as tk
 import traceback
+import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
@@ -41,21 +47,34 @@ from tkinter import font as tkfont, messagebox, simpledialog, ttk
 import cv2
 import mss
 import numpy as np
-from PIL import Image, ImageDraw, ImageTk
+from PIL import Image, ImageDraw, ImageFont, ImageTk
 
-# The overlay's images are small, and it only looks every 1.5 s: spreading each step over
-# every core (OpenCV's default) is a little quicker but costs 15-45% more CPU in all.
+from capture import ScreenCapture, as_capture, capture_window, grab  # noqa: F401
+import digits_v2
+import exp_font
+import healthlog
+import level_ocr
+import ocr
+import potions
+import report
+import shadow
+
 cv2.setNumThreads(1)
-
 from ocr import CANON, NoTextOCR, TemplateMatcher, create_text_ocr, glyph_patch
 from platforms import create_platform, hotkey_text, parse_hotkey
+from report import Health, Recent
+from ui_gfx import INK, TEXT_DIM
+from ui_kit import (ACCENT, ACCENT_SOFT, BAD, BG, DIM, FAINT, FG, GOOD, LINE, LIST_BG, LIST_BG2, LIST_PART,  # noqa: F401
+                    ON_ACCENT, RAISED, RAISED_HI, SELECT, SURFACE, WARN, setup_ttk)
+from ui_main import SHAPES, Button, MainView, PopupMenu, Slider, Theme, Toggle
 
 # Everything that differs between Windows and macOS (finding the game window, screen scaling,
 # hotkeys...) is behind this one object: see platforms/.
 PLATFORM = create_platform()
 PLATFORM.setup_process()
+cv2.setNumThreads(1)
 
-VERSION = "0.9.6-beta"
+VERSION = "0.9.13-beta"
 WINDOW_TITLE = "Maple Classic Exp Overlay"    # the version is shown in Settings
 OLD_TITLES = ("Maple EXP/hr",)               # what versions before 0.9.3 were called
 
@@ -68,10 +87,13 @@ DATA_DIR = Path(os.environ.get("MAPLE_EXP_DATA") or PLATFORM.data_root() / "Mapl
 
 CONFIG_PATH = DATA_DIR / "config.json"
 ERROR_LOG_PATH = DATA_DIR / "errors.log"
+HEALTH_PATH = DATA_DIR / "health.json"        # the day-by-day counts behind the health reports (healthlog.py)
 TEMPLATE_PATH = ASSETS / "digits.npz"
 ICON_PATH = ASSETS / "icon.ico"
 POLL_SECONDS = 1.5          # how often to read the EXP bar
+WORKER_RETRY_SECONDS = 5       # if the reading thread can't open the screen: how long to wait before trying again
 ROLLING_WINDOW = 300        # seconds used for the "last 5 min" rate
+MESO_GAP = 120              # seconds without a mesos look after which a rise is believed, however big
 SEARCH_STRIP = 0.22         # bottom part of the game window searched for the EXP text
 LOG_PATH = DATA_DIR / "exp_log.json"
 LOG_TEXT_PATH = DATA_DIR / "exp_log.txt"
@@ -79,12 +101,97 @@ LOG_BLOCK = 300             # seconds of non-stop EXP gain behind each log updat
 MESOS_PATH = DATA_DIR / "mesos_digits.npz"             # learned as you play...
 MESOS_START_PATH = ASSETS / "mesos_digits.npz"          # ...starting from these
 MESOS_BOX_PATH = ASSETS / "mesos_box.npz"
+MAPS_PATH = ASSETS / "maps.txt"            # the game's map names (see server/tools/make_maps.py)
+MAP_HIDDEN_SECONDS = 3      # the minimap's name unseen this long: say so, and hold back saving to the log
+MAP_BLIND_SECONDS = 45      # the minimap's name box unseen this long: the map may have changed unnoticed
 SCAN_SECONDS = 4            # how often the whole window is checked for the inventory and party
+WINDOW_SCAN_SECONDS = 1     # ...and while a shop, storage or trade window is open (mesos move there)
+WINDOW_GRACE = 4            # seconds a closed window still counts, so its last change is read
+WINDOW_NAMES = {"shop": "NPC shop", "storage": "Storage", "trade": "Trade"}
+POTION_SECONDS = 3          # how often the potion bar is read (a small picture, no need for more)
+POTION_FULL_LOOK = 15       # every this many reads the bar is looked for over its whole search range again
+OUTLINE_SECONDS = 8         # how often the (costly) search for a see-through mesos box may run
+LEVEL_RECHECK_SECONDS = 30  # a level read from the badge is looked at again this often (it only changes at a level-up)
+V2_SPOTS_MAX = 8            # window sizes whose reader v2 spot is remembered in the config
+PART_LOG_SECONDS = 600      # a reading part that keeps failing is written to errors.log this often at most
+PART_NOTE_SECONDS = 120     # ...and its status note stays this long after its last failure
+PART_NOTES = {              # what the status line says while a part of the reading fails
+    "map name": "Map names can't be read right now",
+    "mesos": "Mesos can't be read right now",
+    "potions": "The potion bar can't be read right now",
+    "window scan": "The party list and shop windows can't be checked right now",
+    "class": "The class can't be read right now",
+    "name print": "Telling characters apart isn't working right now",
+    "level": "The level badge can't be read right now",
+    "Tesseract": "The backup number reader (Tesseract) isn't working right now",
+}
+TRIED_PARTS = {"map name": "map", "class": "class", "mesos": "mesos", "potions": "potions"}   # (health reports count these)
+STALE_LEVEL_SECONDS = 6          # after another character is found, a reading with the old level is still waiting this long
+PCT_WAIT_NOTES = ("percentage wrapped", "level up?", "level changed", "level ")   # what a %-only bar says while it waits
+LEVEL_FAILS_FOR_FALLBACK = 3    # badge reads that failed in a row before typing the level in is offered
 DEFAULTS = {"gap_seconds": 15, "transparency": 0, "topmost": True,
-            "check_updates": True, "skip_version": "", "ui_scale": 100, "compact": False, "hotkeys_on": True}
+            "check_updates": True, "skip_version": "", "ui_scale": 100, "compact": False, "hotkeys_on": True,
+            "details": False, "compact_shape": "square", "seen_version": "",
+            "potions_on": True, "potion_prices": {}, "shadow_reader": True}
+SHAPE_LABELS = {"square": "Square", "wide": "Wide", "bar": "Bar"}
+SHAPE_BLURBS = {"square": "The narrow card: the big number, the level bar and Start/Pause.",
+                "wide": "Longer sideways: the level bar on top and four numbers in a row.",
+                "bar": "One thin strip with the main numbers and a slim level bar."}
+# What's new, shown once after updating to a version (plain words, newest changes only). A version with no entry shows nothing.
+WHATS_NEW = {"0.9.13-beta": (
+    (None, None, (
+        ("head", "Fewer reading problems"),
+        "Reading keeps going when the map name or class can't be read, and a stuck text reader no longer freezes the display.",
+        "High levels (a bar with only a %): leveling up, run counts, a covered level badge and Reset work properly now.",
+        ("head", "Health reports (your choice)"),
+        "Once a day the overlay can send numbers about how well it reads your screen: never pictures, names, chat or your log. "
+        "It asks you first, and you can turn it off in Settings.",
+        ("head", "Send a report without GitHub"),
+        "Report a bug, then Send to the developer. You see exactly what is sent before it goes.",
+        ("head", "A new reader, tested quietly"),
+        "A new way to read the EXP bar runs in the background and only notes whether it agrees. It changes nothing you see.")),),
+    "0.9.12-beta": (
+    (None, None, (
+        ("head", "Hotfix for high levels"),
+        "Past about Lv 57 (levels that need a million EXP or more), the game shows only a percentage on the EXP bar, with no EXP number. The overlay couldn't find the bar then. It does now.",
+        "Your level is read from the orange LV badge, and EXP is worked out from it and the percentage. So EXP/hr there is an estimate, and it shows a \u2248 in front.",
+        "If the badge can't be read, it uses your level from before, or you can type it: Settings, Level fallback.",
+        "Estimates stay on your PC. They are never shared with the best-maps website.")),),
+    "0.9.11-beta": (
+    # (title, subtitle, items) pages; an item is a line, ("head", text), ("dot", text) or ("pic", file in assets/)
+    (None, None, (
+        ("head", "Net mesos/hr: what you really make"),
+        "The overlay now counts the potions and food you drink while you farm, prices them, and takes that off your "
+        "mesos/hr. That's your net mesos/hr.",
+        "It only counts potions on your quick-slot bar (bottom right of the game). See how on the next page.",
+        ("head", "Mesos/hr you can trust"),
+        "Mesos you spend or move at an NPC shop, storage or a trade are left out. Only mesos you pick up count.",
+        "The inventory doesn't have to stay open: open it when you start, and now and then.",
+        ("head", "The best-maps website"),
+        "Only clean 15-minute runs are shared: no shop, storage or trade during the run. Open the inventory when a "
+        "run starts and right after it ends, so its mesos count too.")),
+    ("How potion cost works", "What it counts, and how.", (
+        ("pic", "whatsnew_potion_bar.png"),
+        "Put the potions you use on the quick-slot bar, bottom right, so their counts show. The overlay reads that "
+        "number every 3 seconds: when it goes down, that's a use. Buying or looting more is never a use.",
+        "It counts only while tracking is on and EXP is coming in. Paused or in town, nothing counts.",
+        ("pic", "whatsnew_net.png"),
+        "Prices are the NPC shop prices. Potions no NPC sells (Mana Elixir, Power Elixir, Sap of Ancient Tree...) count "
+        "as free until you type what you pay: Settings, Potions, Prices.",
+        "You see it in the Net / hr tile, in Details, in your log, and as \"net\" in the compact shapes. Potion data "
+        "stays on your PC: it is never sent anywhere.")))
+    ,
+    "0.9.10-beta": (
+    "Compact mode now comes in three shapes: Square, Wide and Bar. Pick one in Settings, under Compact shape.",
+    "Map names are matched to the game's own list, so one map is one line in your log.",
+    "If the minimap's name is covered, it tells you after a few seconds, keeps the log clean, and pauses if it stays hidden.",
+    "Towns are no longer logged.",
+    "The best-maps website moved to mcwo.app, with a new look and an Include new players box.")}
+PICTURE_WIDTHS = (430, 340, 250, 0)    # the What's new pictures' widths, biggest first (0: none), until the page fits the screen
 # Settings > Size, in %: only these, so the window can't get too small to read or use.
-UI_SCALES = (80, 90, 100, 110, 125, 150, 175, 200)
-STATS_SITE = "https://maple-classic-exp-overlay.pages.dev"       # shared 15-minute runs (server/)
+UI_SCALES = (60, 70, 80, 90, 100, 110, 125, 150, 175, 200)
+MAX_TRANSPARENCY = 40       # %: more and the window can fade out of sight, with Settings in it
+STATS_SITE = "https://mcwo.app"       # shared 15-minute runs (server/)
 GITHUB_REPO = "beanguri/Maple-Classic-Exp-Overlay"
 RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -104,6 +211,13 @@ EXP_TABLE = [
     25069923, 52646838, 110558359, 232172553, 487562361, 1023880958, 2150150011, 4515315023, 9482161548,
 ]
 
+tesseract_ok = False        # set in main(); Tesseract is only a fallback
+TESS = None                 # the ocr.Tesseract to read text with, once main() has found one
+tesseract_state = "missing"  # "ok", "missing" (no program found) or "no_eng" (a program, but no usable English file)
+tesseract_why = ""          # for "no_eng": "file" (eng.traineddata isn't there) or "path" (the folder's name can't be passed)
+tesseract_where = (None, None)   # the program and data folder in use (or the best one found), for bug reports
+
+
 # --------------------------------------------------------------------------- files
 
 _error_lock = threading.Lock()
@@ -111,9 +225,11 @@ _last_errors = {}
 
 
 def log_error(what, exc=None):
-    """Adds an error, with details, to errors.log in the data folder (the same one at most
-    once a minute), so players can send it in when something goes wrong."""
-    key = (what, repr(exc))
+    """Adds an error, with details, to errors.log in the data folder (the same kind at most
+    once a minute), so players can send it in when something goes wrong. The kind is what was being
+    done and the exception's type, not its message: a message with a number or a path in it would
+    otherwise be written at every look and remembered for good."""
+    key = (re.sub(r"\d+", "#", what), type(exc).__name__ if exc is not None else None)   # (a count in `what` is the same kind)
     with _error_lock:
         now = time.monotonic()
         if now - _last_errors.get(key, -1e9) < 60:
@@ -128,6 +244,13 @@ def log_error(what, exc=None):
             f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] v{VERSION}: {what}\n{details}\n")
     except Exception:
         pass
+
+
+def good_v2_spots(v):
+    """exp_v2_spots in the config: {"WxH/gh": [x0, y0, x1, y1]}, a few at most."""
+    return (isinstance(v, dict) and len(v) <= V2_SPOTS_MAX
+            and all(isinstance(k, str) and re.fullmatch(r"\d{3,5}x\d{3,5}/\d{1,2}", k) and isinstance(b, list)
+                    and len(b) == 4 and all(type(x) is int for x in b) for k, b in v.items()))
 
 
 def load_config():
@@ -145,7 +268,10 @@ def load_config():
         value = cfg.get(key)
         if type(value) is not type(default) or (key == "gap_seconds" and not 1 <= value <= 3600):
             cfg[key] = default
-    cfg["transparency"] = min(90, max(0, cfg["transparency"]))
+    cfg["transparency"] = min(MAX_TRANSPARENCY, max(0, cfg["transparency"]))
+    cfg["potion_prices"] = potions.clean_prices(cfg["potion_prices"])
+    if cfg["compact_shape"] not in SHAPES:
+        cfg["compact_shape"] = "square"
     if cfg["ui_scale"] not in UI_SCALES:
         cfg["ui_scale"] = 100
     keys = cfg.get("hotkeys") if isinstance(cfg.get("hotkeys"), dict) else {}
@@ -158,9 +284,13 @@ def load_config():
                   k in ("left", "top") or v[k] > 0) for k in ("left", "top", "width", "height")),
               "log_columns": lambda v: isinstance(v, dict), "log_columns_pt": lambda v: isinstance(v, dict),
               "log_open": lambda v: type(v) is bool,
-              "share_runs": lambda v: type(v) is bool}       # missing: not asked yet
+              "share_runs": lambda v: type(v) is bool,       # missing: not asked yet
+              "share_health": lambda v: type(v) is bool,     # (same: the daily health report)
+              "health_id": healthlog.good_id,
+              "exp_v2_spots": good_v2_spots,                  # (where reader v2 found the bar, by window size)
+              "reports_sent": lambda v: isinstance(v, dict) and isinstance(v.get("day"), str) and type(v.get("n")) is int and v["n"] >= 0}
     for key, ok in checks.items():
-        if key in cfg and cfg[key] is not None and not ok(cfg[key]):
+        if key in cfg and not (cfg[key] is None and key == "log_size") and not ok(cfg[key]):    # (a null log_size is saved on purpose)
             del cfg[key]
     if cfg.get("mode") == "region" and not cfg.get("region"):
         cfg["mode"] = "window"
@@ -189,12 +319,61 @@ def move_old_data():
                 log_error(f"copying {name} from the program's folder", e)
 
 
+ENG_DATA_MIN = 1_000_000     # a real eng.traineddata is megabytes: anything smaller is cut off or empty
+
+
+def locate_tesseract():
+    """(program, data folder argument, state, why): the Tesseract that comes with the download,
+    else an installed one. A program counts only if it has a usable eng.traineddata: Tesseract
+    5 on Windows won't find it by itself when the folder's name has letters outside the PC's
+    code page, so the folder is always handed over (see Platform.tessdata_arg). Never a program
+    in the folder the overlay happens to be started from (Windows' usual search looks there
+    first, so a tesseract.exe someone left in, say, Downloads could be run)."""
+    global tesseract_where
+    state, why, seen = "missing", "", None
+    for p in PLATFORM.tesseract_candidates(HOME_DIR, APP_DIR):
+        try:
+            usable = p.is_file() and os.access(p, os.X_OK)
+        except OSError:                     # (a folder in PATH we aren't allowed into: not a program we can use)
+            usable = False
+        if not usable:
+            continue
+        state = "no_eng"
+        for folder in PLATFORM.tessdata_candidates(p):
+            try:
+                if (folder / "eng.traineddata").stat().st_size <= ENG_DATA_MIN:
+                    continue
+            except OSError:
+                continue
+            arg = PLATFORM.tessdata_arg(p, folder)
+            if arg is None:
+                why, seen = "path", seen or (p, folder)
+                continue
+            tesseract_where = (str(p), str(folder))
+            return str(p), arg, "ok", ""
+        seen = seen or (p, p.parent)
+    if seen:
+        tesseract_where = (str(seen[0]), str(seen[1]))
+    return None, "", state, why or ("file" if state == "no_eng" else "")
+
+
 def find_tesseract():
-    """The Tesseract that comes with the download, else an installed one. Never one in the
-    folder the overlay happens to be started from (Windows' usual search looks there first,
-    so a tesseract.exe someone left in, say, Downloads could be run)."""
-    return next((str(p) for p in PLATFORM.tesseract_candidates(HOME_DIR, APP_DIR)
-                 if p.is_file() and os.access(p, os.X_OK)), None)
+    """The Tesseract program to use, or None (see locate_tesseract)."""
+    return locate_tesseract()[0]
+
+
+def tesseract_note(what="Map names"):
+    """Why Tesseract can't be used, in the player's words ('' if it can)."""
+    if tesseract_state == "no_eng" and tesseract_why == "path":
+        return (f"{what} and your class can't be read from this folder because its name has unusual "
+                "characters. Move the overlay's folder to a simple place like C:\\Games\\. EXP and mesos still work.")
+    if tesseract_state == "no_eng":
+        return (f"{what} and your class can't be read: a file is missing from the overlay's folder "
+                "(tessdata\\eng.traineddata). Download the zip again and extract it. If it's still missing, "
+                "your antivirus may have removed it. EXP and mesos still work.")
+    if tesseract_state == "missing":
+        return f"{what} can't be read: Tesseract OCR is missing (see the README)."
+    return ""
 
 
 # --------------------------------------------------------------------------- updates
@@ -222,7 +401,9 @@ def _plain_text(markdown):
 
 def check_for_update(timeout=8):
     """(newer version, its release notes) if GitHub has a newer release, else None.
-    Raises if GitHub can't be reached."""
+    Raises if GitHub can't be reached, and while testing (MAPLE_EXP_DATA set: nothing goes online then)."""
+    if sharing_blocked():
+        raise RuntimeError("the update check is off while testing (MAPLE_EXP_DATA is set)")
     request = urllib.request.Request(LATEST_RELEASE_API, headers={
         "User-Agent": f"MapleClassicExpOverlay/{VERSION}", "Accept": "application/vnd.github+json"})
     with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -240,6 +421,10 @@ def post_runs(install, runs, timeout=15):
     Returns the start times of the runs it's done with: the ones the site has (now or from
     before), and ones it turned down for good. Runs turned down only for today ("retry", too
     many sent today) are left to be sent again later."""
+    if sharing_blocked():
+        # MAPLE_EXP_DATA moves the data folder, which only tests do. What they have in their logs is
+        # made up, and made-up runs must never reach the real site: so not while testing.
+        raise RuntimeError("sharing is off while testing (MAPLE_EXP_DATA is set)")
     shared = ("date", "started", "map_read", "class", "level_start", "level_end", "party", "exp",
               "seconds", "mesos", "mesos_seconds", "version", "seal")
     body = json.dumps({"install": install, "runs": [{k: r.get(k) for k in shared} for r in runs]}).encode()
@@ -248,6 +433,41 @@ def post_runs(install, runs, timeout=15):
     with urllib.request.urlopen(request, timeout=timeout) as response:
         data = json.loads(response.read(1_000_000).decode("utf-8"))
     return [r.get("started") for r in data.get("results", []) if r.get("ok") or not r.get("retry")]
+
+
+def sharing_blocked():
+    """True while testing: MAPLE_EXP_DATA moves the data folder, which only tests do, and what a test holds is
+    made up, so nothing is sent unless MAPLE_EXP_ALLOW_SHARE says so."""
+    return bool(os.environ.get("MAPLE_EXP_DATA") and not os.environ.get("MAPLE_EXP_ALLOW_SHARE"))
+
+
+def post_health(body, timeout=15):
+    """Sends one health report (healthlog.HealthLog.body) to the stats site. Returns (outcome, detail):
+    'ok' (taken; also when the site already had that day), 'bad' (refused: detail names the field), 'big'
+    (too large) or 'later' (a limit, a network problem or the site is down: try again tomorrow)."""
+    if sharing_blocked():
+        raise RuntimeError("health reports are off while testing (MAPLE_EXP_DATA is set)")
+    request = urllib.request.Request(f"{STATS_SITE}/api/health", data=json.dumps(body).encode(), headers={
+        "content-type": "application/json", "User-Agent": f"MapleClassicExpOverlay/{VERSION}"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read(10_000).decode("utf-8"))
+        return ("ok", "") if isinstance(data, dict) and data.get("ok") else ("later", "")
+    except urllib.error.HTTPError as e:
+        if e.code == 413:
+            return "big", ""
+        if e.code == 400:
+            try:
+                field = str(json.loads(e.read(1000).decode("utf-8")).get("error", ""))
+            except Exception:
+                field = ""
+            field = re.sub(r"[^A-Za-z_]", "", field)[:40]
+            # (only the site's own refusal names a field; a proxy or a hotel Wi-Fi page answering 400 is "try later",
+            # or that day would be dropped for nothing)
+            return ("bad", field) if field else ("later", "")
+        return "later", ""
+    except Exception:
+        return "later", ""
 
 
 # --------------------------------------------------------------------------- hotkeys
@@ -261,17 +481,7 @@ DEFAULT_HOTKEYS = {"start": "Shift+1", "reset": "Shift+2", "skip": "Shift+3", "c
 
 # --------------------------------------------------------------------------- screenshots
 
-def grab(sct, left, top, width, height):
-    """Screenshot of a screen rectangle, clipped to the monitors: (bgr, left, top) or None."""
-    v = sct.monitors[0]
-    x0, y0 = max(left, v["left"]), max(top, v["top"])
-    x1 = min(left + width, v["left"] + v["width"])
-    y1 = min(top + height, v["top"] + v["height"])
-    if x1 - x0 < 8 or y1 - y0 < 8:
-        return None
-    shot = np.asarray(sct.grab({"left": x0, "top": y0, "width": x1 - x0, "height": y1 - y0}))    # BGRA
-    return cv2.cvtColor(shot, cv2.COLOR_BGRA2BGR), x0, y0           # (one copy, without the A)
-
+# (grab() and the Capture classes live in capture.py: where the pictures come from)
 
 
 def _hsv(bgr, hsv=None):
@@ -294,6 +504,43 @@ Layout = namedtuple("Layout", "gh cy exp pct box V")
 
 MIN_SCORE = 0.75            # correlation the best digit needs (true matches score ~0.9+)
 MIN_LEAD = 0.03             # ...and how far ahead of the runner-up it must be
+
+
+
+MAX_REPORTS_PER_DAY = 3         # Send report: the site takes 3 per day per ID too
+
+
+def reports_sent_today(cfg, now=None):
+    """How many reports this player has sent today (UTC day, like the site counts)."""
+    sent = cfg.get("reports_sent")
+    today = healthlog.utc_day(time.time() if now is None else now)
+    return sent["n"] if isinstance(sent, dict) and sent.get("day") == today else 0
+
+
+def post_report(body, timeout=15):
+    """Sends one Send report (report.report_body) to the stats site. Returns 'ok', 'limit' (3 a day),
+    'message' (the site doesn't like the typed text), 'bad' (refused for another reason, or too large)
+    or 'later' (a network problem or the site is down)."""
+    if sharing_blocked():
+        raise RuntimeError("Send report is off while testing (MAPLE_EXP_DATA is set)")
+    request = urllib.request.Request(f"{STATS_SITE}/api/report", data=report.encode_body(body), headers={
+        "content-type": "application/json", "User-Agent": f"MapleClassicExpOverlay/{VERSION}"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read(10_000).decode("utf-8"))
+        return "ok" if isinstance(data, dict) and data.get("ok") else "later"
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            return "limit"
+        if e.code == 400:
+            try:
+                field = str(json.loads(e.read(1000).decode("utf-8")).get("error", ""))
+            except Exception:
+                field = ""
+            return "message" if field == "message" else "bad"
+        return "bad" if e.code == 413 else "later"
+    except Exception:
+        return "later"
 
 
 def _blobs(mask):
@@ -319,6 +566,27 @@ def _cells(blobs, gh):
         n = max(1, int(round((b.w + 0.1 * gh) / pitch)))
         out.extend((b.x + (k + 0.5) * b.w / n, b.w / n, "digit") for k in range(n))
     return out
+
+
+def _exp_label_dot(wblobs, bracket, bh):
+    """The '.' of the label "EXP." just left of a '[' (a blob), or None. The dot sits low, under the
+    right side of the P, and two taller letters come before it. "HP" and "MP" have no such dot, and
+    this holds at any size because it only compares the blobs with the bracket's height."""
+    base = bracket.y + bracket.h
+    dots = [b for b in wblobs if b.x + b.w <= bracket.x and bracket.x - b.x <= 3.0 * bh
+            and b.h <= 0.45 * bh and b.w <= 0.45 * bh and abs(b.y + b.h - base) <= 0.35 * bh]
+    for dot in sorted(dots, key=lambda b: -b.x):
+        tall = lambda b: 1.15 * bh <= b.h <= 1.9 * bh and abs(b.y + b.h - base) <= 0.35 * bh
+        under = [p for p in wblobs if tall(p) and p.x + 0.4 * p.w <= dot.x and dot.x + dot.w <= p.x + p.w + 1
+                 and dot.y >= p.y + 0.6 * p.h]
+        if not under:
+            continue
+        p = under[0]
+        # Two or more letters come before the dot: separate blobs, or touching ones in one wide blob.
+        if p.w >= 1.8 * bh or any(tall(e) and p.x - (e.x + e.w) <= 0.6 * bh and e.x + e.w <= p.x + 1
+                                  for e in wblobs):
+            return dot
+    return None
 
 
 def find_exp(bgr):
@@ -359,7 +627,17 @@ def find_exp(bgr):
             run.append(b)
             edge = b.x
         if not run:
-            continue                                          # HP/MP: label before '['
+            # No number: the game shows only "EXP. [58.47%]" once the EXP is big. Only the label
+            # "EXP." tells that from HP/MP, so no label means this isn't the EXP bar.
+            dot = _exp_label_dot(wblobs, o, bh)
+            if dot is None:
+                continue
+            heights = [b.h for b in inside if b.w <= 0.85 * b.h]
+            gh = float(np.median(heights)) if heights else float(bh)
+            # box[0] is where the number would start (the class is read left of it): a bit right of the dot
+            found.append(Layout(gh, cy, [], _cells(inside, gh),
+                                (int(dot.x + 0.84 * gh), int(cy - bh), c.x + c.w, int(cy + bh)), V))
+            continue
         run.reverse()
         heights = [b.h for b in run + inside if b.w <= 0.85 * b.h]
         gh = float(np.median(heights)) if heights else float(bh)
@@ -376,6 +654,267 @@ def _match_all(matcher, lay, cells):
     """(digit, score, lead) for each digit position of a Layout, from a GlyphMatcher (all at
     once: much faster than one at a time)."""
     return matcher.match_many(lay.V, [(c[0], lay.cy, lay.gh) for c in cells])
+
+
+# ---- finder v2: shape, layout and contrast instead of fixed colours
+#
+# Works on brightness only (the brightest of B, G, R, like HSV "value"), so a colour change, a
+# paler bracket or a greyscale screen doesn't matter. Text is whatever is clearly brighter than its
+# surroundings; a bracket is a stroke with two short feet; the EXP block is the one with a "%" sign
+# before its "]" (HP and MP have "/").
+
+V2_TEXT = 0.12      # how far above its surroundings text must be (share of how bright the brightest text is)
+V2_PERCENT = 0.5    # how well a blob must match the game's "%" glyph (correlation) to be taken for one
+V2_FAINT = 0.07     # ...and for the thin, paler brackets
+V2_TILE = 128       # width of a stretch of a very wide strip whose text brightness is judged on its own
+V2_WIDE = 2200      # a strip this wide also gets the small blur when nothing is found
+
+
+def _v2_brightness(bgr):
+    """Brightest of B, G, R per pixel (what HSV calls value): white digits and green brackets alike."""
+    b, g, r = cv2.split(bgr)
+    return cv2.max(cv2.max(b, g), r)
+
+
+def _v2_text_mask(V, width=None, tiled=False):
+    """(text, faint): pixels clearly brighter than the local average, and a second mask that also takes
+    the paler ones (brackets); None if nothing in the picture is bright enough to be text. The local
+    average is taken over about 3 digit heights. "How bright text is" is the 99.7th percentile of that
+    contrast; tiled=True asks every stretch of V2_TILE columns alone and takes the strongest (for a very
+    wide strip, where small text is far under 0.3% of all the pixels)."""
+    k = int(min(63, max(31, 0.0165 * (width or V.shape[1])))) | 1
+    D = cv2.subtract(V, cv2.blur(V, (k, k), borderType=cv2.BORDER_REPLICATE))
+    top = 0
+    for x in range(0, D.shape[1], V2_TILE if tiled else max(1, D.shape[1])):
+        part = D[:, x:x + V2_TILE] if tiled else D
+        hist = cv2.calcHist([part], [0], None, [256], [0, 256]).ravel().cumsum()
+        top = max(top, int(np.searchsorted(hist, 0.997 * hist[-1])))
+    if top < 25:
+        return None
+    return D >= V2_TEXT * top, D >= (V2_FAINT / 2 if tiled else V2_FAINT) * top
+
+
+def _v2_has_feet(V, b):
+    """True if the stroke at blob b has short feet: more brightness in its top and bottom fifth than in
+    its middle (a digit "1" or a letter "l" has a plain end)."""
+    x0, x1 = max(0, b.x - 2), b.x + b.w + 2
+    win = V[max(0, b.y - 1):b.y + b.h + 1, x0:x1].astype(np.float32)
+    win = (win - win.min(axis=1, keepdims=True)).sum(axis=1)[1:-1]
+    z = max(2, int(round(0.2 * len(win))))
+    if len(win) < 2 * z + 1:
+        return False
+    return min(win[:z].mean(), win[-z:].mean()) >= 1.12 * max(float(np.median(win[z:-z])), 1.0)
+
+
+def _v2_bracket_side(sub, V, b):
+    """'[' or ']' if the blob mask (bool, h x w) is a thin vertical stroke with feet at the top and the
+    bottom pointing inwards; '|' if the feet are there but the side can't be told (a small or blurred
+    bracket); else None."""
+    h, w = sub.shape
+    if h < 5 or w < 2 or w > 0.6 * h:
+        return None
+    col = sub.sum(axis=0)
+    half = max(1, (w + 1) // 2)
+    left, right = col[:half].max(), col[w - half:].max()
+    if max(left, right) < 0.7 * h or not _v2_has_feet(V, b):
+        return None
+    if left >= 0.7 * h and right <= 0.5 * h:
+        return "["
+    if right >= 0.7 * h and left <= 0.5 * h:
+        return "]"
+    return "|"
+
+
+def _v2_merge_pieces(blobs, bh):
+    """Pieces of one glyph become one blob (a "%" often breaks into the two circles and the slash, or into
+    a left and a right half), as long as the whole is no bigger than a glyph: 1.2 x bh tall, 1.4 x bh wide."""
+    out = []
+    for b in sorted(blobs, key=lambda b: b.x):
+        for k, o in enumerate(out):
+            x, y = min(o.x, b.x), min(o.y, b.y)
+            w, h = max(o.x + o.w, b.x + b.w) - x, max(o.y + o.h, b.y + b.h) - y
+            ov = min(o.x + o.w, b.x + b.w) - max(o.x, b.x)
+            tall = min(o.h, b.h) >= 0.6 * bh
+            if (ov >= 0.5 * min(o.w, b.w) or (ov >= 1 and tall)) and h <= 1.2 * bh and w <= 1.4 * bh:
+                out[k] = Blob(o.i, x, y, w, h)
+                break
+        else:
+            out.append(b)
+    return out
+
+
+def _v2_is_percent(hi, b):
+    """True if the blob looks like "%": its text mask, squeezed to 7 x 7, matches the game's own "%" glyph
+    (a digit, "/" or a letter at that spot is far off: 0.1 or less against 0.75+ for a "%")."""
+    sub = hi[b.y:b.y + b.h, b.x:b.x + b.w].astype(np.float32)
+    if sub.size == 0:
+        return False
+    sub = cv2.resize(sub, (7, 7), interpolation=cv2.INTER_AREA).reshape(-1)
+    pct = _v2_percent_glyph().reshape(-1)
+    sub, pct = sub - sub.mean(), pct - pct.mean()
+    return float(sub @ pct) >= V2_PERCENT * max(float(np.linalg.norm(sub) * np.linalg.norm(pct)), 1e-6)
+
+
+def _v2_percent_glyph(_cache=[]):
+    if not _cache:
+        _cache.append(np.array(exp_font.load()["glyphs"]["%"]["rows"], np.float32))
+    return _cache[0]
+
+
+def find_exp_v2(bgr, hint=None):
+    """Locate the EXP text in a screenshot by shape and contrast, not colour. Returns a Layout
+    (the same as find_exp) or None. hint is a box (x0, y0, x1, y1) where the bar was last seen: it
+    is searched first (the Layout's box and cy say where it was found, to remember for next time)."""
+    if bgr.size == 0:
+        return None
+    if bgr.ndim == 2 or (bgr.ndim == 3 and bgr.shape[2] == 1):      # (a grey or BGRA picture is read like a BGR one)
+        bgr = cv2.cvtColor(bgr.reshape(bgr.shape[:2]), cv2.COLOR_GRAY2BGR)
+    elif bgr.ndim != 3 or bgr.shape[2] < 3:
+        return None
+    elif bgr.shape[2] > 3:
+        bgr = bgr[:, :, :3]
+    if hint is not None:
+        H, W = bgr.shape[:2]
+        try:
+            x0, y0, x1, y1 = hint
+            x0, y0, x1, y1 = max(0, int(x0)), max(0, int(y0)), min(W, int(x1)), min(H, int(y1))
+        except (TypeError, ValueError, OverflowError):              # (a garbled remembered spot is no spot)
+            x0 = y0 = x1 = y1 = 0
+        if x1 - x0 > 8 and y1 - y0 > 8:
+            lay = _find_exp_v2(bgr[y0:y1, x0:x1], W)
+            if lay:
+                V = np.zeros(bgr.shape[:2], np.float32)         # only the searched box is filled in: all the digits need
+                V[y0:y1, x0:x1] = lay.V
+                sh = lambda cells: [(c[0] + x0, c[1], c[2]) for c in cells]
+                b = lay.box
+                return Layout(lay.gh, lay.cy + y0, sh(lay.exp), sh(lay.pct),
+                              (b[0] + x0, b[1] + y0, b[2] + x0, b[3] + y0), V)
+    return _find_exp_v2(bgr)
+
+
+def _v2_bracket_candidates(mask, V8, have):
+    """Brackets in a text mask: thin tall blobs that have a partner of the same height to their right on
+    the same line (and whose feet and stroke look right). Skips ones already in have."""
+    n, glabels, stats, _ = cv2.connectedComponentsWithStats(mask.view(np.uint8), connectivity=8)
+    thin = np.nonzero((stats[:, 3] >= 5) & (stats[:, 2] <= 0.6 * stats[:, 3]))[0]
+    thin = thin[thin > 0]
+    if len(thin) < 2:
+        return []
+    x, y, h = stats[thin, 0], stats[thin, 1], stats[thin, 3]
+    dx = x[None, :] - x[:, None]
+    pair = ((dx >= 3 * h[:, None]) & (dx <= 9 * h[:, None]) & (np.abs(y[None, :] - y[:, None]) <= 0.3 * h[:, None])
+            & (np.abs(h[None, :] - h[:, None]) <= 0.25 * h[:, None]))
+    keep = thin[pair.any(axis=1) | pair.any(axis=0)]
+    out = []
+    for i in keep:
+        b = Blob(int(i), *map(int, stats[i][:4]))
+        if any(abs(k.x - b.x) <= 2 and abs(k.y - b.y) <= 2 for k, _ in have):
+            continue
+        side = _v2_bracket_side(glabels[b.y:b.y + b.h, b.x:b.x + b.w] == b.i, V8, b)
+        if side:
+            out.append((b, side))
+    return out
+
+
+def _find_exp_v2(bgr, width=None):
+    """(width: the whole screen's width where bgr is only a box of it; it sets the size of the blur.)"""
+    lay = _find_exp_v2_try(bgr, width, False)
+    if lay is None:
+        # Text that is a tiny share of the picture (the small UI on a big screen: a very wide strip) is not
+        # what the 99.7th percentile sees: look again asking each stretch alone, and on a very wide strip
+        # also with the small blur (the big one runs the text's soft edges together).
+        lay = _find_exp_v2_try(bgr, width, True)
+        if lay is None and (width or bgr.shape[1]) >= V2_WIDE:
+            lay = _find_exp_v2_try(bgr, 1, True)
+    return lay
+
+
+def _find_exp_v2_try(bgr, width, tiled):
+    V8 = _v2_brightness(bgr)
+    masks = _v2_text_mask(V8, width, tiled)
+    if masks is None:
+        return None
+    low, faint = masks
+    brackets = _v2_bracket_candidates(low, V8, [])
+    lay = _v2_pair_up(low, V8, brackets)
+    if lay is None:                    # a blur can cut the paler brackets short: look again with the softer mask
+        brackets += _v2_bracket_candidates(faint, V8, brackets)
+        lay = _v2_pair_up(low, V8, brackets)
+    return lay
+
+
+def _v2_pair_up(low, V8, brackets):
+    """The Layout of the EXP block among the bracket candidates, or None."""
+    # Only the rows where two brackets could pair up are looked at closely.
+    rows = [(a.y - a.h, a.y + 2 * a.h) for a, _ in brackets for c, _ in brackets
+            if 3 * a.h <= c.x - a.x <= 9 * a.h and abs(a.y - c.y) <= 0.3 * a.h]
+    if not rows:
+        return None
+    y0, y1 = max(0, min(r[0] for r in rows)), min(low.shape[0], max(r[1] for r in rows))
+    band = low[y0:y1].copy()
+    # a bracket's pixels are never part of a digit
+    for b, _ in brackets:
+        band[max(0, b.y - y0):max(0, b.y + b.h - y0), b.x:b.x + b.w] = False
+    _, wblobs = _blobs(band)
+    wblobs = [Blob(b.i, b.x, b.y + y0, b.w, b.h) for b in wblobs]
+    V = V8.astype(np.float32)
+    strokes = [b for b, _ in brackets]
+    opens = sorted((b for b, s in brackets if s != "]"), key=lambda b: b.x)
+    closes = sorted((b for b, s in brackets if s != "["), key=lambda b: b.x)
+    found = []
+    for o in opens:
+        bh, cy = o.h, o.y + o.h / 2
+        on_line = lambda b: abs(b.y + b.h / 2 - cy) <= 0.3 * bh
+        right = [c for c in closes if c.x > o.x + o.w and c.x - o.x <= 9 * bh
+                 and on_line(c) and abs(c.h - bh) <= 0.25 * bh]
+        if not right:
+            continue
+        c = right[0]
+        near = [b for b in wblobs if abs(b.y + b.h / 2 - cy) <= 0.8 * bh and o.x - 12 * bh <= b.x <= c.x + c.w]
+        near = _v2_merge_pieces([b for b in near if b.h <= 1.3 * bh], bh) + [b for b in near if b.h > 1.3 * bh]
+        line = [b for b in near if on_line(b) and b.h >= 0.6 * bh]
+        inside = sorted((b for b in line if b.x >= o.x + o.w and b.x + b.w <= c.x), key=lambda b: b.x)
+        if len(inside) < 3 or any(b.h > 1.25 * bh for b in inside):
+            continue
+        # the "%" sign right before "]": that's what tells EXP from HP and MP
+        last = inside[-1]
+        if not (0.9 * bh <= last.w <= 1.4 * bh and _v2_is_percent(low, last)):
+            continue
+        dh = float(np.median([b.h for b in inside]))
+        run, edge = [], o.x
+        for b in sorted((b for b in line if b.x + b.w <= o.x), key=lambda b: -b.x):
+            if edge - (b.x + b.w) > 2.0 * bh or b.h > 1.25 * bh or b.h > 1.15 * dh or b.w < 0.2 * dh:
+                break                                     # (a sliver is a piece of the label's thick letters, not a digit)
+            if any(b.x + b.w <= k.x and k.x + k.w <= edge and on_line(k) for k in strokes):
+                break                                     # another bracket in the way: the number stops here
+            run.append(b)
+            edge = b.x
+        if not run:
+            # No number: only "EXP. [58.47%]" is left once the EXP is big. The label's dot says it's EXP.
+            dot = _exp_label_dot(wblobs, o, bh)
+            if dot is None:
+                continue
+            heights = [b.h for b in inside if b.w <= 0.85 * b.h]
+            gh = float(np.median(heights)) if heights else float(bh)
+            found.append(Layout(gh, cy, [], _cells(inside, gh),
+                                (int(dot.x + 0.84 * gh), int(cy - bh), c.x + c.w, int(cy + bh)), V))
+            continue
+        run.reverse()
+        heights = [b.h for b in run + inside if b.w <= 0.85 * b.h]
+        gh = float(np.median(heights)) if heights else float(bh)
+        if not 5 <= gh <= 34:
+            continue
+        found.append(Layout(gh, cy, _cells(run, gh), _cells(inside, gh),
+                            (run[0].x, int(cy - bh), c.x + c.w, int(cy + bh)), V))
+    if not found:
+        return None
+    low_cy = max(f.cy for f in found)
+    # the lowest line; if a digit "1" passed for the "[", the real "[" (further left) gives the longer number
+    return min((f for f in found if f.cy >= low_cy - 0.5 * f.gh), key=lambda f: f.box[0])
+
+
+def digit_patch(V, cx, cy, gh, shift):
+    return glyph_patch(V, cx, cy, gh, shift)
 
 
 class DigitTemplates(TemplateMatcher):
@@ -402,17 +941,18 @@ def _read_digits(tpl, lay, cells):
 
 
 def read_layout(tpl, lay):
-    """(exp, pct) read with the digit templates, or None if any digit is unclear."""
+    """(exp, pct) read with the digit templates, or None if any digit is unclear.
+    exp is None when the bar shows only a percentage."""
     exp_cells, pct_cells = list(lay.exp), _pct_cells(lay)
     both = _read_digits(tpl, lay, exp_cells + pct_cells)          # both numbers in one go
     if both is None:
         return None
     exp_s, pct_s = both[:len(exp_cells)], both[len(exp_cells):]
-    if not exp_s or not pct_s or not 3 <= len(pct_s) <= 5:
+    if (lay.exp and not exp_s) or not pct_s or not 3 <= len(pct_s) <= 5:
         return None
-    if (len(exp_s) > 1 and exp_s[0] == "0") or (len(pct_s) > 3 and pct_s[0] == "0"):
+    if (exp_s and len(exp_s) > 1 and exp_s[0] == "0") or (len(pct_s) > 3 and pct_s[0] == "0"):
         return None                                # a leading 0: some digits were cut off
-    return int(exp_s), int(pct_s) / 100          # the game always shows 2 decimals
+    return (int(exp_s) if exp_s else None), int(pct_s) / 100       # the game always shows 2 decimals
 
 
 def _ocr_pictures(bgr, lay, cells):
@@ -432,6 +972,28 @@ def _ocr_pictures(bgr, lay, cells):
     _, bright = cv2.threshold(hsv[..., 2], 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return [cv2.copyMakeBorder(255 - mask, 12, 12, 12, 12, cv2.BORDER_CONSTANT, value=255)
             for mask in (white, bright)]
+
+
+class _DefaultTextOCR:
+    """Follow the application backend unless a reader was given its own backend."""
+    @property
+    def available(self):
+        return tesseract_ok and TESS is not None
+
+    def read_lines(self, images, chars=None):
+        return TESS.read_lines(images, chars) if self.available else [""] * len(images)
+
+
+def _default_text_ocr():
+    return _DefaultTextOCR()
+
+
+def tesseract_candidates(bgr, lay):
+    return ocr_candidates(bgr, lay, _default_text_ocr())
+
+
+def tesseract_mesos(lay):
+    return ocr_mesos(lay, _default_text_ocr())
 
 
 def ocr_candidates(bgr, lay, ocr):
@@ -518,15 +1080,29 @@ def _clean_job(text):
     return t if len(t) >= 3 else ""
 
 
-def read_job(bgr, x0, cy, g, ocr):
+def read_job(bgr, x0, cy, g, debug=None, ocr=None):
     """The job name in the status bar (e.g. 'Bandit'), from a shot where the EXP number's
     first digit is at x0 and its middle at cy, or None if it can't be read clearly.
+    debug: a dict to fill with what it looked at ("image", "boxes") and, if it gave up, "why".
 
     The job sits on the line of the HP bar's label ("HP"), right before it; the character
     name is on the line under it and is never read."""
-    reg = bgr[max(0, int(cy - 2.5 * g)):int(cy + 3 * g), max(0, int(x0 - 64 * g)):max(0, int(x0 - 20 * g))]
-    if reg.size == 0:
+    if debug is not None and hasattr(debug, "read_lines"):
+        ocr, debug = debug, None
+    ocr = ocr if ocr is not None else _default_text_ocr()
+    ry, rx = max(0, int(cy - 2.5 * g)), max(0, int(x0 - 64 * g))
+    reg = bgr[ry:int(cy + 3 * g), rx:max(0, int(x0 - 20 * g))]
+    if debug is not None:
+        debug.clear()
+        debug.update(image=reg, boxes=[], why="")
+
+    def give_up(why):
+        if debug is not None:
+            debug["why"] = why
         return None
+
+    if reg.size == 0:
+        return give_up("the status bar is off screen here")
     white = _whiteness(reg)
     _, blobs = _blobs(white > 0.3)                    # thin letters: a gentle white check
     # The HP bar: 13-16 EXP digits wide, its left end 31-35 of them before the EXP number
@@ -534,17 +1110,19 @@ def read_job(bgr, x0, cy, g, ocr):
     bars = [b for b in blobs if 9 * g <= b.w <= 20 * g and 1.4 * g <= b.h <= 2.8 * g
             and 24 * g <= b.x <= 39 * g]
     if not bars:
-        return None
+        return give_up("can't find the HP bar next to the class name")
     hp = min(bars, key=lambda b: b.x)                 # the HP bar (the MP bar is right of it)
+    if debug is not None:
+        debug["boxes"].append((hp.x, hp.y, hp.x + hp.w, hp.y + hp.h, "mesos"))
     label = [b for b in blobs if hp.x - 0.5 * g <= b.x <= hp.x + 3 * g
              and b.y + b.h <= hp.y + 0.2 * g and 0.6 * g <= b.h <= 1.6 * g]
     if not label:
-        return None
+        return give_up("can't find the HP label")
     top, bottom = min(b.y for b in label), max(b.y + b.h for b in label)
     row = sorted((b for b in blobs if b.x + b.w <= hp.x - g and b.y >= top - 0.3 * g
                   and b.y + b.h <= bottom + 0.4 * g and b.h >= 0.3 * g), key=lambda b: b.x)
     if len(row) < 2:
-        return None
+        return give_up("no class name found left of the HP bar")
     words = [[row[0]]]
     for b in row[1:]:
         if b.x - max(c.x + c.w for c in words[-1]) > 2.0 * g:
@@ -553,6 +1131,8 @@ def read_job(bgr, x0, cy, g, ocr):
             words[-1].append(b)
     word = words[-1]                                  # the letters right before "HP"
     x_a, x_b = max(0, min(b.x for b in word) - int(0.4 * g)), max(b.x + b.w for b in word) + int(0.4 * g)
+    if debug is not None:
+        debug["boxes"].append((x_a, top, x_b, bottom, "exp"))
     crop = white[max(0, top - int(0.4 * g)):bottom + int(0.4 * g), x_a:x_b]
     glyph_h = max(b.h for b in word)
     if glyph_h > 10:                                  # big screens: read at small-window size,
@@ -561,11 +1141,13 @@ def read_job(bgr, x0, cy, g, ocr):
     votes = _ocr_votes(crop.astype(np.float32), glyph_h, ocr, _clean_job)
     text, n = votes.most_common(1)[0] if votes else ("", 0)
     if n < 2:
-        return None
+        return give_up("the tries didn't agree on what it says" + (f" (best guess: {text})" if text else ""))
     score, best = max((SequenceMatcher(None, text.lower(), j.lower()).ratio(), j) for j in JOBS)
     if score >= 0.72:
         return best
-    return text.title() if n >= 3 else None
+    if n >= 3:
+        return text.title()
+    return give_up(f"it reads \"{text}\", which isn't a class it knows")
 
 
 def _whiteness(bgr):
@@ -603,19 +1185,112 @@ def find_map_box(bgr, gh):
     return (x, y, w, h) if w >= 10 * gh and h >= 4 * gh else None
 
 
+_ROMAN = re.compile(r"^(?:X{0,2})(?:IX|IV|V?I{0,3})$")
+
+
+def _fix_roman(name):
+    """A last word that is a Roman numeral misread ("Vil" -> VII, "lV" -> IV, "il" -> II, "V1" -> VI). Plain numbers
+    ("Free Market 11") and ordinary words are left alone. The site does the same (server/src/mapnames.js)."""
+    def fix(m):
+        token = m.group(2)
+        if not re.search(r"[IVXivxl|!]", token):
+            return m.group(0)                          # only digits: a number
+        numeral = re.sub(r"[li1|!]", "I", token, flags=re.I).upper()
+        return m.group(1) + numeral if numeral and _ROMAN.match(numeral) else m.group(0)
+    return re.sub(r"(\s)([IVXivxl1|!]{1,6})$", fix, name)
+
+
 def _clean_map_name(text):
     t = text.replace("|", "I")                         # a lone "I" (as in "... I") reads as "|"
     t = re.sub(r"(?<=\s)[!\[\]](?=\s*$)", "I", t)
     t = re.sub(r"[^A-Za-z0-9 '<>:.&()\-]", " ", t)
     t = re.sub(r"\s+", " ", t).strip(" .:-")
-    t = re.sub(r"(?<= )[Il1]{3}$", "III", t)         # Roman numerals read as l's and 1's
-    t = re.sub(r"(?<= )[Il1]{2}$", "II", t)
-    t = re.sub(r"(?<= )l$", "I", t)
+    t = _fix_roman(t)                                  # Roman numerals read as l's, 1's, i's ("Vil" is VII)
+    t = re.sub(r"(^|\s)[IiLl]st(?=\s|$)", r"\g<1>1st", t)     # "ist Accompaniment" is "1st Accompaniment"
+    t = re.sub(r"(^|\s)[Zz]nd(?=\s|$)", r"\g<1>2nd", t)
+    t = re.sub(r"(^|\s)[SsBb5]rd(?=\s|$)", r"\g<1>3rd", t)
     return t if len(t) >= 3 else ""
 
 
-def read_map_name(bgr, gh, ocr):
+def _map_key(name):
+    """Only letters and digits, lower case: names that differ in punctuation are the same map."""
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def _edit_distance(a, b):
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        row = [i]
+        for j, cb in enumerate(b, 1):
+            row.append(min(prev[j] + 1, row[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = row
+    return prev[-1]
+
+
+class MapList:
+    """The game's own map names (assets/maps.txt, from meowdb.com), to spell a map the way the game
+    does and to know the towns, where nobody farms. It helps; it isn't a gate: a name that isn't
+    in it (an event map, a new map) is used as it was read. The site applies the same rules."""
+
+    def __init__(self, path=MAPS_PATH):
+        self.entries, self.by_key = [], {}
+        try:
+            lines = Path(path).read_text(encoding="utf-8").splitlines()
+        except OSError:
+            lines = []
+        for line in lines:
+            name, _, town = line.partition("\t")
+            style = _clean_map_name(name)               # as the overlay writes names (no commas)
+            if style:
+                entry = (style, _map_key(name), town.strip() == "1", _numbers(style))
+                self.entries.append(entry)
+                self.by_key[entry[1]] = entry
+
+    def find(self, read):
+        """The list's entry (name, key, is_town, numbers) for a name as read, or None."""
+        key = _map_key(read)
+        if key in self.by_key:
+            return self.by_key[key]
+        nums, best, second = _numbers(read), None, float("inf")
+        for e in self.entries:
+            if e[3] != nums or abs(len(e[1]) - len(key)) > 2:
+                continue
+            d = _edit_distance(key, e[1])
+            if best is None or d < best[0]:
+                second = best[0] if best else second
+                best = (d, e)
+            elif d < second:
+                second = d
+        # one clear match: a letter misread (two in a long name). Two names about as close, or too far, are left alone.
+        allowed = 2 if len(key) >= 24 else 1
+        return best[1] if best and best[0] <= allowed and second - best[0] >= 1 else None
+
+
+_MAP_LIST = None
+
+
+def map_list():
+    global _MAP_LIST
+    if _MAP_LIST is None:
+        _MAP_LIST = MapList()
+    return _MAP_LIST
+
+
+def snap_map_name(name):
+    """The game's spelling of a map name as read (or the name as it is, if it isn't on the list)."""
+    e = map_list().find(name)
+    return e[0] if e else name
+
+
+def is_town(name):
+    """Is this one of the game's towns? (A name not on the list isn't.)"""
+    e = map_list().by_key.get(_map_key(name or ""))
+    return bool(e and e[2])
+
+
+def read_map_name(bgr, gh, ocr=None):
     """The map name (the lower line of white text) from a shot of the minimap's info box."""
+    ocr = ocr if ocr is not None else _default_text_ocr()
     white = _whiteness(bgr[:, int(0.85 * bgr.shape[0]):])      # skip the map's icon
     _, blobs = _blobs(white > 0.5)
     glyphs = sorted((b for b in blobs if 0.3 * gh <= b.h <= 1.6 * gh and b.w <= 2.5 * gh),
@@ -635,7 +1310,7 @@ def read_map_name(bgr, gh, ocr):
     y0, y1 = max(0, min(b.y for b in ln) - 2), max(b.y + b.h for b in ln) + 2
     votes = _ocr_votes(white[y0:y1, x0:x1], max(b.h for b in ln), ocr, _clean_map_name)
     name, n = votes.most_common(1)[0] if votes else (None, 0)
-    return name if n >= 2 else None
+    return snap_map_name(name) if n >= 2 else None
 
 
 # --------------------------------------------------------------------------- mesos and party
@@ -648,30 +1323,90 @@ def read_map_name(bgr, gh, ocr):
 # font's digits are used, which match these closely enough.
 # Party: the small party list shows one HP bar per member, in an evenly spaced column.
 
-def find_mesos_field(bgr, gh=None, hsv=None):
-    """(x, y, w, h) of the solid white mesos box (gold coin on its left), or None.
+def find_mesos_fields(bgr, gh=None, hsv=None, narrow=False):
+    """Every solid white mesos box (gold coin on its left) as (x, y, w, h), biggest first.
 
-    With gh (the EXP digit height), the box must also be the mesos box's size at that scale:
-    about 19.1 x 1.82 EXP digits."""
-    hsv = _hsv(bgr, hsv)
-    white = cv2.inRange(hsv, (0, 0, 226), (255, 29, 255))          # val > 225, sat < 30
-    n, _, stats, _ = cv2.connectedComponentsWithStats(white, connectivity=8)
-    x, y, w, h, area = stats[1:].T.astype(np.int64)
-    ok = (h >= 8) & (7 * h <= w) & (w <= 16 * h) & (area >= 0.6 * w * h)      # box-shaped (all at once:
-    if gh:                                                                      # a busy shot has thousands)
-        ok &= (16.2 * gh <= w) & (w <= 22 * gh) & (1.45 * gh <= h) & (h <= 2.2 * gh)
-    best = None
-    for i in np.flatnonzero(ok) + 1:
+    With gh (the EXP digit height), a box must also be the mesos box's size at that scale:
+    about 19.1 x 1.82 EXP digits. hsv: the same picture as HSV, if it's at hand already.
+    narrow: also the shop's shorter box (about 12 x 1.82 EXP digits)."""
+    hue, sat, val = cv2.split(cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV) if hsv is None else hsv)
+    n, _, stats, _ = cv2.connectedComponentsWithStats(((val > 225) & (sat < 30)).astype(np.uint8),
+                                                      connectivity=8)
+    coin = (hue >= 12) & (hue <= 35) & (sat >= 100) & (val >= 140)
+    found = []
+    for i in range(1, n):
         x, y, w, h, area = map(int, stats[i])
-        left = hsv[y:y + h, max(0, x - int(1.6 * h)):x]                         # the gold coin, left of it
-        if left.size == 0:
+        if h < 8 or not (6.4 if narrow else 7) * h <= w <= 16 * h or area < 0.6 * w * h:
             continue
-        coin = cv2.inRange(left, (12, 100, 140), (35, 255, 255))
-        if np.count_nonzero(coin) / coin.size < 0.15:
+        if gh and not ((11.5 if narrow else 16.2) * gh <= w <= 22 * gh and 1.45 * gh <= h <= 2.2 * gh):
             continue
-        if best is None or area > best[4]:
-            best = (x, y, w, h, area)
-    return best[:4] if best else None
+        left = coin[y:y + h, max(0, x - int(1.6 * h)):x]
+        if left.size == 0 or left.mean() < 0.15:
+            continue
+        found.append((area, (x, y, w, h)))
+    return [box for _, box in sorted(found, reverse=True)]
+
+
+def find_mesos_field(bgr, gh=None):
+    """The biggest solid mesos box (see find_mesos_fields), or None."""
+    fields = find_mesos_fields(bgr, gh)
+    return fields[0] if fields else None
+
+
+def find_trade_mesos_box(bgr, gh, hsv=None):
+    """Your mesos box beside a trade window, as (x, y, w, h), or None.
+
+    The trade's chat panel can cover the box's left end and its coin, so the box is
+    picked by its size alone: a white box 13.5 to 22 EXP digits wide (the two small offer
+    boxes are about 12.5 wide, the chat input over 26). The right-most one wins."""
+    hue, sat, val = cv2.split(cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV) if hsv is None else hsv)
+    n, _, stats, _ = cv2.connectedComponentsWithStats(((val > 225) & (sat < 30)).astype(np.uint8), connectivity=8)
+    found = []
+    for i in range(1, n):
+        x, y, w, h, area = map(int, stats[i])
+        if (13.5 * gh <= w <= 22 * gh and 1.45 * gh <= h <= 2.2 * gh and 7.5 * h <= w <= 12.5 * h
+                and area >= 0.6 * w * h):
+            found.append((x, y, w, h))
+    return max(found) if found else None
+
+
+MONEY_COLOURS = {"orange": ((6, 150, 170), (16, 255, 255)),        # TAKE OUT, BUY ITEM, TRADE...
+                 "green": ((28, 60, 140), (50, 255, 255)),         # EXIT, LEAVE STORE, CANCEL
+                 "blue": ((92, 100, 140), (110, 255, 255))}        # ORGANIZE ITEM
+MONEY_LOOK_WIDTH = 1600     # the window is looked at no bigger than this (buttons stay 10+ px tall)
+
+
+def find_money_window(bgr):
+    """"shop", "storage" or "trade" when that window is open (told apart by their buttons),
+    else None. Mesos move at these windows without being earned.
+
+    Each has a column of same-sized, same-width buttons: a shop's green LEAVE STORE over
+    the orange BUY ITEM; storage the same with a blue ORGANIZE ITEM under it; a trade's
+    orange TRADE over the green CANCEL. Orange chat lines and lone buttons don't count."""
+    scale = min(1.0, MONEY_LOOK_WIDTH / bgr.shape[1])
+    if scale < 1:
+        bgr = cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    kernel = np.ones((3, 3), np.uint8)
+    buttons = {}
+    for colour, (lo, hi) in MONEY_COLOURS.items():
+        mask = cv2.morphologyEx(cv2.inRange(hsv, np.array(lo), np.array(hi)), cv2.MORPH_CLOSE, kernel)
+        n, _, stats, _ = cv2.connectedComponentsWithStats(mask)
+        buttons[colour] = [tuple(map(int, s[:4])) for s in stats[1:n]
+                           if s[3] >= 8 and 2.5 * s[3] <= s[2] <= 7 * s[3] and s[4] >= 0.6 * s[2] * s[3]]
+
+    def below(a, b):
+        """b is the next button down from a: same left edge and width, a little gap."""
+        return (abs(a[0] - b[0]) <= 0.08 * a[2] and abs(a[2] - b[2]) <= 0.1 * a[2]
+                and 0 <= b[1] - a[1] - a[3] <= 0.8 * a[3])
+
+    found = set()
+    for orange in buttons["orange"]:
+        if any(below(g, orange) for g in buttons["green"]):
+            found.add("storage" if any(below(orange, b) for b in buttons["blue"]) else "shop")
+        elif any(below(orange, g) for g in buttons["green"]):
+            found.add("trade")
+    return next((kind for kind in ("storage", "shop", "trade") if kind in found), None)
 
 
 def mesos_layout(bgr, field):
@@ -1004,8 +1739,16 @@ def find_party_bars(bgr, gh, hsv=None):
 # --------------------------------------------------------------------------- finding it on screen
 
 Reading = namedtuple("Reading", "where candidates confident text image boxes map note "
-                                 "mesos mesos_image mesos_boxes party mesos_at",
-                     defaults=((), False, "", None, (), None, None, None, None, (), None, None))
+                                 "mesos mesos_image mesos_boxes party mesos_at window bar percent_only level exp_kind tries ms shadow v2_at",
+                     defaults=((), False, "", None, (), None, None, None, None, (), None, None, None, None, False, None,
+                               None, (), None, None, None))
+# percent_only: the bar shows just "[58.47%]" (candidates are then [(None, pct)]); level: the level read
+# from the status bar's LV badge, with where it came from, as (level, source), or None
+# exp_kind, tries and ms are for health reports (healthlog.py): how the EXP look went (read, tesseract, unclear,
+# not_found, covered or no_window), which other readers tried during the look as (part, worked) pairs, and
+# how long the look took in milliseconds
+# shadow and v2_at are for shadow mode (shadow.py): (what happened, v2's milliseconds), and (key, box) when reader v2
+# found the bar in a new place, to remember in the config
 
 
 def _view(img, lay):
@@ -1082,7 +1825,7 @@ class ScreenReader:
 
     def __init__(self, templates, mode="window", region=None, text_ocr=None):
         self.templates = templates          # GlyphMatcher for the EXP bar's digits
-        self.text_ocr = text_ocr or NoTextOCR()     # TextOCR for map names, the class, new mesos
+        self.text_ocr = text_ocr if text_ocr is not None else _default_text_ocr()     # TextOCR for map names, the class, new mesos
         self.mode, self.region = mode, region
         self.hwnd = None
         self.size = None
@@ -1105,21 +1848,97 @@ class ScreenReader:
         self.mesos_fails = 0
         self.next_mesos_check = 0.0
         self.mesos_covered = False  # this app's window is in the way of the mesos
+        self.capture = ScreenCapture(None)  # where the pictures come from (set at each look)
+        self.two_boxes = False      # a storage / trade window shows a second mesos box
+        self.window = None          # "shop", "storage" or "trade" while one is open (or just closed)
+        self.window_until = 0.0     # ...and until when it still counts
+        self.window_box = False     # the mesos box being read belongs to such a window (not the inventory)
+        self.potion_table = self.potion_digits = None    # loaded at the first look at the potion bar
+        self.next_bar, self.bar_reads, self.bar_shift = 0.0, 0, (0, 0)
+        self.next_outline = 0.0     # the earliest time to search for a see-through mesos box again
         self.party_area = None      # where the party list was last seen, on screen
         self.next_scan = 0.0
         self.own_rect = None        # this app's window, which screenshots can't see through
         self.look_again_requested = False
         self.exp_anchor = None      # where the EXP number starts, relative to the game window
         self.job = None             # the class shown in the status bar
+        self.job_look = None        # what the last try at reading it saw: {"image", "boxes", "why"}
+        self.map_look = None        # the same for the map name: {"image", "text"}
+        self.map_seen_at = None     # when the minimap's name box was last seen (so a map change would have shown)
+        self.last_rect = None       # where the game window was at the last look (x, y, w, h)
         self.next_job_read = 0.0
         self.last_exp = _LastLook()         # the EXP bar's last picture and its reading
         self.last_mesos = _LastLook()       # the mesos box's last picture and its reading
+        self.level = None           # the level read from the status bar's badge (two captures agreed)
+        self.level_look = None      # what the last try at reading it saw: {"image", "votes", "why"}
+        self.level_failures = 0     # badge reads in a row that gave nothing
+        self.badge_covered = False  # the last badge look found a window over it
+        self.next_level_read = 0.0
+        self._level_candidate = None    # a level seen once, waiting for a second capture to agree
+        self.name_print = None      # a small picture of the character's name row (see level_ocr.name_print); never read as text
+        self.next_name_read = 0.0
+        self._tries = []                    # (part, worked) for the readers that tried during this look
+        self.part_errors = Counter()        # how often each part of the reading failed (by part name)
+        self.error_types = Counter()        # ...and by exception type name (never the message)
+        self.part_failed_at = {}            # part -> when it last failed, until a later try works
+        self._part_logged = {}              # part -> (when errors.log last heard of it, failures skipped since)
+        self.shadow = shadow.Shadow(find_exp_v2, digits_v2.read_layout_v2, fits_exp_table, exp_font.load, _view,
+                                    lambda exc: self._part_failed("reader v2", exc))      # reader v2, beside this one
+        self.saved_v2 = {}                  # "WxH/gh" -> where reader v2 found the bar last time (from the config)
+        self.v2_spot = None                 # ...and where it has found it in this game window (x0, y0, x1, y1)
+
+    @contextlib.contextmanager
+    def _part(self, part):
+        """One part of a look (map name, mesos, ...): if it raises, that part counts as not read this look
+        and the others carry on. A part that really ran and worked says so with _part_ok (one that wasn't due
+        yet proves nothing, so a failure's status note stays its PART_NOTE_SECONDS)."""
+        try:
+            yield
+        except Exception as e:
+            self._part_failed(part, e)
+            if part in TRIED_PARTS:
+                self._tried(TRIED_PARTS[part], False)
+
+    def _part_ok(self, part):
+        self.part_failed_at.pop(part, None)
+
+    def _tried(self, part, worked):
+        """Notes that a reader tried during this look (map, class, level, mesos, potions), for health reports."""
+        self._tries.append((part, bool(worked)))
+
+    def _part_failed(self, part, exc):
+        now = time.monotonic()
+        self.part_errors[part] += 1
+        self.error_types[type(exc).__name__] += 1
+        self.part_failed_at[part] = now
+        last, skipped = self._part_logged.get(part, (None, 0))
+        if last is not None and now - last < PART_LOG_SECONDS:
+            self._part_logged[part] = (last, skipped + 1)           # (it would fill errors.log at every look)
+            return
+        self._part_logged[part] = (now, 0)
+        more = f" ({skipped} more failures skipped since the last entry)" if skipped else ""
+        log_error(f"reading the {part} failed{more}", exc)
+
+    def _with_part_notes(self, reading):
+        now = time.monotonic()
+        said = [f"{PART_NOTES[p]} (details in errors.log)." for p, t in self.part_failed_at.items()
+                if p in PART_NOTES and now - t < PART_NOTE_SECONDS]
+        if not said:
+            return reading
+        return reading._replace(note=" ".join(([reading.note] if reading.note else []) + said))
 
     def use_window(self):
         self.mode, self.hwnd, self.box = "window", None, None
+        self.forget_level()
 
     def use_region(self, region):
         self.mode, self.region = "region", region
+        self.forget_level()
+
+    def forget_level(self):
+        """The badge level read so far belongs to what was looked at before (another place, character or reset)."""
+        self.level, self.level_failures, self._level_candidate = None, 0, None
+        self.recheck_level()
 
     def request_map(self):
         """Read the map name on the next look, even if it doesn't seem to have changed."""
@@ -1132,54 +1951,198 @@ class ScreenReader:
 
     def _forget_places(self):
         self.box, self.misses = None, 0
+        self.v2_spot = None
         self.map_box, self.map_print = None, None
         self.mesos_box = self.saved_mesos = None
         self.mesos_fails, self.mesos_count, self.mesos_pending = 0, None, (None, 0)
         self.mesos_covered, self.party_area, self.next_scan = False, None, 0.0
+        self.two_boxes, self.next_outline = False, 0.0
+        self.window, self.window_until, self.window_box = None, 0.0, False
         self.exp_anchor, self.next_job_read = None, 0.0
+        self.next_level_read, self._level_candidate = 0.0, None
         self.request_map()
 
-    def read(self, sct):
+    def read(self, capture):
+        capture = self.capture = as_capture(capture)
+        capture.begin_look()
+        try:
+            return self._look(capture)
+        finally:
+            capture.end_look()
+
+    def _look(self, capture):
+        self._tries = []
         if self.look_again_requested:
             self.look_again_requested = False
             self._forget_places()
         rect = self._game_rect()
-        if rect and self.mode == "window" and PLATFORM.flat_screenshot_cost:
-            sct = _OneShot(sct, rect)                   # one screenshot for this whole look
+        self.last_rect = rect
+        if rect and self.mode == "window" and type(capture) is ScreenCapture:
+            window = capture_window(PLATFORM, self.hwnd, rect)
+            if window is not None:
+                capture = self.capture = window
+            elif PLATFORM.flat_screenshot_cost:
+                capture = self.capture = ScreenCapture(_OneShot(capture.sct, rect))
         if self.mode == "region":
-            reading = self._read_region(sct, rect)
+            reading = self._read_region(capture, rect)
         elif not self.hwnd and PLATFORM.missing_permission():
-            return Reading(PLATFORM.missing_permission())
+            return Reading(PLATFORM.missing_permission(), exp_kind="no_window")
         elif not self.hwnd:
-            return Reading("MapleStory window not found. Is the game running?")
+            return Reading("MapleStory window not found. Is the game running?", exp_kind="no_window")
         elif not rect:
-            return Reading("MapleStory is minimized. Bring the game back up.")
+            return Reading("MapleStory is minimized. Bring the game back up.", exp_kind="no_window")
         else:
-            reading = self._read_window(sct, rect)
+            reading = self._read_window(capture, rect)
+        if reading.percent_only and self.mode == "region":
+            # (a selected area has no game window around it: no badge to find, so typing the level in is open at once)
+            self.level_failures = max(self.level_failures, LEVEL_FAILS_FOR_FALLBACK)
+            self.level_look = {"image": None, "votes": {}, "why": "Selected area: the level badge isn't in it"}
         if rect and self.gh:
-            name, note = self._read_info(sct, rect)
-            reading = self._read_extras(sct, rect, reading._replace(map=name, note=note))
+            name = note = None
+            with self._part("map name"):
+                name, note = self._read_info(capture, rect)
+            reading = self._read_extras(capture, rect, reading._replace(map=name, note=note))
             if self.exp_anchor and self.mode == "window":
-                self._read_job(sct, rect)
-        return reading
+                with self._part("class"):
+                    self._read_job(capture, rect)
+                with self._part("name print"):
+                    self._look_at_name(capture, rect)
+                if reading.percent_only:        # no EXP number to tell the level from: the badge has to
+                    with self._part("level"):
+                        self._read_level(capture, rect)
+        return self._with_part_notes(reading._replace(
+            level=(self.level, "badge") if self.level and reading.percent_only and self.mode == "window" else None,
+            tries=tuple(self._tries)))
 
-    def _read_job(self, sct, rect):
+    def map_blind_seconds(self):
+        """How long the minimap's name box hasn't been visible (0 if it never was: no map to lose)."""
+        return 0.0 if self.map_seen_at is None else time.monotonic() - self.map_seen_at
+
+    def diagnostics(self):
+        """What this reader knows about where things are, for bug reports (a plain dict)."""
+        rect, g = self.last_rect, self.gh
+        covering = []
+        if rect and g:
+            wx, wy = rect[0], rect[1]
+            if self.box and self._covered(wx + self.box[0], wy + self.box[1], self.box[2], self.box[3]):
+                covering.append("EXP bar")
+            if self.mesos_box and self._covered(wx + self.mesos_box[0], wy + self.mesos_box[1], self.mesos_box[2],
+                                                self.mesos_box[3], margin=max(2, int(0.3 * self.mesos_box[3]))):
+                covering.append("mesos box")
+            if self.map_box and self._covered(wx + self.map_box[0], wy + self.map_box[1], self.map_box[2], self.map_box[3]):
+                covering.append("minimap name")
+            if self.party_area and self._covered(*self.party_area):
+                covering.append("party list")
+            if self.exp_anchor:
+                ax, ay = self.exp_anchor
+                if self._covered(wx + int(ax - 65 * g), wy + int(ay - 3 * g), int(46 * g), int(6.5 * g)):
+                    covering.append("class name")
+        return dict(mode=self.mode, found=bool(self.hwnd), rect=rect, gh=g, region=self.region, capture=self.capture.name,
+                    own_rect=self.own_rect, covering=covering, exp_box=self.box, exp_misses=self.misses,
+                    map_box=self.map_box, map_unread=self.map_unread, mesos_box=self.mesos_box,
+                    mesos_fails=self.mesos_fails, two_boxes=self.two_boxes, mesos_learned=self.mesos_digits.complete,
+                    party_area=self.party_area, job_why=(self.job_look or {}).get("why") or "",
+                    part_errors=dict(self.part_errors), error_types=dict(self.error_types))
+
+    def _read_job(self, capture, rect):
         """Reads the class from the status bar now and then (it only changes at a job advance)."""
+        capture = self.capture = as_capture(capture)
         now = time.monotonic()
-        if not self.text_ocr.available or now < self.next_job_read:
+        if not self.text_ocr.available:
+            self.job_look = {"image": None, "boxes": [], "why": tesseract_note("The class")}
+            return
+        if now < self.next_job_read:
             return
         wx, wy, _, _ = rect
         ax, ay = self.exp_anchor
         g = self.gh
         x0, y0, w, h = wx + int(ax - 65 * g), wy + int(ay - 3 * g), int(46 * g), int(6.5 * g)
-        if self._covered(x0, y0, w, h):
+        if self._blocked(x0, y0, w, h):
             self.next_job_read = now + 5
+            self.job_look = {"image": None, "boxes": [], "why": "this window is covering the class name: move it"}
             return
-        shot = grab(sct, x0, y0, w, h)
-        job = read_job(shot[0], wx + ax - shot[1], wy + ay - shot[2], g, self.text_ocr) if shot else None
+        shot = capture.grab(x0, y0, w, h)
+        look = {}
+        self.next_job_read = now + 10         # (kept if the read raises: it isn't started again at every look)
+        job = read_job(shot[0], wx + ax - shot[1], wy + ay - shot[2], g, look, ocr=self.text_ocr) if shot else None
+        self._part_ok("class")
+        self.job_look = look or None
+        self._tried("class", job)
         if job:
             self.job = job
         self.next_job_read = now + (60 if job else 10)
+
+    def _look_at_name(self, capture, rect):
+        """Now and then, a print of the name row: how another character is told from this one (the level
+        read for one isn't another's). It is only a picture, kept in memory: the name isn't read."""
+        capture = self.capture = as_capture(capture)
+        now = time.monotonic()
+        if now < self.next_name_read:
+            return
+        self.next_name_read = now + 5
+        wx, wy, _, _ = rect
+        ax, ay = self.exp_anchor
+        g = self.gh
+        x0, y0, w, h = wx + int(ax - 50.5 * g) - 2, wy + int(ay + 0.9 * g) - 2, int(12.5 * g) + 5, int(1.7 * g) + 5
+        if self._blocked(x0, y0, w, h):
+            self.name_print = None
+            return
+        shot = capture.grab(x0, y0, w, h)
+        self.name_print = level_ocr.name_print(shot[0], wx + ax - shot[1], wy + ay - shot[2], g) if shot else None
+        self._part_ok("name print")
+
+    def recheck_level(self):
+        """Read the badge at the next look (the % wrapped: the level may have gone up). The level known so
+        far stays until a new one has been seen twice."""
+        self.next_level_read, self._level_candidate = 0.0, None
+
+    def _read_level(self, capture, rect):
+        """Reads the level from the badge: a level counts once two looks in a row agree. A failing read
+        backs off (so a covered or unreadable badge doesn't keep starting Tesseract); a known level is
+        looked at again only now and then."""
+        capture = self.capture = as_capture(capture)
+        now = time.monotonic()
+        if now < self.next_level_read:
+            return
+        wx, wy, _, _ = rect
+        ax, ay = self.exp_anchor
+        g = self.gh
+        x0, y0, w, h = wx + int(ax - 72 * g), wy + int(ay - 1.6 * g), int(34 * g) + 1, int(5.2 * g) + 1
+        if not self.text_ocr.available:           # nothing to wait for: typing the level in is open at once
+            self.level_failures = max(self.level_failures, LEVEL_FAILS_FOR_FALLBACK)
+            self.level_look = {"image": None, "votes": {}, "why": tesseract_note("The level badge") or "Tesseract isn't available"}
+            self.next_level_read = now + 60
+            return
+        if self._blocked(x0, y0, w, h):
+            self.level_look = {"image": None, "votes": {}, "why": "this window is covering the level badge: move it"}
+            self.badge_covered = True
+            self.level_failures += 1            # (a badge that stays out of sight opens the Level fallback like one that can't be read)
+            self.next_level_read = now + 5
+            return
+        self.badge_covered = False
+        shot = capture.grab(x0, y0, w, h)
+        look = {}
+        try:
+            seen = level_ocr.read_level(shot[0], wx + ax - shot[1], wy + ay - shot[2], g, self.text_ocr, look) if shot else None
+        except Exception as e:              # (Tesseract failing or timing out, or anything unexpected: not a level, back off)
+            look["why"] = f"the level read failed: {e}"
+            self._part_failed("level", e)
+            seen = None
+        else:
+            self._part_ok("level")
+        self.level_look = look
+        self._tried("level", seen is not None)
+        if seen is None:
+            self.level_failures += 1
+            self._level_candidate = None
+            self.next_level_read = now + (2 if self.level_failures < LEVEL_FAILS_FOR_FALLBACK
+                                         else 5 if self.level_failures < 2 * LEVEL_FAILS_FOR_FALLBACK else 30)
+        elif seen == self._level_candidate:       # the second look agrees
+            self.level, self.level_failures, self._level_candidate = seen, 0, None
+            self.next_level_read = now + LEVEL_RECHECK_SECONDS
+        else:
+            self._level_candidate, self.level_failures = seen, 0
+            self.next_level_read = now + 1.5
 
     def _game_rect(self):
         if not (self.hwnd and PLATFORM.window_exists(self.hwnd)):
@@ -1187,17 +2150,20 @@ class ScreenReader:
         rect = PLATFORM.client_rect(self.hwnd) if self.hwnd else None
         if rect and rect[2:] != self.size:                  # resized: find everything again
             self.size, self.box, self.map_box, self.gh = rect[2:], None, None, None
+            self.v2_spot = None
             self.exp_anchor, self.next_job_read = None, 0.0
             self.mesos_box, self.party_area, self.next_scan = None, None, 0.0
+            self.window, self.window_until, self.window_box = None, 0.0, False
             saved = self.saved_mesos
             if saved and tuple(saved[:2]) == tuple(rect[2:]):
                 self.mesos_box = tuple(saved[2:])           # where it was last time
         return rect
 
-    def _hide_own(self, shot):
-        """The screenshot with this app's window blacked out, so it can never read itself."""
+    def _hide_own(self, shot, screen_copy=False):
+        """The screenshot with this app's window blacked out, so it can never read itself. (A capture that
+        sees through windows has nothing to hide; screen_copy=True is for a picture taken from the screen.)"""
         r = self.own_rect
-        if not shot or not r:
+        if not shot or not r or (self.capture.sees_through_windows and not screen_copy):
             return shot
         img, sx, sy = shot
         x0, y0 = max(0, r[0] - sx), max(0, r[1] - sy)
@@ -1213,31 +2179,41 @@ class ScreenReader:
         return bool(r) and (x - margin < r[0] + r[2] and r[0] < x + w + margin
                             and y - margin < r[1] + r[3] and r[1] < y + h + margin)
 
+    def _blocked(self, x, y, w, h, margin=0):
+        """Is this area unreadable because this app's window is on top of it? (Never, if the capture sees
+        through windows; _covered is the plain geometry.)"""
+        return self._covered(x, y, w, h, margin) and not self.capture.sees_through_windows
+
     def _remember(self, lay, rect, shot=None):
         if lay and rect:
             self.gh = lay.gh                # tells the minimap reader how big the UI is
             if shot:                        # where the EXP number starts: the class is left of it
                 self.exp_anchor = (shot[1] - rect[0] + lay.box[0], shot[2] - rect[1] + lay.cy)
 
-    def _read_region(self, sct, rect):
+    def _read_region(self, capture, rect):
+        capture = self.capture = as_capture(capture)
         r = self.region
         if not r:
-            return Reading("No area selected. Click Select area.")
-        shot = self._hide_own(grab(sct, r["left"], r["top"], r["width"], r["height"]))
+            return Reading("No area selected. Click Select area.", exp_kind="no_window")
+        shot = self._hide_own(capture.grab(r["left"], r["top"], r["width"], r["height"]))
         reading, lay = self._read(shot, "Selected area")
         if reading.confident:
             self._remember(lay, rect)
         return reading
 
-    def _read_window(self, sct, rect):
+    def _read_window(self, capture, rect):
+        capture = self.capture = as_capture(capture)
         wx, wy, ww, wh = rect
         where = f"MapleStory window {ww}x{wh}"
+        started = time.perf_counter()
         if self.box:
             bx, by, bw, bh = self.box
-            if self._covered(wx + bx, wy + by, bw, bh):
-                return Reading("This window is covering the EXP bar. Move it.")
-            shot = grab(sct, wx + bx, wy + by, bw, bh)
+            if self._blocked(wx + bx, wy + by, bw, bh):
+                return Reading("This window is covering the EXP bar. Move it.", exp_kind="covered")
+            shot = capture.grab(wx + bx, wy + by, bw, bh)
             reading, lay = self._read(shot, where)
+            if reading.confident or self.misses < 2:        # (the 3rd miss searches again below: that look is the one handed on)
+                reading = self._shadow_look(capture, rect, shot, reading, lay, started)
             if reading.confident:
                 self.misses = 0
                 self._remember(lay, rect, shot)
@@ -1251,35 +2227,107 @@ class ScreenReader:
 
         # Search the bottom of the window (and now and then the whole window).
         top = int(wh * (1 - SEARCH_STRIP))
-        shot = self._hide_own(grab(sct, wx, wy + top, ww, wh - top))
+        shot = self._hide_own(capture.grab(wx, wy + top, ww, wh - top))
         lay = find_exp(shot[0]) if shot else None
         if not lay and time.monotonic() - self.last_full_search > 10:
             self.last_full_search = time.monotonic()
-            shot = self._hide_own(grab(sct, wx, wy, ww, wh))
+            shot = self._hide_own(capture.grab(wx, wy, ww, wh))
             lay = find_exp(shot[0]) if shot else None
         if not lay:
-            if self._covered(wx, wy + top, ww, wh - top):
-                return Reading("Can't find the EXP bar. Is this window covering it?")
-            return Reading("Can't find the EXP bar at the bottom of the game. Is something covering it?")
+            if self._blocked(wx, wy + top, ww, wh - top):
+                reading = Reading("Can't find the EXP bar. Is this window covering it?", exp_kind="covered")
+            else:
+                reading = Reading("Can't find the EXP bar at the bottom of the game. Is something covering it?",
+                                  exp_kind="not_found")
+            return self._shadow_look(capture, rect, shot, reading, None, started)     # (v2 may still see it)
         img, sx, sy = shot
         g = lay.gh
-        x0, x1 = max(0, int(lay.box[0] - g)), min(img.shape[1], int(lay.box[2] + 6 * g))
+        lead = g if lay.exp else 5.5 * g       # (a %-only bar is found by its label, so the label stays in the spot)
+        x0, x1 = max(0, int(lay.box[0] - lead)), min(img.shape[1], int(lay.box[2] + 6 * g))
         y0, y1 = max(0, int(lay.cy - 1.4 * g)), min(img.shape[0], int(lay.cy + 1.4 * g))
         reading, lay = self._read(shot, where, lay)
+        reading = self._shadow_look(capture, rect, shot, reading, lay, started)
         if reading.confident:             # only remember a spot whose digits match the game font
             self.box = (sx - wx + x0, sy - wy + y0, x1 - x0, y1 - y0)
             self.misses = 0
             self._remember(lay, rect, shot)
         return reading
 
+    def _shadow_look(self, capture, rect, shot, reading, lay, started):
+        """Runs reader v2 on the picture just read and notes in the Reading how the two compare (shadow.py).
+        It only adds to the Reading's shadow and v2_at, never changes what was read: anything going wrong here
+        leaves the Reading exactly as it was."""
+        try:
+            return self._shadow_look_v2(capture, rect, shot, reading, lay, started)
+        except Exception as e:
+            self.shadow.failed(e)           # (counted like any v2 error, and v2 rests a minute)
+            return reading._replace(shadow=("errors", None))
+
+    def _today_answer(self, img):
+        """Today's reader (templates, no Tesseract) on another picture: only to tell a v2 disagreement from EXP that
+        changed between two screen grabs."""
+        lay = find_exp(img)
+        got = read_layout(self.templates, lay) if lay and self.templates else None
+        if got and got[0] is not None and not fits_exp_table(*got):
+            return None
+        return got
+
+    def _shadow_look_v2(self, capture, rect, shot, reading, lay, started):
+        if not shot or self.shadow.idle():
+            return reading
+        wx, wy, ww, wh = rect
+        old_img, ox, oy = shot[0], shot[1] - wx, shot[2] - wy      # where this picture sits in the game window
+        img = old_img
+        key = f"{ww}x{wh}/{round(lay.gh) if lay else round(self.gh or 0)}"
+        spot = self.v2_spot or self.saved_v2.get(key)
+        hint, own = None, None
+        where = {"ox": ox, "oy": oy}                # where the picture v2 reads sits in the game window
+        if spot:
+            x0, y0, x1, y1 = max(0, spot[0]), max(0, spot[1]), min(ww, spot[2]), min(wh, spot[3])
+            if x1 - x0 > 8 and y1 - y0 > 8:
+                if ox <= x0 and oy <= y0 and x1 <= ox + img.shape[1] and y1 <= oy + img.shape[0]:
+                    hint = (x0 - ox, y0 - oy, x1 - ox, y1 - oy)       # the picture holds its spot
+                elif not self._blocked(wx + x0, wy + y0, x1 - x0, y1 - y0):
+                    def own():                      # (a small crop of its own, grabbed only if v2 really runs)
+                        pic = self._hide_own(capture.grab(wx + x0, wy + y0, x1 - x0, y1 - y0))
+                        if not pic:
+                            return None
+                        self.shadow.counts["grabs"] += 1
+                        where["ox"], where["oy"] = pic[1] - wx, pic[2] - wy
+                        return pic[0]
+        top = int(wh * (1 - SEARCH_STRIP))
+
+        def strip():                                # (the bottom strip, if the picture didn't hold the bar)
+            if self._blocked(wx, wy + top, ww, wh - top):
+                return None
+            big = self._hide_own(capture.grab(wx, wy + top, ww, wh - top))
+            return (big[0], big[1] - wx - where["ox"], big[2] - wy - where["oy"]) if big else None
+
+        old = reading.candidates[0] if reading.confident and reading.candidates else None
+        small = own or img.shape[0] < wh - top or img.shape[1] < ww       # (a picture that already is the strip needs no other)
+        res = self.shadow.look(img, old, (time.perf_counter() - started) * 1000, lay, hint, strip if small else None, old_img, own,
+                                searching=lay is None, recheck=self._today_answer)
+        ox, oy = where["ox"], where["oy"]
+        if res is None:
+            return reading
+        at = None
+        if res.spot:
+            box = (res.spot[0] + ox, res.spot[1] + oy, res.spot[2] + ox, res.spot[3] + oy)
+            if self.v2_spot is None or max(abs(a - b) for a, b in zip(box, self.v2_spot)) > 3:
+                self.v2_spot = box
+                at = (key, list(box))
+        return reading._replace(shadow=(res.category, res.ms), v2_at=at)
+
     def _read(self, shot, where, lay=None):
-        """Returns (Reading, Layout or None)."""
+        """Returns (Reading, Layout or None). Its exp_kind (for health reports): read = the templates gave a
+        number that fits (or a clear percentage); tesseract = only Tesseract's candidate is left; unclear = the
+        bar is there but nothing can be trusted; not_found = no bar (or off screen)."""
         if not shot:
-            return Reading(_problem(where, "The EXP bar is off screen.")), None
+            return Reading(_problem(where, "The EXP bar is off screen."), exp_kind="not_found"), None
         img = shot[0]
         if lay is None:                         # (where it was: often just as it was)
             same, answer = self.last_exp.get(img, where)
-            if same:
+            if same and answer[0].confident:
                 return answer
             return self.last_exp.put(img, where, self._read_new(img, where, None))
         return self._read_new(img, where, lay)
@@ -1287,72 +2335,168 @@ class ScreenReader:
     def _read_new(self, img, where, lay):
         lay = lay or find_exp(img)
         if not lay:
-            return Reading(_problem(where, "Can't find the EXP bar.")), None
+            return Reading(_problem(where, "Can't find the EXP bar."), exp_kind="not_found"), None
         view, boxes = _view(img, lay)
         got = read_layout(self.templates, lay) if self.templates else None
+        if not lay.exp:                       # only "[58.47%]": the level has to come from elsewhere
+            if got:
+                return Reading(where, [got], True, f"[{got[1]:.2f}%] (percentage only)", view, boxes,
+                               percent_only=True, exp_kind="read"), lay
+            return Reading(_problem(where, "Found the EXP bar, but can't read its percentage clearly."),
+                           image=view, boxes=boxes, percent_only=True, exp_kind="unclear"), lay
         if got and fits_exp_table(*got):
-            return Reading(where, [got], True, f"{got[0]:,} [{got[1]:.2f}%]", view, boxes), lay
+            return Reading(where, [got], True, f"{got[0]:,} [{got[1]:.2f}%]", view, boxes, exp_kind="read"), lay
         # Unclear digits, or a reading that fits no level: not trusted. Readings that do fit
         # a level go first, so the tracker tries those.
-        cands = ([got] if got else []) + [c for c in ocr_candidates(img, lay, self.text_ocr) if c != got]
+        cands = [got] if got else []
+        with self._part("Tesseract"):           # (the backup failing leaves the template reading standing)
+            backup = (tesseract_candidates(img, lay) if isinstance(self.text_ocr, _DefaultTextOCR)
+                      else ocr_candidates(img, lay, self.text_ocr))
+            cands += [c for c in backup if c != got]
+            self._part_ok("Tesseract")
         cands.sort(key=lambda c: not fits_exp_table(*c))
         if cands:
             e, p = cands[0]
             how = "" if (e, p) == got else " (Tesseract)"
-            return Reading(where, cands, False, f"{e:,} [{p:.2f}%]{how}", view, boxes), lay
+            return Reading(where, cands, False, f"{e:,} [{p:.2f}%]{how}", view, boxes,
+                           exp_kind="tesseract" if how else "unclear"), lay
         return Reading(_problem(where, "Found the EXP bar, but can't read its numbers clearly."),
-                       image=view, boxes=boxes), lay
+                       image=view, boxes=boxes, exp_kind="unclear"), lay
 
-    def _read_extras(self, sct, rect, reading):
+    def _read_extras(self, capture, rect, reading):
         """Adds the mesos count and, every few seconds, the party size to a reading."""
+        capture = self.capture = as_capture(capture)
         wx, wy, ww, wh = rect
         now, g = time.monotonic(), self.gh
         notes = [reading.note] if reading.note else []
         party = moved = None
+        if self.window and now > self.window_until:   # the window closed: its box went with it
+            self.window = None
+            if self.window_box:
+                self.mesos_box, self.window_box = None, False
+                self.mesos_fails, self.next_outline = 0, 0.0
         if now >= self.next_scan:                     # look over the whole window
             self.next_scan = now + (SCAN_SECONDS if self.mesos_box else 2)
-            shot = self._hide_own(grab(sct, wx, wy, ww, wh))
-            if shot:
-                img, sx, sy = shot
-                hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)   # once, for all that's looked for here
-                field = find_mesos_field(img, g, hsv)  # the solid box is easy to spot
-                if field and not self._readable(img, field):
-                    field = None                      # a white patch in the scene, not the box
-                # Look for it by its outline too if it's lost, or this window is in the way of
-                # where it was (it may have been moved from there).
-                if field is None and (self.mesos_box is None or self.mesos_fails >= 10 or self.mesos_covered):
-                    field = self._find_seethrough_box(img, g, hsv)
-                if field:
-                    box = (sx - wx + field[0], sy - wy + field[1], field[2], field[3])
-                    old = self.mesos_box
-                    if old is None or max(abs(a - b) for a, b in zip(box, old)) > 3:
-                        self.mesos_box, self.mesos_fails = box, 0
-                        moved = (ww, wh) + box
-                area = self.party_area
-                if area and self._covered(*area):
-                    notes.append("This window is covering the party list.")
-                else:
-                    bars = find_party_bars(img, g, hsv)
-                    party = max(1, len(bars))
-                    if len(bars) >= 2:
-                        x0, y0 = min(b[0] for b in bars), min(b[1] for b in bars)
-                        x1, y1 = max(b[0] + b[2] for b in bars), max(b[1] + b[3] for b in bars)
-                        # Only the HP bars are counted, so only they (and a little room
-                        # around them) must be clear of this window.
-                        self.party_area = (sx + x0 - int(g), sy + y0 - int(g),
-                                           x1 - x0 + int(2 * g), y1 - y0 + int(2 * g))
+            with self._part("window scan"):
+                shot = self._hide_own(capture.grab(wx, wy, ww, wh))
+                if shot:
+                    img, sx, sy = shot
+                    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)      # (made once for everything below)
+                    window = find_money_window(img)                 # (shop, storage or trade)
+                    if window:
+                        self.window, self.window_until = window, now + WINDOW_GRACE
+                    if self.window:
+                        self.next_scan = now + WINDOW_SCAN_SECONDS  # mesos change here: look often
+                    fields = find_mesos_fields(img, g, hsv, narrow=window == "shop")   # the solid box is easy to spot
+                    if window == "trade" and not fields:            # its chat panel may cover the coin
+                        box = find_trade_mesos_box(img, g, hsv)
+                        fields = [box] if box else []
+                    if window == "storage" and len(fields) == 2:
+                        fields = [max(fields)]                      # yours is the right-hand one
+                        self.two_boxes = False
+                    elif window == "shop":
+                        self.two_boxes = False                      # (both would be yours: the first will do)
+                    else:
+                        # A storage / trade window outside those cases shows a second mesos box next to
+                        # yours, and which is which can't be told: read neither until it's closed.
+                        self.two_boxes = len(fields) > 1
+                        if window == "storage":
+                            fields = []
+                    field = None if self.two_boxes else (fields[0] if fields else None)
+                    if field and window == "shop" and field[2] < 16 * g:
+                        # (its digits end a little further from the box's right edge)
+                        field = (field[0], field[1], field[2] - round(0.12 * field[3]), field[3])
+                    if field and not self._readable(img, field):
+                        field = None                      # a white patch in the scene, not the box
+                    # Look for it by its outline too if it's lost, or this window is in the way of
+                    # where it was (it may have been moved from there).
+                    if (field is None and not self.two_boxes and now >= self.next_outline
+                            and (self.mesos_box is None or self.mesos_fails >= 10 or self.mesos_covered)):
+                        field = self._find_seethrough_box(img, g, hsv)
+                        if field is None:
+                            self.next_outline = now + OUTLINE_SECONDS   # (it costs a lot on a big screen)
+                    if self.two_boxes:
+                        self.mesos_box = None
+                    if window and not field:
+                        self.mesos_box = None                       # (the old spot isn't yours here)
+                    if field:
+                        box = (sx - wx + field[0], sy - wy + field[1], field[2], field[3])
+                        old = self.mesos_box
+                        if old is None or max(abs(a - b) for a, b in zip(box, old)) > 3:
+                            self.mesos_box, self.mesos_fails = box, 0
+                            if not window:                          # a window's own box isn't remembered
+                                moved = (ww, wh) + box
+                        self.window_box = bool(window)
+                    area = self.party_area
+                    if area and self._blocked(*area):
+                        notes.append("This window is covering the party list.")
+                    else:
+                        bars = find_party_bars(img, g, hsv)
+                        party = max(1, len(bars))
+                        if len(bars) >= 2:
+                            x0, y0 = min(b[0] for b in bars), min(b[1] for b in bars)
+                            x1, y1 = max(b[0] + b[2] for b in bars), max(b[1] + b[3] for b in bars)
+                            # Only the HP bars are counted, so only they (and a little room
+                            # around them) must be clear of this window.
+                            self.party_area = (sx + x0 - int(g), sy + y0 - int(g),
+                                               x1 - x0 + int(2 * g), y1 - y0 + int(2 * g))
+                self._part_ok("window scan")
         mesos, image, boxes = None, None, ()
         self.mesos_covered = False
         if self.mesos_box:
             bx, by, bw, bh = self.mesos_box
             # (the digits only need the box and a sliver around it to be seen)
-            if self._covered(wx + bx, wy + by, bw, bh, margin=max(2, int(0.3 * bh))):
+            if self._blocked(wx + bx, wy + by, bw, bh, margin=max(2, int(0.3 * bh))):
                 notes.append("This window is covering the inventory's mesos.")
                 self.mesos_covered = True
             else:
-                mesos, image, boxes = self._read_mesos(sct, wx + bx, wy + by, bw, bh)
+                with self._part("mesos"):
+                    mesos, image, boxes = self._read_mesos(capture, wx + bx, wy + by, bw, bh)
+                    self._part_ok("mesos")
+                    self._tried("mesos", mesos is not None)
+        window = self.window if now <= self.window_until else None
+        if window:
+            notes.append(f"{WINDOW_NAMES[window]} window open.")
+        bar = None
+        if now >= self.next_bar:
+            with self._part("potions"):
+                bar = self._read_potion_bar(capture, rect, notes)
+                if bar is not None:
+                    self._part_ok("potions")
+                    self._tried("potions", bool(bar))
         return reading._replace(mesos=mesos, mesos_image=image, mesos_boxes=boxes, party=party,
-                                mesos_at=moved, note=" ".join(notes) or None)
+                                mesos_at=moved, window=window, bar=bar, note=" ".join(notes) or None)
+
+    def _read_potion_bar(self, capture, rect, notes):
+        """The potions and food on the potion bar as a tuple of potions.Slot (empty: none, or it
+        can't be seen), or None when there is nothing to report. Read every few seconds."""
+        capture = self.capture = as_capture(capture)
+        self.next_bar = time.monotonic() + POTION_SECONDS
+        wx, wy, ww, wh = rect
+        if self.potion_table is None:
+            try:
+                self.potion_table = potions.PotionTable.load(ASSETS / "potion_table.json")
+                self.potion_digits = potions.load_digits(ASSETS / "potion_digits.npz")
+            except Exception as e:
+                self._part_failed("potions", e)
+                self.next_bar = float("inf")                    # without it there's nothing to read
+                return None
+        bx, by, bw, bh = potions.bar_crop_box(ww, wh)
+        if self._blocked(wx + bx, wy + by, bw, bh):
+            notes.append("This window is covering the potion bar.")
+            return ()
+        shot = capture.grab(wx + bx, wy + by, bw, bh)
+        if not shot:
+            return ()
+        img, sx, sy = shot
+        ex, ey, scale = potions.bar_estimate(ww, wh)
+        full = self.bar_reads % POTION_FULL_LOOK == 0
+        origin = (ex + wx - sx + (0 if full else self.bar_shift[0]), ey + wy - sy + (0 if full else self.bar_shift[1]))
+        slots, (ox, oy) = potions.read_bar(img, scale, origin, self.potion_table, self.potion_digits,
+                                           search=potions.SEARCH if full else 1)
+        self.bar_shift = (ox - (ex + wx - sx), oy - (ey + wy - sy))
+        self.bar_reads += 1
+        return tuple(slots)
 
     def _readable(self, img, field):
         """Clear mesos digits at field? (Always yes while the mesos font is still being
@@ -1375,9 +2519,10 @@ class ScreenReader:
             return None
         return field if read_mesos_positions(part, there, templates) else None
 
-    def _read_mesos(self, sct, x, y, w, h):
+    def _read_mesos(self, capture, x, y, w, h):
         """Reads the mesos box at (x, y, w, h) on screen. Returns (number, image, boxes)."""
-        shot = grab(sct, x - 2 * h, y - h, w + 4 * h, 3 * h)
+        capture = self.capture = as_capture(capture)
+        shot = capture.grab(x - 2 * h, y - h, w + 4 * h, 3 * h)
         if not shot:
             return None, None, ()
         img, sx, sy = shot
@@ -1435,48 +2580,55 @@ class ScreenReader:
             learned.learn(lay, checked)
         return checked, img, boxes
 
-    def _read_info(self, sct, rect):
+    def _read_info(self, capture, rect):
         """Returns (map name if it was just read, note)."""
+        capture = self.capture = as_capture(capture)
         if not self.text_ocr.available:
-            return None, "Map names can't be read: Tesseract OCR is missing (see the README)."
+            return None, tesseract_note()
         if self.own_rect is None:
             return None, None                   # wait until we know where this app's window is
         wx, wy, ww, wh = rect
         g, now = self.gh, time.monotonic()
         name = note = None
 
+        hidden = self.map_blind_seconds() > MAP_HIDDEN_SECONDS
         if self.map_box is None and now >= self.next_map_search:
-            self.next_map_search = now + 3
-            shot = self._hide_own(grab(sct, wx, wy, int(ww * 0.4), int(wh * 0.3)))
+            self.next_map_search = now + (1 if hidden else 3)     # looks harder for a name that has gone missing
+            shot = self._hide_own(capture.grab(wx, wy, int(ww * 0.4), int(wh * 0.3)))
             box = find_map_box(shot[0], g) if shot else None
             if box:
                 self.map_box = (shot[1] - wx + box[0], shot[2] - wy + box[1], box[2], box[3])
                 self.map_print, self.map_unread = None, True
         if self.map_box is None:
-            if self._covered(wx, wy, int(ww * 0.4), int(wh * 0.3)):
+            if self._blocked(wx, wy, int(ww * 0.4), int(wh * 0.3)):
                 note = "This window may be covering the minimap. Move it so the map name can be read."
             else:
                 note = "Can't see the map name. Is the minimap open?"
         else:
             bx, by, bw, bh = self.map_box
-            if self._covered(wx + bx, wy + by, bw, bh, margin=max(3, int(0.1 * g))):
+            if self._blocked(wx + bx, wy + by, bw, bh, margin=max(3, int(0.1 * g))):
                 # Even a box that only touches this window may be cut off by it (it was
                 # found with this window blacked out). Find the whole box again (and read
                 # the name) once this window is out of the way.
                 note = "This window is covering the minimap. Move it so the map name can be read."
                 self.map_box, self.map_unread = None, True
             else:
-                shot = grab(sct, wx + bx, wy + by, bw, bh)
+                shot = capture.grab(wx + bx, wy + by, bw, bh)
                 if shot:
+                    self.map_seen_at = now
                     picture = cv2.resize(_whiteness(shot[0]), (64, 16), interpolation=cv2.INTER_AREA) > 0.3
                     if self.map_print is not None and (picture != self.map_print).mean() > 0.04:
                         # Changed map: find the box again (its size can change), then read it.
                         self.map_box, self.next_map_search = None, now + 1
                         self.map_unread, self.next_map_read = True, 0.0
                     elif self.map_unread and now >= self.next_map_read:
-                        name = read_map_name(shot[0], g, self.text_ocr)
+                        with self._part("map name"):
+                            name = read_map_name(shot[0], g, self.text_ocr)
+                            self._part_ok("map name")
+                            self._tried("map", name is not None)
+                        self.map_look = {"image": shot[0], "text": name}
                         self.map_unread = name is None
-                        self.next_map_read = now + 5          # if unreadable, try again later
+                        self.next_map_read = now + (2 if hidden else 5)   # if unreadable, try again later
                     self.map_print = picture
         return name, note
 
@@ -1493,6 +2645,8 @@ class ExpTracker:
     so they are ignored instead of being counted as gains.
     """
 
+    WRAP_WAIT_READS = 40                      # %-only readings (about a minute) to wait for the level after a wrap
+
     def __init__(self):
         self.reset()
 
@@ -1500,6 +2654,7 @@ class ExpTracker:
         self.running = False
         self._accum = 0.0
         self._resumed = None
+        self._wrap_reads = 0                  # readings in a row spent waiting for a level after the % wrapped
         self.exp = None                       # last trusted EXP
         self.pct = None
         self.last_read = None                 # latest reading, trusted or not (for display)
@@ -1520,6 +2675,9 @@ class ExpTracker:
         self.gained = 0
         self.levels = 0
         self.samples = deque()                # (elapsed, gained)
+        self._format = None                   # what the bar showed last: "exact" (number and %) or "percent"
+        self.estimated = False                # some EXP here came from a % alone, so it is an estimate
+        self.level_source = None              # where a %-only level came from: "badge", "typed"
 
     def start(self):
         if not self.running:
@@ -1539,6 +2697,7 @@ class ExpTracker:
         self._accum, self._resumed = 0.0, None
         self.gained, self.levels, self.deaths = 0, 0, 0
         self.samples = deque()
+        self.estimated = False
 
     def elapsed(self):
         if self.running:
@@ -1614,6 +2773,93 @@ class ExpTracker:
     # ---- main entry
     def observe(self, candidates, confident=False):
         """Feed the (exp, pct) guesses for one screenshot. Returns (accepted, note)."""
+        self._switch_format("exact")
+        return self._observe(candidates, confident)
+
+    def _switch_format(self, kind):
+        """A bar that went from showing its number to only a %, or back: the estimate and the
+        real EXP differ by rounding, so the next reading starts a fresh baseline (not a gain)."""
+        if self._format not in (None, kind):
+            self.exp = self.pct = self._pending = self._before_death = None
+            self._pending_lvl = self._level_start = None
+            self._recent.clear()                  # (the other format's numbers are off by rounding)
+            self._wrap_reads = 0
+        self._format = kind
+
+    def observe_percent(self, pct, level=None, source=None):
+        """Feed the % of a bar that shows no number ("EXP. [58.47%]"), with the level when it was read
+        (source: "badge" or "typed"). The EXP is an estimate: the level's EXP from the table times pct.
+        Returns (accepted, note), like observe."""
+        if pct is None or not 0 <= pct < 100:
+            return False, "unreadable"
+        if level is not None and not 1 <= level <= len(EXP_TABLE):
+            return False, f"level {level} isn't supported yet (no EXP table for it)"
+        cur = level_for_req(self.req) if self.req else None
+        if cur is None:
+            if level is None:
+                return False, "waiting to read your level"
+            self._use_level(level, source)
+            cur = level
+        if level is not None and level == cur and source:
+            self.level_source = source           # (a level read from the badge beats a carried or typed one)
+        # A % that wrapped around (the level went up, or a misread): only the next level, read, says which.
+        wrapped = self.exp is not None and self.pct is not None and self._format == "percent" and self.pct - pct > 30
+        if level is not None and level != cur:
+            # (the next level with a lower %, whatever the bar showed before and however far it fell: a level-up)
+            fell = self.exp is not None and self.pct is not None and pct < self.pct
+            if (wrapped or fell) and level == cur + 1:
+                last = self._pending_lvl
+                n = last[2] + 1 if last and last[0] == level else 1
+                self._pending_lvl = (level, pct, n)
+                if n < 2:
+                    return False, "level up? waiting to confirm"
+                self.estimated = True
+                self._enter_level(round(EXP_TABLE[level - 1] * pct / 100), pct, EXP_TABLE[level - 1])
+                self.level_source = source
+                return True, "LEVEL UP!"
+            if self.gained:
+                return False, "level changed: Reset to start again on the new level"
+            self._use_level(level, source)      # nothing counted yet: the newer reading wins
+            cur = level
+        elif wrapped:
+            if level is not None:                 # (a look where the badge wasn't read doesn't cancel a level-up seen before it)
+                self._pending_lvl = None
+            self._wrap_reads += 1
+            if self._wrap_reads < self.WRAP_WAIT_READS:
+                return False, "percentage wrapped: waiting to read the new level"
+            self.forget_level()                   # nothing explained it for a minute: the level is unknown again, and the
+            self._wrap_reads = 0                  # next one read (even a new one) is taken as it is, with a fresh start
+            return False, "waiting to read your level"
+        self._wrap_reads = 0
+        self._pending_lvl = None
+        self._switch_format("percent")
+        self.estimated = True
+        return self._observe([(round(EXP_TABLE[cur - 1] * pct / 100), pct)], True)
+
+    def _use_level(self, level, source):
+        """Starts estimating from this level (a fresh baseline: nothing is counted for the change)."""
+        self.req, self._req_exact, self.level_source = EXP_TABLE[level - 1], True, source
+        self.exp = self.pct = self._pending = self._pending_lvl = self._level_start = None
+
+    @property
+    def percent_mode(self):
+        """The bar shows only a % right now (so the EXP coming in is an estimate)."""
+        return self._format == "percent"
+
+    def set_level(self, level, source):
+        """The level, given from outside the bar (typed in). False if there is no EXP table for it."""
+        if not 1 <= level <= len(EXP_TABLE):
+            return False
+        self._use_level(level, source)
+        return True
+
+    def forget_level(self):
+        """Another character, or a level that can't be trusted: nothing to estimate from until read again."""
+        self.req, self._req_exact, self._table_level, self.level_source = None, False, None, None
+        self.exp = self.pct = self._pending = self._pending_lvl = self._level_start = None
+        self._seen.clear()
+
+    def _observe(self, candidates, confident=False):
         candidates = [(e, p) for e, p in candidates if p is not None and 0 <= p < 100]
         if not candidates:
             return False, "unreadable"
@@ -1749,22 +2995,24 @@ class ExpTracker:
         self._pending_lvl = (e, p, n)
         if n < need:
             return False
+        self._enter_level(e, p, nxt if need == 2 else None)     # (2: the new level's EXP is known, no relearning)
+        return True
+
+    def _enter_level(self, e, p, new_req=None):
+        """A confirmed level-up: the rest of the old level and e count as gained. new_req is the new
+        level's EXP when the table gives it (otherwise it is learned again)."""
         self._pending_lvl = self._pending = None
         if self.running:
             self.levels += 1
         self._add_gain(self.req - self.exp + e)
         self.exp, self.pct = e, p
         self._prev_req = self.req
-        if need == 2:                          # the new level's EXP is known: no relearning
-            self.req, self._req_exact = nxt, True
-        else:
-            self.req, self._req_exact = None, False
+        self.req, self._req_exact = new_req, new_req is not None
         self._table_level = None
         self._seen.clear()
         self._recent.clear()                   # the old level's numbers mean nothing now
         self._recent.append((self._reads, e))
         self._level_start = (e, p)
-        return True
 
     def rate(self):
         t = self.elapsed()
@@ -1780,6 +3028,11 @@ class ExpTracker:
 class MesoTracker:
     """Turns mesos readings into mesos gained per hour and per 5 minutes.
 
+    The first count is the baseline; every later one adds what changed since. The
+    inventory doesn't have to stay open: after a long wait (MESO_GAP) a big rise is
+    believed, and the rates cover the run up to the last look, so they hold still
+    while the inventory is closed.
+
     A new count only counts once two readings in a row agree on it (three for a big jump),
     so a one-off misread never shows up as mesos gained. A change by more than half,
     or a digit-count change bigger than 10%, starts counting afresh from the new number
@@ -1788,19 +3041,94 @@ class MesoTracker:
     """
 
     def __init__(self):
+        self.resets = 0                       # times reset(): looks from before one don't compare with looks after
         self.reset()
 
     def reset(self):
+        self.resets += 1
         self.value = None                     # confirmed mesos count
         self.seen_at = None                   # when it was last confirmed
         self._candidate = (None, 0, 0)
         self.gained = 0
         self.samples = deque()                # (elapsed, gained)
         self.start = None                     # elapsed time when counting began
+        self.read_elapsed = None              # elapsed time of the last confirmed count
         self.counting = False
+        self.window = None                    # "shop", "storage" or "trade" while one is open
+        self.window_reads = 0                 # confirmed counts seen in it so far
+        self.drop_next = False                # a window was never read: the next change isn't earned
+        self.after_window = False             # the next count follows a window that just closed
+        self.late_change = False              # ...and a new count was still being confirmed as it closed
+        self.idle_pause = False               # paused only because EXP stopped (same map): nothing is left out
+        self.ignored = None                   # (amount, window, when) of the last change left out
+        self.stale = False                    # paused since the last count: what changed meanwhile is unknown
+        self.stale_since = None               # when the status line first had to ask about it
+        self.bank_window = False              # the first window opened after a trip banks what came before it
+        self.bank_inventory = False           # ...and so does the inventory, right after pausing on the map
+        self.left_out = [0, 0]                # mesos gained and lost at windows (kept apart, for Details)
+        self.window_at = None                 # when a shop, storage or trade window was last seen open
+        self.misreads = []                    # (from, to): when a count later proven wrong was shown
+        self._shown = None                    # [count, first seen, last seen] of the count shown now
+        self._before = None                   # ...and of the one before it
+        self._window_since = False            # a window was seen since the count shown now came in
 
-    def pause(self):
+    def pause(self, stale=True, bank_inventory=False):
+        """Tracking paused. Unless it's only an idle pause on the same map, what changes now
+        (a sale in town, a trade...) can't be told from earnings: the count goes stale.
+
+        What was earned before the pause hasn't been counted yet if the inventory was closed.
+        It is banked by the first look at the inventory right after pausing on the grinding
+        map (bank_inventory), or by the first shop, storage or trade window that is read."""
         self.counting = False                 # don't count what changes while paused
+        self.idle_pause = not stale
+        self.stale = stale and self.value is not None
+        self.bank_window = self.stale
+        self.bank_inventory = self.stale and bank_inventory
+
+    def stale_note(self, now, running):
+        """Asks for the inventory: right after pausing (to keep what was earned), or once
+        tracking has carried on with the count still stale."""
+        if not running and self.bank_inventory and (self.seen_at is None or now - self.seen_at > 8):
+            return "Open the inventory now to save your mesos."
+        if not (self.stale and running):
+            self.stale_since = None
+            return None
+        if self.stale_since is None:
+            self.stale_since = now
+        if now - self.stale_since >= 5:       # (not at once: the inventory may be open already)
+            return "Open the inventory to set the mesos start."
+        return None
+
+    def set_window(self, window, now):
+        """Which money window is open (or None). Mesos change there without being earned:
+        the first count in a window is still earned (it shows what came before), every
+        later change is left out. A window closed without a single count leaves the next
+        change unexplained, so that is left out too."""
+        if window:
+            self.window_at = now
+            self._window_since = True
+        if window == self.window:
+            return
+        if self.window and not window:        # (a sale or purchase seen, not yet confirmed: not earned either)
+            self.late_change = self._candidate[0] is not None and self._candidate[0] != self.value
+        if window and not self.window:
+            self.window_reads = 0
+        elif self.window and not window and self.window_reads == 0:
+            self.drop_next = True
+            self.after_window = True
+        elif self.window and not window:
+            self.after_window = True
+            if not self.counting:
+                self.stale = False            # read exactly while paused: the count is still good
+        self.window = window
+
+    def ignored_note(self, now):
+        """Why the last change was left out, for the status line, or None after a while."""
+        if not self.ignored or now - self.ignored[2] > 30:
+            return None
+        amount, window, _ = self.ignored
+        where = {"shop": "the NPC shop", "storage": "storage", "trade": "a trade"}.get(window, "a shop or trade")
+        return f"Left out {amount:+,} mesos ({where}, not earned)."
 
     def observe(self, value, now, elapsed, running):
         jump = False
@@ -1818,47 +3146,131 @@ class MesoTracker:
             top = max(value, old) if old is not None else 0
             digits_changed = old is not None and len(str(value)) != len(str(old))
             jump = old is not None and abs(value - old) > (0.1 if digits_changed else 0.5) * top
+            # Not looked at for a while, so a big rise is more likely mesos earned than a shop
+            # visit (selling is seen as it happens, and a drop is still treated as a shop).
+            big_jump = jump
+            if jump and value > old and self.seen_at is not None and now - self.seen_at > MESO_GAP:
+                jump = False
             big = old is not None and abs(value - old) > max(10000, 0.05 * top)
             # The first count, a digit change and a jump need the very same number 3 times.
             # First counts and jumps aren't gained, so a misread there would never cancel
             # out; digit changes can also be different, nearby misreads of an extra digit.
             # About 10x (or a tenth): almost always a digit read too many (or lost).
             tenfold = old is not None and old > 0 and (9 <= value / old <= 11 or 0.09 <= value / old <= 0.11)
-            if old is None or jump or digits_changed:
+            if old is None or big_jump or digits_changed:
                 if same < (8 if tenfold else 3):
                     return
             elif n < (3 if big else 2):
                 return
             self._candidate = (None, 0, 0)
+        if (not running and self.idle_pause and not self.window
+                and self.value is not None and self.start is not None):
+            if value == self.value:
+                self.seen_at = now                # (still a look, for a run waiting for one)
+            return                                # an idle pause: counted once tracking carries on
         self.seen_at = now
-        if running and not self.counting:
+        self.read_elapsed = elapsed
+        resumed = running and not self.counting
+        first = self.value is None
+        if resumed:
             self.counting = True                  # count changes from this reading on
             self.start = elapsed if self.start is None else self.start
+            if not self.samples:                  # the rates always have a starting point
+                self.samples.append((elapsed, self.gained))
+        moved = value != self.value and not jump
+        if jump and self.window and self.value is not None:
+            self._leave_out(value - self.value, now)          # a big sale or purchase: a new start, and said so
+        # Mesos never go down by grinding. A drop at a window's first look, or at the first look
+        # after one, is a purchase that wasn't read in time, not negative earnings.
+        unread_spend = (moved and self.value is not None
+                        and ((self.window and self.window_reads == 0 or self.after_window) and value < self.value
+                             or self.after_window and self.late_change))
+        banking = (not running and self.stale and self.value is not None
+                   and ((self.window and self.window_reads == 0 and self.bank_window)
+                        or (not self.window and self.bank_inventory)))
+        if banking:                               # what was earned before the trip, seen at last
+            self.bank_window = self.bank_inventory = False
+            if moved and unread_spend:
+                self._leave_out(value - self.value, now)
+            elif moved:
+                self._earn(value - self.value, elapsed)
+        elif moved and self.window and self.window_reads:
+            self._leave_out(value - self.value, now)                        # exact change at a window
+        elif moved and not running and not self.idle_pause and self.value is not None and self.start is not None:
+            self._leave_out(value - self.value, now)                        # anything while paused
+        elif resumed and (self.stale or first):
+            self.stale = False                    # a first or stale count is only a new baseline
             self.samples.append((elapsed, self.gained))
-        elif running and value != self.value and not jump:
-            self.gained += value - self.value
-            self.samples.append((elapsed, self.gained))
-            while len(self.samples) > 2 and self.samples[1][0] <= elapsed - ROLLING_WINDOW:
-                self.samples.popleft()
+        elif running and moved:
+            if self.drop_next or unread_spend:
+                self._leave_out(value - self.value, now)
+            else:
+                self._earn(value - self.value, elapsed)
+        self.drop_next = False
+        if not self.window:
+            self.after_window = self.late_change = False
+        if self.window:
+            self.window_reads += 1
+        self._snap_back(value, now)
         self.value = value
 
+    def _snap_back(self, value, now):
+        """A count that goes back to the one before it (A, B, A) with no window seen meanwhile
+        is a snap back: grinding can't do that, so B was a misread. When B was shown is kept
+        (misreads), so nothing that used it goes to the website with mesos."""
+        if self._shown and value == self._shown[0]:
+            self._shown[2] = now
+            return
+        if self._shown and self._before and value == self._before[0] and not self._window_since:
+            self.misreads = self.misreads[-49:] + [(self._shown[1], self._shown[2])]
+        self._before, self._shown = self._shown, [value, now, now]
+        self._window_since = bool(self.window)
+
+    def _earn(self, amount, elapsed):
+        self.gained += amount
+        self.samples.append((elapsed, self.gained))
+        while len(self.samples) > 2 and self.samples[1][0] <= elapsed - ROLLING_WINDOW:
+            self.samples.popleft()
+
+    def _leave_out(self, amount, now):
+        self.ignored = (amount, self.window, now)
+        self.left_out[amount < 0] += abs(amount)
+
+    def look(self):
+        """The last inventory look as the log is given it: (mesos gained so far, when read),
+        however old (the log decides what is too old), or None before the first count."""
+        return None if self.value is None else (self.gained, self.seen_at)
+
+    def for_log(self):
+        """What AutoLog.tick and AutoLog.settle are given about mesos, as keyword arguments."""
+        return dict(mesos=self.look(), window_at=self.window_at, misreads=self.misreads, meso_epoch=self.resets)
+
     def per_hour(self, elapsed):
-        if self.start is None or elapsed - self.start < 30:
+        # Up to the last look, not up to now: the number holds still while nobody looks.
+        end = self.read_elapsed if self.read_elapsed is not None else elapsed
+        if self.start is None or end - self.start < 30:
             return None
-        return self.gained / (elapsed - self.start) * 3600
+        return self.gained / (end - self.start) * 3600
 
     def per_5min(self, elapsed):
         if self.start is None:
             return None
-        t0 = max(self.start, elapsed - ROLLING_WINDOW)
-        if elapsed - t0 < 60:
+        end = self.read_elapsed if self.read_elapsed is not None else elapsed
+        t0 = max(self.start, end - ROLLING_WINDOW)
+        if end - t0 < 60:
             return None
-        before = 0
+        return (self.gained - self._gained_at(t0)) / (end - t0) * ROLLING_WINDOW
+
+    def _gained_at(self, t0):
+        """Mesos gained by run time t0, assuming a steady rate between two looks."""
+        before = self.samples[0] if self.samples else (self.start, 0)
         for t, g in self.samples:
             if t > t0:
-                break
-            before = g
-        return (self.gained - before) / (elapsed - t0) * ROLLING_WINDOW
+                if t == before[0]:                # (t0 is before the first look we have)
+                    return g
+                return before[1] + (g - before[1]) * (t0 - before[0]) / (t - before[0])
+            before = (t, g)
+        return before[1]
 
 
 class Session:
@@ -1874,6 +3286,7 @@ class Session:
 
     def __init__(self, gap):
         self.exp, self.meso = ExpTracker(), MesoTracker()
+        self.potions = potions.PotionTracker()
         self.gap = gap
         self.on = False             # Start was pressed (and Pause wasn't)
         self.waiting = None         # paused by itself: "idle" or "map"
@@ -1889,40 +3302,72 @@ class Session:
     def pause(self):
         self.on, self.waiting = False, None
         self.exp.pause()
-        self.meso.pause()
+        # (the inventory can bank what was earned only while still on the grinding map)
+        self.meso.pause(bank_inventory=self.map is None or self.here is None or self.here == self.map)
+        self.potions.pause()
 
     def reset(self):
         self.exp.reset()
         self.meso.reset()
+        self.potions.reset()
         self.on, self.waiting, self.map, self.last_gain = False, None, None, None
 
     def _wait(self, why):
         self.exp.pause(at=self.last_gain)
-        self.meso.pause()
+        self.meso.pause(stale=why != "idle")      # (leaving the map: a shop or a trade may follow)
+        self.potions.pause()
         self.waiting = why
 
     def observe(self, candidates, confident, now):
         """Feeds an EXP reading to the tracker. Returns the tracker's (accepted, note)."""
+        return self._feed(lambda t: t.observe(candidates, confident), now)
+
+    def observe_percent(self, pct, level, source, now):
+        """Feeds the % of a bar that shows no EXP number (see ExpTracker.observe_percent)."""
+        return self._feed(lambda t: t.observe_percent(pct, level, source), now)
+
+    def _feed(self, observe, now):
         t = self.exp
         exp_before, gained_before = t.exp, t.gained
-        result = t.observe(candidates, confident)
+        result = observe(t)
         rose = exp_before is not None and t.exp is not None and (
             t.exp > exp_before or result[1] == "LEVEL UP!")
         if t.running and t.gained > gained_before:
             self.last_gain = now
-        elif self.on and self.waiting and rose:
+        elif self.on and self.waiting and self.waiting != "blind" and rose:
             if self.map and self.here and self.here != self.map:
                 t.new_session()             # a different map: its own numbers
                 self.meso.reset()
+                self.potions.reset()
                 self.map = self.here
             self.waiting = None
             self.last_gain = now
             t.start()
         return result
 
+    def look_at_bar(self, slots):
+        """Feeds a look at the potion bar: what went down since the last look was used."""
+        self.potions.observe(slots, self.exp.running)
+
+    def map_blind(self):
+        """The minimap's name has been out of sight for a while (hidden, covered, or the game
+        closed it): you may have changed maps without it noticing, so it pauses instead of
+        carrying on under the old name. It carries on once the name can be read again."""
+        self.here = None
+        if self.waiting == "blind" or not self.on:
+            return
+        if self.exp.running:
+            self._wait("blind")
+        elif self.waiting:
+            self.waiting = "blind"
+
     def map_seen(self, name):
         """The map name was read (already matched to known names, see AutoLog.canonical)."""
+        if self.waiting == "blind":
+            self.waiting = "map"            # visible again: the usual rule decides (same map: carry on; another: new numbers)
         self.here = name
+        if self.map and name != self.map and not self.on:
+            self.meso.bank_inventory = False            # walked off after pausing: a read here isn't just earnings
         if not self.on:
             return
         if self.map is None:
@@ -1931,6 +3376,8 @@ class Session:
             if self.exp.running:
                 self._wait("map")
             elif self.waiting:
+                if self.waiting == "idle":
+                    self.meso.pause()       # (an idle pause kept the count; off the map it goes stale)
                 self.waiting = "map"
 
     def tick(self, now):
@@ -1960,6 +3407,20 @@ def fmt_logged(seconds, short=False):
     return f"{hours} h {minutes:02d} min" if hours else f"{minutes} min"
 
 
+APPROX = "≈"           # shown before a number worked out from a % alone: "≈15,429"
+
+
+def net_text(e):
+    """Net mesos/hr of a log line ('' if no potion cost was counted, '?' if the mesos weren't read):
+    mesos/hr minus what the potions cost per hour."""
+    if "potion_cost" not in e:
+        return ""
+    ms, ps = e.get("mesos_seconds", 0), e.get("potion_seconds", e["seconds"])
+    if not ms or not ps:
+        return "?"
+    return f"{e['mesos'] / ms * 3600 - e['potion_cost'] / ps * 3600:,.0f}"
+
+
 def format_entry(e):
     """e.g. 'Oct 8th, 2026 - Rocky Road II - Lv 27 - Bandit - Solo - 15,429exp/hr - 3,210mesos/hr - 25 min'"""
     d = date.fromisoformat(e["date"])
@@ -1970,28 +3431,53 @@ def format_entry(e):
     tracked = "party" in e                    # entries from before party/mesos tracking lack these
     if tracked:
         parts.append(party_label(e["party"]))
-    parts.append(f"{e['exp'] / e['seconds'] * 3600 if e['seconds'] else 0:,.0f}exp/hr")
+    parts.append(f"{APPROX if e.get('estimated') else ''}{e['exp'] / e['seconds'] * 3600 if e['seconds'] else 0:,.0f}exp/hr")
     if tracked:
         ms = e.get("mesos_seconds", 0)
         parts.append(f"{e['mesos'] / ms * 3600:,.0f}mesos/hr" if ms else "?mesos/hr")
+        if net_text(e):
+            parts.append(f"{net_text(e)}net/hr")
     parts.append(fmt_logged(e["seconds"]))
     return " - ".join(parts)
 
 
+def clean_note(text):
+    """A note as it's kept: plain text with \\n line breaks, no control characters or lone
+    surrogates (neither can be shown or saved), without blanks at either end."""
+    if not isinstance(text, str):
+        return ""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = "".join(ch for ch in text if ch in "\n\t" or (ch >= " " and ch != "\x7f"))
+    return text.encode("utf-8", "ignore").decode("utf-8").strip()
+
+
+def note_of(e):
+    """The personal note on a log line, ready to show ('' if none, or if what's there isn't text)."""
+    n = e.get("note")
+    return clean_note(n) if isinstance(n, str) else ""
+
+
+def notes_of(entries):
+    """One note for log lines shown as one (a map's party sizes): each different note once."""
+    return "\n\n".join(dict.fromkeys(n for n in map(note_of, entries) if n))
+
+
 def log_row(e, part=False):
-    """The log table's cells for an entry: Date, Map, Lv, Class, Party, Time, EXP/hr, Mesos/hr.
-    `part`: one party size under a merged party line, so just its own numbers."""
+    """The log table's cells for an entry: Date, Map, Lv, Class, Party, Time, EXP/hr, Mesos/hr,
+    Net/hr, Note. `part`: one party size under a merged party line, so just its own numbers."""
     d = date.fromisoformat(e["date"])
     day = f"{MONTHS[d.month - 1]} {d.day}" + ("" if d.year == date.today().year else f" '{d.year % 100:02d}")
     level = e["level"] if e["level"] is not None else "?"
     tracked = "party" in e                    # entries from before party/mesos tracking lack these
     party = ("Solo" if not e["party"] or e["party"] <= 1 else f"{e['party']}ppl") if tracked else ""
-    exp = f"{e['exp'] / e['seconds'] * 3600:,.0f}" if e["seconds"] else "—"
+    exp = f"{APPROX if e.get('estimated') else ''}{e['exp'] / e['seconds'] * 3600:,.0f}" if e["seconds"] else "—"
     ms = e.get("mesos_seconds", 0)
     mesos = f"{e['mesos'] / ms * 3600:,.0f}" if ms else ("?" if tracked else "")
+    note = NOTE_MARK if note_of(e) else ""
     if part:
-        return "", "", "", "", party, fmt_logged(e["seconds"], short=True), exp, mesos
-    return day, e["map"], level, e.get("class") or "", party, fmt_logged(e["seconds"], short=True), exp, mesos
+        return "", "", "", "", party, fmt_logged(e["seconds"], short=True), exp, mesos, net_text(e), note
+    return (day, e["map"], level, e.get("class") or "", party, fmt_logged(e["seconds"], short=True), exp, mesos,
+            net_text(e), note)
 
 
 def party_groups(entries):
@@ -2009,8 +3495,15 @@ def party_groups(entries):
 def merged(entries):
     """Log lines added together, so EXP/hr and mesos/hr are over all of their time."""
     m = dict(entries[0])
+    if any(e.get("estimated") for e in entries):
+        m["estimated"] = True                    # (one estimated part makes the whole line an estimate)
     for k in ("exp", "seconds", "mesos", "mesos_seconds"):
         m[k] = sum(e.get(k) or 0 for e in entries)
+    if any("potion_cost" in e for e in entries):
+        m["potion_cost"] = sum(e.get("potion_cost") or 0 for e in entries)
+        m["potion_seconds"] = sum(e.get("potion_seconds", e["seconds"]) for e in entries if "potion_cost" in e)
+    else:
+        m.pop("potion_cost", None)
     return m
 
 
@@ -2019,6 +3512,7 @@ def group_row(entries, is_open=False):
     row = list(log_row(merged(entries)))
     sizes = [e["party"] for e in entries]
     row[4] = f"{sizes[0]}–{sizes[-1]}ppl {'▾' if is_open else '▸'}"
+    row[9] = NOTE_MARK if notes_of(entries) else ""
     return tuple(row)
 
 
@@ -2027,9 +3521,21 @@ def _numbers(name):
     return re.findall(r"\b(?:[IVX]+|\d+)\b", name)
 
 
-LOG_VERSION = 3     # 2: mesos/hr from the mesos tracker; 3: class, seals and runs
+LOG_VERSION = 4     # 2: mesos/hr from the mesos tracker; 3: class, seals and runs; 4: potion cost
+                    # (a line's personal "note" needed no new version: it's one more optional field,
+                    # which older versions leave alone and keep)
+NOTE_MAX = 4000     # characters in a note on a log line
+NOTE_MARK = "\u270e"            # shown in the log's Note column for lines that have one
+BACKUPS_KEPT = 7    # days of log backups kept (backups/ in the data folder)
 RUN_SECONDS = 900   # a run: 15 minutes of non-stop farming on one map, one party size
                     # (until 0.9.4 a run was an hour; those are still shared as they are)
+SITE_GAP = 15       # seconds without EXP that end a run, whatever the gap setting (which is for the log lines)
+END_LOOK = 30       # a run goes to the website with mesos only with an inventory look this soon after its end...
+START_GRACE = 10    # ...and one at or before its start (or this soon after: the first look on a new map)
+PAUSED_WAIT = 7     # paused while a run waits for that look: how long it still waits
+MAX_LOOKS = 5000    # inventory looks kept (over 40 minutes of them with the inventory open)
+MAX_MESOS_HR = 20_000_000     # the website's own ceiling: a run above it is a misread
+RUN_ALERT = "Open the inventory now so your run is logged for the website."
 
 # Each line the tracker writes is sealed: a code worked out from its numbers. A line edited
 # (or added) by hand doesn't match its seal any more, so it's known not to be the tracker's
@@ -2038,6 +3544,7 @@ RUN_SECONDS = 900   # a run: 15 minutes of non-stop farming on one map, one part
 # (The old name stays in the key: changing it would unseal every log written so far.)
 _SEAL_KEY = hashlib.sha256(b"Maple EXP/hr log seal: keep this log honest").digest()
 _SEALED_LINE = ("date", "map_read", "level", "party", "class", "exp", "seconds", "mesos", "mesos_seconds")
+_SEALED_LINE_POTIONS = _SEALED_LINE + ("potion_cost",)     # lines written with a potion cost (older lines keep their seal as it was)
 _SEALED_RUN = ("date", "started", "map_read", "class", "level_start", "level_end", "party", "exp",
                "seconds", "mesos", "mesos_seconds", "version")
 
@@ -2064,6 +3571,9 @@ class AutoLog:
         self.entries, self.aliases, self.runs = [], {}, []   # aliases: misread/renamed map -> name
         self.install = secrets.token_hex(8)           # this log's own id, part of its seals
         self._kept = set()                            # problems a copy of the file was kept for
+        self.looks, self.epoch = [], None             # inventory looks (when, mesos gained so far)
+        self.pending = None                           # a finished run waiting for a look after its end
+        self._misreads = ()                           # the MesoTracker's misreads, as last given
         version = self._load()
         if version < 2:
             def clear_old_mesos():                    # logged by the old, unreliable mesos counting
@@ -2073,6 +3583,9 @@ class AutoLog:
             self._change(clear_old_mesos)
         elif version < LOG_VERSION:
             self._change(lambda: None)                # saves this log's id with it
+        if any(r.get("pending") for r in self.runs):
+            # Closed while a run waited for a look: it goes as it was saved, with EXP only.
+            self._change(lambda: [r.pop("pending", None) for r in self.runs])
         self.reset_clock()
 
     @staticmethod
@@ -2084,8 +3597,13 @@ class AutoLog:
         data = json.dumps([record.get(k) for k in fields], separators=(",", ":"))
         return hmac.new(_SEAL_KEY + self.install.encode(), data.encode(), hashlib.sha256).hexdigest()[:24]
 
-    def sealed(self, e, fields=_SEALED_LINE):
+    @staticmethod
+    def _line_fields(e):
+        return _SEALED_LINE_POTIONS if "potion_cost" in e else _SEALED_LINE
+
+    def sealed(self, e, fields=None):
         """True for a line exactly as the tracker wrote it."""
+        fields = fields or self._line_fields(e)
         return isinstance(e.get("seal"), str) and hmac.compare_digest(e["seal"], self._seal(e, fields))
 
     def edited(self, e):
@@ -2093,7 +3611,7 @@ class AutoLog:
         return "seal" in e and not self.sealed(e)
 
     def _reseal(self, e, ok):
-        e["seal"] = self._seal(e, _SEALED_LINE) if ok else "edited"
+        e["seal"] = self._seal(e, self._line_fields(e)) if ok else "edited"
 
     # ---- the file
     def _load(self):
@@ -2152,6 +3670,10 @@ class AutoLog:
                     and optional("seal", lambda v: isinstance(v, str))
                     and optional("updated", number)
                     and optional("mesos", number) and optional("mesos_seconds", number)
+                    and optional("potion_cost", lambda v: number(v) and v >= 0)
+                    and optional("potion_seconds", lambda v: number(v) and v >= 0)
+                    and optional("potions", lambda v: isinstance(v, dict))
+                    and optional("estimated", lambda v: type(v) is bool)
                     and (not e.get("mesos_seconds") or number(e.get("mesos"))))
         except Exception:
             return False
@@ -2165,34 +3687,50 @@ class AutoLog:
 
     # ---- tracking
     def reset_clock(self):
-        self.start = self.last_gain = self.block_map = self.block_party = self.meso0 = None
+        self.start = self.last_gain = self.block_map = self.block_party = self.meso0 = self.pot0 = None
         self.block_exp = 0
         self.run = None                                  # the 15-minute run going on, if any
+        self.chain = None                                # when the runs going on straight after each other began
+        self.block_estimated = False                     # some of the stretch's EXP was estimated from a % alone
 
     def gain(self, now, amount):
         if amount > 0:
-            if self.start is None:
+            starts = self.start is None
+            if starts:
                 self.start, self.block_exp = now, 0          # this gain starts the clock
-                self.run = self.run or {"start": now, "exp": 0, "map": None}
             else:
                 self.block_exp += amount
-                if self.run:
-                    self.run["exp"] += amount
+            if self.run is None:                             # ...and a run's
+                self.run = {"start": now, "exp": 0, "map": None}
+                self.chain = now if self.chain is None else self.chain
+            elif not starts:
+                self.run["exp"] += amount
             self.last_gain = now
         elif self.start is not None:
             self.block_exp += amount                         # a misread too high, taken back
             if self.run:
                 self.run["exp"] += amount
 
-    def tick(self, now, map_name, level, party=1, mesos=None, job=None, map_read=None):
-        """Call regularly while tracking. mesos is (mesos gained so far, when last read) from
-        the MesoTracker, or None; job is the class; map_read the map name exactly as read.
+    def tick(self, now, map_name, level, party=1, mesos=None, job=None, map_read=None, hidden=False, potions=None,
+             window_at=None, misreads=(), meso_epoch=0, estimated=False):
+        """Call regularly while tracking. mesos is the MesoTracker's last look (mesos gained so
+        far, when read), however old, or None: a stretch's mesos are those gained between its
+        first and last look (a run's: see _site_mesos). job is the class; map_read the map name exactly as read;
+        potions ({name: used so far}, their cost so far) or None when potions aren't counted.
+        window_at, misreads and meso_epoch: see MesoTracker.for_log. estimated: the EXP now coming in is
+        estimated from a % alone (the line and run say so, and such a run is never shared).
         Returns the entry when one was logged."""
+        self._note_look(mesos, meso_epoch)
+        self._misreads = misreads
+        if estimated and self.start is not None:
+            self.block_estimated = True
         if self.start is None:
             return None
         if now - self.last_gain > self.gap:
             self.reset_clock()                               # no EXP for too long: start over
             return None
+        if self.run and now - self.last_gain > SITE_GAP:
+            self.run = self.chain = None                     # ...for a run, 15 s is too long
         if map_name:
             if self.block_map and map_name != self.block_map:
                 self.reset_clock()                           # changed maps: start over
@@ -2204,8 +3742,10 @@ class AutoLog:
         self.block_party = party
         if self.meso0 is None and mesos and mesos[1] >= self.start - 2:
             self.meso0 = mesos                               # mesos as the stretch began
-        self._run_tick(now, map_name, level, party, mesos, job, map_read)
-        if now - self.start < LOG_BLOCK:
+        if self.pot0 is None and potions is not None:
+            self.pot0 = (dict(potions[0]), potions[1])       # potions used as the stretch began
+        self._run_tick(now, map_name, level, party, job, map_read, hidden, window_at, estimated)
+        if hidden or now - self.start < LOG_BLOCK:       # (hidden: the map may have changed, so nothing is saved yet)
             return None
         if self.block_exp <= 0:                              # nothing gained after all
             self.start, self.block_exp = now, 0
@@ -2213,13 +3753,19 @@ class AutoLog:
         meso_gain = meso_seconds = 0
         if self.meso0 and mesos and mesos[1] > self.meso0[1]:
             meso_gain, meso_seconds = mesos[0] - self.meso0[0], mesos[1] - self.meso0[1]
+        used = cost = None
+        if potions is not None and self.pot0 is not None:
+            cost = max(0, potions[1] - self.pot0[1])
+            used = {n: c - self.pot0[0].get(n, 0) for n, c in potions[0].items() if c > self.pot0[0].get(n, 0)}
         entry = self._add(self.block_map or "Unknown map", level, party, self.block_exp,
-                          now - self.start, meso_gain, meso_seconds, job, map_read or self.block_map)
-        self.start, self.block_exp = now, 0                  # the next 5 minutes start now
+                          now - self.start, meso_gain, meso_seconds, job, map_read or self.block_map, cost, used,
+                          self.block_estimated)
+        self.start, self.block_exp, self.block_estimated = now, 0, False       # the next 5 minutes start now
         self.meso0 = mesos if mesos and now - mesos[1] < 10 else None
+        self.pot0 = (dict(potions[0]), potions[1]) if potions is not None else None
         return entry
 
-    def _run_tick(self, now, map_name, level, party, mesos, job, map_read):
+    def _run_tick(self, now, map_name, level, party, job, map_read, hidden=False, window_at=None, estimated=False):
         r = self.run
         if r is None:
             return
@@ -2229,23 +3775,149 @@ class AutoLog:
                 r["exp"] = 0
                 return
             r.update(map=map_name, map_read=map_read or map_name, party=party, job=job,
-                     level_start=level, wall=time.time() - (now - r["start"]), meso0=None)
+                     level_start=level, wall=time.time() - (now - r["start"]),
+                     chain=min(self.chain if self.chain is not None else now, r["start"]))
         if job and r["job"] and job != r["job"]:
             self.run = {"start": now, "exp": 0, "map": None}  # a different class: a new run
+            self.chain = now
             return
         r["job"] = r["job"] or job
         r["level"] = level
-        if r["meso0"] is None and mesos and mesos[1] >= r["start"] - 2:
-            r["meso0"] = mesos
-        if now - r["start"] < RUN_SECONDS:
+        if estimated:
+            r["estimated"] = True                            # (a % alone: kept on this PC, never shared)
+        if window_at is not None and window_at >= r["start"]:
+            r["window"] = True                               # a shop, storage or trade: not a clean run
+        if hidden or now - r["start"] < RUN_SECONDS:
             return
-        meso_gain = meso_seconds = 0
-        if r["meso0"] and mesos and mesos[1] > r["meso0"][1]:
-            meso_gain, meso_seconds = mesos[0] - r["meso0"][0], mesos[1] - r["meso0"][1]
         if r["exp"] > 0:
-            self._add_run(r, now - r["start"], meso_gain, meso_seconds)
+            self._end_run(r, now)
         self.run = {"start": now, "exp": 0, "map": None}     # straight on into the next run
-        self._run_tick(now, map_name, level, party, mesos, job, map_read)
+        self._prune()
+        self._run_tick(now, map_name, level, party, job, map_read, hidden, window_at, estimated)
+
+    # ---- what a run takes to the website (fail closed: any doubt and it goes with EXP only)
+    def _note_look(self, mesos, epoch):
+        if epoch != self.epoch:                              # the mesos count started over: older looks don't compare
+            self.epoch, self.looks = epoch, []
+            if self.pending:
+                self.pending["no_mesos"] = True              # (its looks are gone: it goes with EXP only)
+        if mesos and mesos[1] is not None and (not self.looks or mesos[1] > self.looks[-1][0]):
+            self.looks.append((mesos[1], mesos[0]))
+            if self.run is None and self.pending is None:
+                self._prune()
+            elif len(self.looks) > MAX_LOOKS:                # (a run waiting or going on for hours: forget the oldest)
+                del self.looks[:len(self.looks) - MAX_LOOKS]
+
+    def _prune(self):
+        """Forgets the looks no run going on or waiting needs (keeps the last one before them)."""
+        live = [r["start"] for r in (self.run, self.pending) if r]
+        t = min(live) if live else math.inf
+        before = [k for k in self.looks if k[0] <= t]
+        self.looks = before[-1:] + [k for k in self.looks if k[0] > t]
+
+    def _end_run(self, r, now):
+        """Saves a finished run. One with a shop, storage or trade window seen, or an unknown
+        level, is never shared: it keeps the mesos between its first and last look. A clean one
+        is saved with EXP only and, given a look at its start, waits for one after its end (settle)."""
+        seconds = now - r["start"]
+        if r.get("window") or r.get("estimated") or r["level_start"] is None or r["level"] is None:
+            inside = [k for k in self.looks if r["start"] - 2 <= k[0] <= now]
+            gain = gain_s = 0
+            if len(inside) >= 2:
+                gain, gain_s = inside[-1][1] - inside[0][1], round(inside[-1][0] - inside[0][0], 1)
+            self._add_run(r, seconds, gain, gain_s, local={"window": True} if r.get("window") else {})
+            return
+        if self.pending:
+            self._settle(now)                                # (can't still be waiting, but never lose one)
+        waits = self._gained_at(r["start"], r["chain"]) is not None
+        run = self._add_run(r, seconds, 0, 0, local={"pending": True} if waits else {})
+        if waits:
+            self.pending = dict(r, end=now, started=run["started"], paused_at=None)
+
+    def _gained_at(self, t, chain=None, upto=None):
+        """Mesos gained by time t, spread evenly between the looks around it: (gained, looks
+        used), or None. Needs a look at or before t (not from before `chain`'s runs; or just
+        after t when there's none), or with `upto` a look at or after t, no later than upto."""
+        before = [k for k in self.looks if k[0] <= t]
+        after = [k for k in self.looks if k[0] >= t]
+        a = before[-1] if before else None
+        b = after[0] if after else None
+        if upto is not None:
+            if a is None or b is None or b[0] > upto:
+                return None
+        elif a is None or a[0] < chain - END_LOOK:
+            if b is None or b[0] > t + START_GRACE:
+                return None
+            return b[1], (b,)                                # (a little less than it was: never more)
+        if b is None or b[0] == a[0]:
+            return a[1], (a,)
+        return a[1] + (b[1] - a[1]) * (t - a[0]) / (b[0] - a[0]), (a, b)
+
+    def _site_mesos(self, p, upto, misreads):
+        """A waiting run's (mesos, mesos seconds) for the website, or (0, 0) when in doubt: no
+        look at its start or after its end, a look later proven a misread, below zero, or
+        above the site's ceiling."""
+        start, end = self._gained_at(p["start"], p["chain"]), self._gained_at(p["end"], upto=upto)
+        if start is None or end is None or p.get("no_mesos"):
+            return 0, 0
+        if any(t0 <= k[0] <= t1 for k in start[1] + end[1] for t0, t1 in misreads):
+            return 0, 0
+        mesos, seconds = round(end[0] - start[0]), round(p["end"] - p["start"], 1)
+        if mesos < 0 or seconds <= 0 or mesos / seconds * 3600 > MAX_MESOS_HR:
+            return 0, 0
+        return mesos, seconds
+
+    def _end_look(self, p):
+        """A waiting run's mesos at its end, given a look soon enough after it (see _gained_at)."""
+        return self._gained_at(p["end"], upto=self._deadline(p))
+
+    @staticmethod
+    def _deadline(p):
+        return p["end"] + END_LOOK if p["paused_at"] is None else p["paused_at"] + PAUSED_WAIT
+
+    def settle(self, now, running, mesos=None, window_at=None, misreads=(), meso_epoch=0):
+        """Call regularly, also while paused. A finished run waits for a look after its end:
+        while tracking goes on it waits END_LOOK seconds (so a misread can still snap back);
+        paused, it goes as soon as the look comes, or after PAUSED_WAIT seconds (see alert).
+        Returns True when a run is ready to be shared."""
+        self._note_look(mesos, meso_epoch)
+        self._misreads = misreads
+        p = self.pending
+        if p is None:
+            return False
+        if window_at is not None and window_at >= p["end"]:
+            p["no_mesos"] = True                             # a shop, storage or trade before its end look
+        if running:
+            p["paused_at"] = None
+        elif p["paused_at"] is None:
+            p["paused_at"] = now
+        found = self._end_look(p) is not None
+        if now < self._deadline(p) and (running or not found) and not p.get("no_mesos"):
+            return False
+        self._settle(now, misreads)
+        return True
+
+    def _settle(self, now, misreads=None):
+        p, self.pending = self.pending, None
+        misreads = self._misreads if misreads is None else misreads
+        mesos, seconds = self._site_mesos(p, self._deadline(p), misreads)
+
+        def apply():
+            for r in self.runs:
+                if r.get("started") == p["started"] and r.get("pending"):
+                    r.pop("pending")
+                    r["mesos"], r["mesos_seconds"] = mesos, seconds
+                    r["seal"] = self._seal(r, _SEALED_RUN)
+        self._change(apply)
+        self._prune()
+
+    def alert(self, now, running):
+        """Asks for the inventory when tracking stops while a run waits for a look."""
+        p = self.pending
+        if (p is None or running or p.get("no_mesos") or self._end_look(p) is not None
+                or (self.looks and now - self.looks[-1][0] <= 3)):     # (open already: the look is on its way)
+            return None
+        return RUN_ALERT
 
     def run_progress(self, now):
         """Seconds into the 15-minute run going on, or None."""
@@ -2253,14 +3925,20 @@ class AutoLog:
         return None if r is None or r["map"] is None else max(0.0, now - r["start"])
 
     def runs_done(self, map_name, party, job, day=None):
-        """How many runs were finished (sealed) on a day for a map, party size and class."""
+        """How many runs were finished (sealed) on a day for a map, party size and class. A run estimated from a %
+        alone carries the seal "estimated" instead: it counts here, it is just never shared."""
         day = day or date.today().isoformat()
         return sum(1 for r in self.runs if r.get("date") == day and r.get("map") == map_name
-                   and r.get("party") == party and r.get("class") == job and self.sealed(r, _SEALED_RUN))
+                   and r.get("party") == party and r.get("class") == job
+                   and (self.sealed(r, _SEALED_RUN) or (r.get("estimated") and r.get("seal") == "estimated")))
 
     def unshared_runs(self):
-        """Finished runs (exactly as the overlay saved them) not shared yet."""
-        return [r for r in self.runs if not r.get("shared") and self.sealed(r, _SEALED_RUN)][:50]
+        """Finished runs (exactly as the overlay saved them) not shared yet: only clean ones
+        (no shop, storage or trade window seen, no EXP estimated from a % alone), with a known level, not
+        waiting for a look."""
+        return [r for r in self.runs if not r.get("shared") and not r.get("window") and not r.get("pending")
+                and not r.get("estimated") and r.get("level_start") is not None and r.get("level_end") is not None
+                and self.sealed(r, _SEALED_RUN)][:50]
 
     def mark_shared(self, started):
         def apply():
@@ -2272,16 +3950,28 @@ class AutoLog:
     def seconds_left(self, now):
         return None if self.start is None else max(0.0, LOG_BLOCK - (now - self.start))
 
-    def _add(self, map_name, level, party, exp, seconds, mesos, meso_seconds, job=None, map_read=None):
+    def _add(self, map_name, level, party, exp, seconds, mesos, meso_seconds, job=None, map_read=None,
+             potion_cost=None, potions=None, estimated=False):
         def add():
             key = (date.today().isoformat(), map_name, level, party, job)
             for e in self.entries:
                 if self.key(e) == key:
                     ok = self.sealed(e)                      # still exactly the tracker's own?
+                    if potion_cost is not None or "potion_cost" in e:     # (the time potions were counted over)
+                        e["potion_seconds"] = (e.get("potion_seconds", e["seconds"] if "potion_cost" in e else 0)
+                                               + (seconds if potion_cost is not None else 0))
                     e["exp"] += exp
                     e["seconds"] += seconds
                     e["mesos"] = e.get("mesos", 0) + mesos
                     e["mesos_seconds"] = e.get("mesos_seconds", 0) + meso_seconds
+                    if potion_cost is not None:
+                        e["potion_cost"] = e.get("potion_cost", 0) + potion_cost
+                        used = dict(e.get("potions") or {})
+                        for n, c in (potions or {}).items():
+                            used[n] = used.get(n, 0) + c
+                        e["potions"] = used
+                    if estimated:
+                        e["estimated"] = True                # (not sealed: it only says how the EXP was got)
                     if "seal" in e:
                         self._reseal(e, ok)
                     break
@@ -2289,13 +3979,17 @@ class AutoLog:
                 e = {"date": key[0], "map": map_name, "map_read": map_read or map_name, "level": level,
                      "party": party, "class": job, "exp": exp, "seconds": seconds, "mesos": mesos,
                      "mesos_seconds": meso_seconds}
+                if potion_cost is not None:
+                    e["potion_cost"], e["potions"], e["potion_seconds"] = potion_cost, dict(potions or {}), seconds
+                if estimated:
+                    e["estimated"] = True
                 self._reseal(e, True)
                 self.entries.append(e)
             e["updated"] = time.time()
             return e
         return self._change(add)
 
-    def _add_run(self, r, seconds, mesos, meso_seconds):
+    def _add_run(self, r, seconds, mesos, meso_seconds, local=None):
         run = {"date": date.fromtimestamp(r["wall"]).isoformat(),
                "started": time.strftime("%Y-%m-%dT%H:%M", time.localtime(r["wall"])),
                "map": r["map"], "map_read": r["map_read"], "class": r["job"],
@@ -2303,6 +3997,11 @@ class AutoLog:
                "exp": r["exp"], "seconds": round(seconds, 1), "mesos": mesos,
                "mesos_seconds": round(meso_seconds, 1), "version": VERSION}
         run["seal"] = self._seal(run, _SEALED_RUN)
+        local = dict(local or {})
+        if r.get("estimated"):
+            # An older overlay doesn't know the flag and would share a sealed run: a seal that never verifies stops it.
+            run["seal"], local["estimated"] = "estimated", True
+        run.update(local)                                    # (kept on this PC only: not sealed, never sent)
         self._change(lambda: self.runs.append(run))
         return run
 
@@ -2346,12 +4045,18 @@ class AutoLog:
                 if self.key(e) in merged:
                     m = merged[self.key(e)]
                     ok = self.sealed(m) and self.sealed(e)
-                    for field in ("exp", "seconds", "mesos", "mesos_seconds"):
+                    for field in ("exp", "seconds", "mesos", "mesos_seconds", "potion_cost"):
                         if field in e:
                             m[field] = m.get(field, 0) + e[field]
+                    if e.get("potions"):
+                        m["potions"] = {n: (m.get("potions") or {}).get(n, 0) + (e["potions"] or {}).get(n, 0)
+                                        for n in {*(m.get("potions") or {}), *e["potions"]}}
                     m["updated"] = max(m.get("updated", 0), e.get("updated", 0))
                     if "seal" in m or "seal" in e:
                         self._reseal(m, ok)
+                    both = notes_of([m, e])                   # a note on either line is kept
+                    if both and both != m.get("note"):
+                        m["note"] = both
                 else:
                     merged[self.key(e)] = e
             self.entries = list(merged.values())
@@ -2361,6 +4066,30 @@ class AutoLog:
             self.block_map = new_name
         if old != "Unknown map" and self.run and self.run.get("map") == old:
             self.run["map"] = new_name
+
+    def set_note(self, entries, text):
+        """Writes a personal note on these log lines (the same one on each: e.g. a map's party
+        sizes shown as one line). An empty note takes it off. Returns True if anything changed.
+
+        A note only ever lives in this log file, on this PC. It isn't one of the sealed fields,
+        so a line stays as trusted as it was, and it's never part of a run: what's shared with
+        the stats site is made from the runs alone (see post_runs)."""
+        keys = {self.key(e) for e in entries}
+        text = clean_note(text)[:NOTE_MAX]
+
+        def apply():
+            changed = False
+            for e in self.entries:
+                if self.key(e) not in keys:
+                    continue
+                if text and e.get("note") != text:
+                    e["note"], changed = text, True
+                elif not text and "note" in e:
+                    del e["note"]
+                    changed = True
+            return changed
+
+        return self._change(apply)
 
     def delete(self, entry):
         key = self.key(entry)
@@ -2373,7 +4102,30 @@ class AutoLog:
     def newest_first(self):
         return sorted(self.entries, key=lambda e: e.get("updated") or 0, reverse=True)
 
+    def _back_up(self):
+        """Before the first save of each day: a copy of the log as it was, in backups/ (the last
+        few days are kept), so that whatever goes wrong, a recent copy of it all, notes
+        included, is still there. To go back to one, close the overlay and copy it over
+        exp_log.json."""
+        try:
+            if not self.path.exists():
+                return
+            folder = self.path.parent / "backups"
+            copy = folder / f"exp_log-{date.today().isoformat()}.json"
+            if copy.exists():
+                return
+            data = json.loads(self.path.read_text(encoding="utf-8"))     # (a damaged file has its own copy)
+            if not (data.get("entries") or data.get("runs")):
+                return                                                  # nothing in it worth a backup
+            folder.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(self.path, copy)
+            for old in sorted(folder.glob("exp_log-*.json"))[:-BACKUPS_KEPT]:
+                old.unlink()
+        except Exception as e:
+            log_error("backing up the EXP log", e)
+
     def save(self):
+        self._back_up()
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".tmp")
@@ -2399,6 +4151,14 @@ def fmt_short(n):
         if abs(n) >= div:
             return f"{n / div:.2f}{suffix}"
     return f"{n:,.0f}"
+
+
+def approx_num(n, estimated):
+    """A number as shown: with an approx sign in front when it was worked out from a % alone. A very big one is
+    shortened (99,999,999 -> 100.00M) so the sign never makes it run out of its box."""
+    if n is None or not estimated:
+        return fmt_num(n)
+    return APPROX + (fmt_num(n) if abs(n) < 10_000_000 else fmt_short(n))
 
 
 def fmt_eta(seconds):
@@ -2435,7 +4195,7 @@ class RegionSelector:
         self.win.attributes("-topmost", True)
         self.canvas = tk.Canvas(self.win, bg="black", cursor="cross", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
-        self.canvas.create_text(v["width"] // 2, 60, fill="white", font=(*PLATFORM.font("Segoe UI", "bold"), 20),
+        self.canvas.create_text(v["width"] // 2, 60, fill="white", font=(PLATFORM.font("Segoe UI", "bold")[0], 20, PLATFORM.font("Segoe UI", "bold")[1]),
                                 text="Drag a box around the EXP numbers  (Esc to cancel)")
         self.start = None
         self.rect = None
@@ -2471,53 +4231,80 @@ class RegionSelector:
 
 # --------------------------------------------------------------------------- app
 
-BG, FG, DIM, ACCENT, FIELD = "#1b1d23", "#e8e8e8", "#8a8f98", "#ffcc33", "#2c3038"
-ACCENT_SOFT = "#d9b04a"     # a quieter gold, for text that goes with the big number
+FIELD = RAISED              # inputs and buttons
 # The window's fonts: (family, size at 100%, weight, underline). Settings > Size scales them all.
-FONTS = {"small": ("Segoe UI", 8, "normal", False), "text": ("Segoe UI", 9, "normal", False),
-         "link": ("Segoe UI", 9, "normal", True), "row": ("Segoe UI", 10, "normal", False),
-         "icon": ("Segoe UI", 11, "normal", False), "value": ("Consolas", 11, "normal", False),
-         "next": ("Segoe UI Semibold", 11, "normal", False), "title": ("Segoe UI Semibold", 12, "normal", False),
-         "big": ("Segoe UI", 24, "bold", False)}
-LIST_BG, LIST_BG2, LIST_PART = "#23262d", "#282b33", "#1c1e23"
-LOG_HINT = "Right-click a line to copy, rename or delete it."
+FONTS = {"small": ("Manrope", 9, "normal", False), "text": ("Manrope", 10, "normal", False),
+         "link": ("Manrope SemiBold", 10, "normal", False), "row": ("Manrope", 10, "normal", False),
+         "icon": ("Segoe UI", 12, "normal", False), "value": ("Manrope Bold", 11, "normal", False),
+         "next": ("Manrope SemiBold", 11, "normal", False), "title": ("Manrope Bold", 13, "normal", False),
+         "caps": ("Manrope SemiBold", 9, "normal", False), "strong": ("Manrope SemiBold", 10, "normal", False),
+         "big": ("Manrope ExtraBold", 32, "normal", False)}
+FONT_FILES = ("Manrope.ttf", "ManropeSemiBold.ttf", "ManropeBold.ttf", "ManropeExtraBold.ttf")
+FALLBACK_FONT = {"Manrope": "Segoe UI", "Manrope SemiBold": "Segoe UI Semibold", "Manrope Bold": "Segoe UI Semibold",
+                 "Manrope ExtraBold": "Segoe UI Semibold"}
+LOG_HINT = "Click a line to write a note about it. Right-click to copy, rename or delete it."
 
 
 class App:
     def __init__(self, root, templates, text_ocr=None):
         self.root = root
+        self._fresh = not CONFIG_PATH.exists()          # a first install: it picks a compact shape
         self.cfg = {**DEFAULTS, **load_config()}
         mode = self.cfg.get("mode", "window")
         self.reader = ScreenReader(templates, mode, self.cfg.get("region"), text_ocr)
         saved = self.cfg.get("mesos_box")
         if isinstance(saved, list) and len(saved) == 6:
             self.reader.saved_mesos = tuple(saved)
+        self.reader.saved_v2 = dict(self.cfg.get("exp_v2_spots") or {})
+        self.reader.shadow.on = self.cfg["shadow_reader"]           # (reader v2 in shadow mode: off with shadow_reader false)
         self.session = Session(self.cfg["gap_seconds"])
         self.tracker, self.meso = self.session.exp, self.session.meso
         self.party = 1
         self._party_seen = (None, 0)
         self.last_mesos = None
         self.rejected = 0
+        self.started, self.cpu0 = time.monotonic(), time.process_time()
+        self.recent, self.health = Recent(40, self.started), Health()      # for bug reports
         self.autolog = AutoLog(self.cfg["gap_seconds"])
         self.map_name = None
+        self.potion_bar = ()                # what the potion bar showed at the last look: potions.Slot tuple
+        self.in_town = False                # on a town map: nobody farms there, so nothing is logged
         self.level = None
         self.note = None
         self.last_logged = None
         self.skip_log = False               # "Don't log" is on: this run isn't logged
         self._sharing, self._next_share = False, 0.0       # sending runs to the site
+        self.healthlog = healthlog.HealthLog(HEALTH_PATH)   # counts for the daily health report
+        self._health_sending, self._health_at, self._health_snap_at = False, None, 0.0
+        self._health_monitors, self._health_errors = [], {}
         self.job = None                     # the class, from the status bar
         self.map_read = None                # the map name exactly as read
+        self.map_hidden, self.map_back_at = False, None     # the minimap's name out of sight for a few seconds
         self.found_at = None                # when the EXP bar was first read for this level
+        self.level_wait = False             # a %-only bar is waiting for its level
+        self.pct_note = ""                  # what the tracker last said about a %-only reading
+        self._char_print = None             # the name row's print when the level was last known (memory only)
+        self._char_seen = None              # the newest print looked at, so each is counted once
+        self.name_note = ""                 # what to say about a covered or partly covered name row
+        self._stale_level = None            # (level, when) of the character just left: a queued reading may still carry it
+        self._char_diff = 0                 # prints in a row that differ from _char_print
+        self._same_char = False             # the newest print matches the one from when the level was known
+        self.other_char_at = None           # when another character was last noticed (the status says so for a while)
+        self.level_btn = None               # Settings > Level fallback (enabled only when it can help)
         self.level_up_at = None
         self.died_at = None
         self.log_open = False
-        self.settings_win = None
+        self.settings_win = self.prices_win = None
+        self._price_table = None
         self.q = queue.Queue()
         self.stop_evt = threading.Event()
         self.last_capture = None
 
+        # The typeface is bundled with the overlay and made available to this program only.
+        self._own_fonts = PLATFORM.register_fonts([ASSETS / "fonts" / n for n in FONT_FILES])
+        family_of = lambda f: f if self._own_fonts else FALLBACK_FONT.get(f, f)
         self.fonts = {name: tkfont.Font(root, underline=underline, **dict(zip(("family", "weight"),
-                                                                               PLATFORM.font(family, weight))))
+                                                                               PLATFORM.font(family_of(family), weight))))
                       for name, (family, _, weight, underline) in FONTS.items()}
         pos = self.cfg.get("pos")
         self._dpi = (PLATFORM.screen_dpi(pos[0] + 40, pos[1] + 15) if pos else None) or root.winfo_fpixels("1i")
@@ -2539,79 +4326,17 @@ class App:
         self._apply_window_settings()
         self._restore_position()
 
-        main = self.main = tk.Frame(root, bg=BG)
-        main.grid(row=0, column=0, sticky="n")
+        setup_ttk(root)
+        PLATFORM.style_window(root, INK, TEXT_DIM)          # a title bar in the overlay's own colours
+        self._trend, self._trend_at, self._start_text = deque(maxlen=60), 0.0, "Start"
+        self.status = tk.StringVar()
+        self.status.trace_add("write", lambda *_: self.view.show(message=self.status.get()) if hasattr(self, "view") else None)
         root.columnconfigure(1, weight=1)                 # the log gets any extra room
         root.rowconfigure(0, weight=1)
-        self.vars = {}
-        tk.Label(main, text="EXP / hr", bg=BG, fg=DIM, font=self.fonts["text"]).grid(
-            row=0, column=0, sticky="w", padx=12, pady=(10, 0))
-        corner = tk.Frame(main, bg=BG)
-        corner.grid(row=0, column=1, sticky="ne", padx=(0, 6), pady=(4, 0))
-        small = dict(bg=BG, fg=DIM, activebackground=FIELD, activeforeground=FG, relief="flat",
-                     bd=0, padx=6, pady=0, font=self.fonts["icon"], cursor="hand2")
-        self.best_btn = tk.Button(corner, text="Best maps", command=self.open_best_maps,
-                  **{**small, "fg": ACCENT_SOFT, "activebackground": BG, "activeforeground": ACCENT,
-                     "font": self.fonts["link"]})
-        self.best_btn.pack(side="left", padx=(0, 4))
-        tk.Button(corner, text="⚙", command=self.open_settings, **small).pack(side="left")
-        self.log_btn = tk.Button(corner, text=">", command=self.toggle_log, **small)
-        self.log_btn.pack(side="left")
-        self.compact_btn = tk.Button(corner, text="Compact", command=lambda: self.set_compact(not self.compact),
-                                     bg=FIELD, fg=FG, activebackground="#3a3f49", activeforeground=FG,
-                                     relief="flat", bd=0, padx=8, pady=1, font=self.fonts["small"], cursor="hand2")
-        self.compact_btn.pack(side="left", padx=(6, 0))
-        self.big = tk.Label(main, text="—", bg=BG, fg=ACCENT, font=self.fonts["big"])
-        self.big.grid(row=1, column=0, columnspan=2, sticky="w", padx=12)
-        self.big.bind("<Double-Button-1>", lambda _: self.set_compact(not self.compact))
-        # Under the big number, like a caption: when you'll reach the next level.
-        self.next_level = tk.Label(main, text="", bg=BG, fg=ACCENT_SOFT, font=self.fonts["next"])
-        self.next_level.grid(row=2, column=0, columnspan=2, sticky="nw", padx=(14, 12), pady=(0, 8))
-
-        rows = ["Last 5 min", "% / hr", "Gained", "Current",
-                "Mesos", "Mesos / hr", "Mesos / 5 min", "Elapsed"]
-        self.detail = []                                  # the rows, hidden in compact mode
-        for i, name in enumerate(rows, start=3):
-            label = tk.Label(main, text=name, bg=BG, fg=DIM, font=self.fonts["row"])
-            label.grid(row=i, column=0, sticky="w", padx=(12, 8))
-            v = tk.StringVar(value="—")
-            value = tk.Label(main, textvariable=v, bg=BG, fg=FG, font=self.fonts["value"])
-            value.grid(row=i, column=1, sticky="e", padx=(8, 12))
-            self.vars[name] = v
-            self.detail += [label, value]
-        # Compact mode's stand-in for the rows: the last 5 minutes and mesos/hr, on one line.
-        self.compact_line = tk.Label(main, text="", bg=BG, fg=DIM, font=self.fonts["text"])
-        self.compact_line.grid(row=3, column=0, columnspan=2, sticky="w", padx=12)
-        self.compact_line.grid_remove()
-
-        bar = tk.Frame(main, bg=BG)
-        bar.grid(row=len(rows) + 3, column=0, columnspan=2, pady=(10, 4), padx=8)
-        btn = dict(bg=FIELD, fg=FG, activebackground="#3a3f49", activeforeground=FG,
-                   relief="flat", padx=8, pady=3, font=self.fonts["text"])
-        self.start_btn = tk.Button(bar, text="Start", command=self.toggle, **btn)
-        self.start_btn.pack(side="left", padx=2)
-        reset_btn = tk.Button(bar, text="Reset", command=self.reset, **btn)
-        reset_btn.pack(side="left", padx=2)
-        # Keeps this run out of the log (everything is still shown). Turns itself off when
-        # the run ends: when you leave the map or stop getting EXP.
-        self._btn_style = btn
-        self.skip_btn = tk.Button(bar, command=self.toggle_skip_log, **btn)
-        self.skip_btn.pack(side="left", padx=2)
+        self._build_view()
         self._show_skip_log()
-        # Normally the EXP bar is found by itself; this switches to an area you drag out
-        # yourself (if it ever can't find it) and back.
-        self.area_btn = tk.Button(bar, command=self.toggle_area, **btn)
-        self.area_btn.pack(side="left", padx=2)
-        capture_btn = tk.Button(bar, text="View capture", command=self.view_capture, **btn)
-        capture_btn.pack(side="left", padx=2)
-        self._show_area_mode()
-        self.more_buttons = [reset_btn, self.skip_btn, self.area_btn, capture_btn]   # not in compact mode
-
-        self.status = tk.StringVar()
-        self.status_label = tk.Label(main, textvariable=self.status, bg=BG, fg=DIM, font=self.fonts["small"],
-                                     justify="left")
-        self.status_label.grid(row=len(rows) + 4, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 8))
-        self._fit_status()
+        for delay in (0, 150, 800):                        # (Windows can reset it while the window is first shown)
+            root.after(delay, lambda: PLATFORM.style_window(root, INK, TEXT_DIM))
 
         self._build_log_panel()
         if self.cfg["compact"]:
@@ -2626,21 +4351,60 @@ class App:
             self.status.set("Looking for the MapleStory window..." if mode == "window"
                             else "Using your selected area.")
 
-        threading.Thread(target=self._worker, daemon=True).start()
+        self._worker_thread = threading.Thread(target=self._worker, daemon=True)
+        self._worker_thread.start()
         root.after(200, self._pump)
         root.after(500, self._refresh)
         if self.cfg["check_updates"]:
             self.check_updates()                       # only now, when it starts
-        root.after(1500, self._ask_to_share)           # (asked once, the first time)
+        root.after(1500, self._first_run)              # (once: the compact shape or what's new, then the sharing question)
+
+    # ---- the main window
+    def _build_view(self):
+        """(Re)builds the main window at the current size: it's drawn smoothly for each screen's scaling
+        and for Settings > Size, so a new size means new pictures."""
+        if getattr(self, "view", None):
+            self.view.destroy()
+        self.theme = Theme(self.root, self._px_per_pt * 0.75, ASSETS / "fonts", self._own_fonts, PLATFORM.font)
+        callbacks = dict(settings=self.open_settings, compact=lambda: self.set_compact(not self.compact),
+                         log=self.toggle_log, start=self.toggle, reset=self.reset, logging=self._logging_clicked,
+                         best=self.open_best_maps, menu=self._open_menu, details=self._details_changed)
+        self.view = self.main = MainView(self.root, self.theme, callbacks, details=bool(self.cfg.get("details")))
+        self.view.grid(row=0, column=0, sticky="n")
+        if self.compact:
+            self.view.set_compact(True, self.cfg["compact_shape"])
+        self._set_start(self._start_text)
+        self.view.log_btn.set(kind="secondary" if self.log_open else "ghost")
+        self.view.show(message=self.status.get())
+        self._show_skip_log()
+
+    def _style_frame(self):
+        """The title bar in the overlay's colours. (Windows resets it when the frame changes, e.g. when the
+        log opens or it goes compact, so this runs again a moment after.)"""
+        for delay in (30, 300):
+            self.root.after(delay, lambda: PLATFORM.style_window(self.root, INK, TEXT_DIM))
+
+    def _details_changed(self, is_open):
+        self.cfg["details"] = is_open
+        save_config(self.cfg)
+
+    def _open_menu(self, anchor):
+        PopupMenu(self.theme, anchor, [
+            ("Follow the game" if self.reader.mode == "region" else "Select area", None, self.toggle_area),
+            ("View capture", None, self.view_capture)])
+
+    def _logging_clicked(self, on):
+        if self.skip_log == on:                           # the switch and the state disagree: flip
+            self.toggle_skip_log()
 
     # ---- log panel
     def _build_log_panel(self):
         p = self.log_panel = tk.Frame(self.root, bg=BG)
-        tk.Label(p, text="EXP log", bg=BG, fg=DIM, font=self.fonts["text"]).grid(
-            row=0, column=0, columnspan=2, sticky="w")
+        tk.Label(p, text="EXP log", bg=BG, fg=FG, font=self.fonts["title"]).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(2, 0))
         self.log_status = tk.StringVar()
-        tk.Label(p, textvariable=self.log_status, bg=BG, fg=FG, font=self.fonts["text"],
-                 justify="left", anchor="w").grid(row=1, column=0, columnspan=2, sticky="we", pady=(2, 6))
+        tk.Label(p, textvariable=self.log_status, bg=BG, fg=DIM, font=self.fonts["text"],
+                 justify="left", anchor="w").grid(row=1, column=0, columnspan=2, sticky="we", pady=(2, 10))
 
         # A compact table: one row per day, map, level and class, solo or in a party (click a
         # party row for a row per party size). Drag the lines between the column titles to
@@ -2650,23 +4414,25 @@ class App:
         style.theme_use("clam")
         style.layout("Log.Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
         style.configure("Log.Treeview", background=LIST_BG, fieldbackground=LIST_BG, foreground=FG,
-                        font=cell, rowheight=int(cell.metrics("linespace") * 1.45), borderwidth=0)
-        style.configure("Log.Treeview.Heading", background=FIELD, foreground=DIM, relief="flat",
-                        borderwidth=0, font=head)
-        style.map("Log.Treeview", background=[("selected", "#3a3f49")], foreground=[("selected", FG)])
-        style.map("Log.Treeview.Heading", background=[("active", "#3a3f49")])
+                        font=cell, rowheight=int(cell.metrics("linespace") * 1.8), borderwidth=0)
+        style.configure("Log.Treeview.Heading", background=BG, foreground=DIM, relief="flat",
+                        borderwidth=0, font=self.fonts["caps"], padding=(0, 6))
+        style.map("Log.Treeview", background=[("selected", SELECT)], foreground=[("selected", ACCENT)])
+        style.map("Log.Treeview.Heading", background=[("active", BG)])
         # (key, title, widest usual value, alignment): starting widths are measured in the
         # real font, so nothing is cut off at any screen scaling.
         columns = (("date", "Date", "Sep 30", "w"), ("map", "Map", "The Swamp of Despair II", "w"),
                    ("lv", "Lv", "99", "center"), ("class", "Class", "Crossbowman", "w"),
                    ("party", "Party", "2–6ppl ▸", "center"),
                    ("time", "Time", "12h 30m", "center"),
-                   ("exp", "EXP/hr", "888,888", "e"), ("mesos", "Mesos/hr", "888,888", "e"))
+                   ("exp", "EXP/hr", "888,888", "e"), ("mesos", "Mesos/hr", "888,888", "e"),
+                   ("net", "Net/hr", "888,888", "e"), ("note", "Note", NOTE_MARK, "center"))
         # Saved widths are in points, so they look the same on screens with different scaling
         # (older versions saved pixels: those are used as they are, once).
         saved = {k: round(v * self._px_per_pt) for k, v in (self.cfg.get("log_columns_pt") or {}).items()
                  if type(v) in (int, float)} or self.cfg.get("log_columns") or {}
         pad = cell.measure("00")
+        self._log_titles = {c[0]: c[1] for c in columns}
         tree = self.log_tree = ttk.Treeview(p, columns=[c[0] for c in columns], show="headings",
                                             style="Log.Treeview", height=11, selectmode="browse")
         for key, title, sample, anchor in columns:
@@ -2681,13 +4447,34 @@ class App:
         tree.tag_configure("part", background=LIST_PART, foreground="#b3b8c0")   # one party size
         tree.tag_configure("edited", foreground="#6b7079")      # changed outside the tracker
         tree.grid(row=2, column=0, sticky="nsew")
-        scroll = tk.Scrollbar(p, orient="vertical", command=tree.yview)
+        scroll = ttk.Scrollbar(p, orient="vertical", command=tree.yview, style="Dark.Vertical.TScrollbar")
         scroll.grid(row=2, column=1, sticky="ns")
         tree.configure(yscrollcommand=scroll.set)
+        # Notes: a place for the player's own notes on the selected line. They're only ever kept
+        # in the log file on this PC (never shared), and saved as they're typed.
+        self._note_key = self._note_entries = self._note_job = None
+        self._note_dirty, self._note_label = False, ""
+        nb = tk.Frame(p, bg=BG)
+        nb.grid(row=3, column=0, columnspan=2, sticky="we", pady=(8, 0))
+        nb.columnconfigure(0, weight=1)
+        self.note_title = tk.Label(nb, text="", bg=BG, fg=DIM, font=head, anchor="w", justify="left")
+        self.note_title.grid(row=0, column=0, sticky="we")
+        self.note_text = tk.Text(nb, height=3, wrap="word", undo=True, maxundo=100, bg=LIST_BG, fg=FG,
+                                 insertbackground=FG, relief="flat", font=cell, padx=8, pady=6,
+                                 highlightthickness=1, highlightbackground=LINE, highlightcolor=ACCENT)
+        self.note_text.grid(row=1, column=0, sticky="we", pady=(3, 0))
+        self.note_text.bind("<<Modified>>", self._note_modified)
+        self.note_text.bind("<FocusIn>", lambda e: self.hotkeys.pause(True))      # typing "!" isn't Shift+1
+        self.note_text.bind("<FocusOut>", lambda e: (self.hotkeys.pause(False), self._note_flush()))
+        self._note_show(None)
         self.log_hint = tk.StringVar(value=LOG_HINT)
         hint = tk.Label(p, textvariable=self.log_hint, bg=BG, fg=DIM, font=head, justify="left", anchor="w")
-        hint.grid(row=3, column=0, columnspan=2, sticky="we", pady=(4, 0))
-        p.bind("<Configure>", lambda e: hint.config(wraplength=max(120, e.width - 8)))
+        hint.grid(row=4, column=0, columnspan=2, sticky="we", pady=(4, 0))
+
+        def fit(e):
+            hint.config(wraplength=max(120, e.width - 8))
+            self.note_title.config(wraplength=max(120, e.width - 8))
+        p.bind("<Configure>", fit)
         p.columnconfigure(0, weight=1)
         p.rowconfigure(2, weight=1)
         tree.bind("<Button-3>", self._log_menu)
@@ -2700,6 +4487,7 @@ class App:
 
     def toggle_log(self, remember=True):
         if self.log_open:
+            self._note_flush()
             self._remember_log_size()                   # before it closes
         self.log_open = not self.log_open
         root = self.root
@@ -2716,7 +4504,8 @@ class App:
             root.resizable(False, False)
             root.minsize(1, 1)
             root.geometry("")                           # back to just the tracker's size
-        self.log_btn.config(text="<" if self.log_open else ">")
+        self.view.log_btn.set(kind="secondary" if self.log_open else "ghost")
+        self._style_frame()
         if remember:
             self.cfg["log_open"] = self.log_open
             save_config(self.cfg)
@@ -2729,22 +4518,22 @@ class App:
         self.compact = self.cfg["compact"] = on
         if on and self.log_open:
             self.toggle_log(remember=False)                 # out of the way, but remembered
-        for w in self.detail:
-            w.grid_remove() if on else w.grid()
-        self.compact_line.grid() if on else self.compact_line.grid_remove()
-        for b in self.more_buttons:
-            b.pack_forget()
-            if not on:
-                b.pack(side="left", padx=2)
-        if on:
-            self.log_btn.pack_forget()
-        else:
-            self.log_btn.pack(side="left", before=self.compact_btn)
-        self.compact_btn.config(text="Full" if on else "Compact")
-        self._fit_status()
+        self.view.set_compact(on, self.cfg["compact_shape"])
+        self._style_frame()
         if not on and self.cfg.get("log_open"):
             self.toggle_log(remember=False)
         else:
+            self.root.geometry("")
+        save_config(self.cfg)
+
+    def set_shape(self, shape):
+        """Settings > Compact shape: Square, Wide or Bar. Only compact mode looks different."""
+        if shape not in SHAPES:
+            return
+        self.cfg["compact_shape"] = shape
+        if self.compact:
+            self.view.set_compact(True, shape)
+            self._style_frame()
             self.root.geometry("")
         save_config(self.cfg)
 
@@ -2755,15 +4544,18 @@ class App:
         for name, (_, size, _, _) in FONTS.items():
             # In pixels (negative), never under 9 so the smallest text stays readable.
             self.fonts[name].configure(size=-max(9, round(size * self._px_per_pt)))
+        if old is not None and getattr(self, "view", None):
+            self._build_view()
         if old is None or not hasattr(self, "log_tree"):    # at start, before the window is built
             return
         self._fit_settings()
-        ttk.Style(self.root).configure("Log.Treeview", rowheight=int(self.fonts["text"].metrics("linespace") * 1.45))
+        ttk.Style(self.root).configure("Log.Treeview", rowheight=int(self.fonts["text"].metrics("linespace") * 1.8))
+        head, pad = self.fonts["caps"], self.fonts["text"].measure("00")
         for c in self.log_tree["columns"]:
             width = round(self.log_tree.column(c, "width") * self._px_per_pt / old)
-            self.log_tree.column(c, width=max(10, width))
+            # (text doesn't shrink as far as the window does, so a column keeps room for its heading)
+            self.log_tree.column(c, width=max(10, width, head.measure(self._log_titles.get(c, "")) + pad))
         self.cfg["log_size"] = None                         # a size from before may not fit any more
-        self._fit_status()
         if self.log_open:
             self.root.update_idletasks()
             self.root.minsize(self.main.winfo_reqwidth() + 150, self.main.winfo_reqheight())
@@ -2785,16 +4577,12 @@ class App:
             self._dpi = dpi
             self._apply_ui_scale()
 
-    def _fit_status(self):
-        """Wraps the status line at the width the rest of the window needs."""
-        self.status_label.config(wraplength=1)
-        self.main.update_idletasks()
-        self.status_label.config(wraplength=max(160, self.main.winfo_reqwidth() - 24))
-
     def _fill_log(self):
         """The log, newest first. A map's party sizes on a day share a row (smallest to biggest
         party, all their time together); clicking it shows a row for each party size."""
         tree = self.log_tree
+        self._note_flush()                                  # a note being typed is saved first,
+        keep, rows = self._selected_key(), {}               # and the same line stays selected
         tree.delete(*tree.get_children())
         self.shown, self.groups = {}, {}
         edited = lambda e: ("edited",) if self.autolog.edited(e) else ()
@@ -2803,15 +4591,114 @@ class App:
             if len(entries) == 1:
                 iid = tree.insert("", "end", values=log_row(entries[0]), tags=stripe + edited(entries[0]))
                 self.shown[iid] = entries[0]
+                rows[self._line_key(entries[0])] = iid
                 continue
             is_open = key in self.open_groups
             all_edited = all(self.autolog.edited(e) for e in entries)
             iid = tree.insert("", "end", values=group_row(entries, is_open), open=is_open,
                               tags=stripe + (("edited",) if all_edited else ()))
             self.groups[iid] = (key, entries)
+            rows[key] = iid
             for e in entries:
-                self.shown[tree.insert(iid, "end", values=log_row(e, part=True), tags=("part",) + edited(e))] = e
+                child = tree.insert(iid, "end", values=log_row(e, part=True), tags=("part",) + edited(e))
+                self.shown[child] = e
+                rows[self._line_key(e)] = child
+        if keep in rows:
+            tree.selection_set(rows[keep])
+        else:
+            self._note_show(None)                           # that line is gone (renamed, merged, deleted)
         self.log_hint.set(LOG_HINT if self.shown else "No logs yet. Press Start and gain EXP for 5 minutes.")
+
+    # ---- personal notes on log lines
+    @staticmethod
+    def _line_key(e):
+        return ("line",) + AutoLog.key(e)
+
+    def _selected_entries(self):
+        """(a key for the selected row, the log lines it stands for), or (None, None)."""
+        sel = self.log_tree.selection()
+        if not sel:
+            return None, None
+        if sel[0] in self.groups:
+            return self.groups[sel[0]]
+        e = self.shown.get(sel[0])
+        return (self._line_key(e), [e]) if e else (None, None)
+
+    def _selected_key(self):
+        return self._selected_entries()[0]
+
+    def _note_show(self, key, entries=None):
+        """Puts the selected line's note in the box (or empties it, with nothing selected)."""
+        t = self.note_text
+        if key is not None and key == self._note_key:
+            self._note_entries = entries                    # the same line (the log was refilled): leave
+            return                                          # the text, and whoever is typing in it, alone
+        self._note_key, self._note_entries, self._note_dirty = key, entries, False
+        t.config(state="normal")
+        t.delete("1.0", "end")
+        if key is None:
+            self._note_label = ""
+            self.note_title.config(text="Notes: click a line to write one (they stay on this PC).")
+            t.config(state="disabled", bg=LIST_PART)
+        else:
+            first, party = entries[0], entries[0].get("party")
+            where = f"{log_row(first)[0]} \u00b7 {first['map']}" + (f" \u00b7 {party}ppl" if len(entries) == 1 and party and party > 1 else "")
+            self._note_label = f"Note for {where} (kept on this PC only)"
+            self.note_title.config(text=self._note_label)
+            t.insert("1.0", notes_of(entries))
+            t.config(bg=LIST_BG)
+        t.edit_reset()
+        t.edit_modified(False)
+
+    def _note_modified(self, _event=None):
+        t = self.note_text
+        if not t.edit_modified():
+            return
+        t.edit_modified(False)
+        if self._note_key is None:
+            return
+        over = len(t.get("1.0", "end-1c")) - NOTE_MAX
+        if over > 0:                                        # too long: what doesn't fit isn't kept
+            t.delete(f"end-1c-{over}c", "end-1c")
+            self.note_title.config(text=f"A note can be {NOTE_MAX:,} characters at most.")
+        else:
+            self.note_title.config(text=self._note_label)
+        self._note_dirty = True
+        if self._note_job:
+            self.root.after_cancel(self._note_job)
+        self._note_job = self.root.after(900, self._note_flush)
+
+    def _note_flush(self):
+        """Saves the note being typed, if it was changed (as you type, when you click another
+        line or leave the box, and when the log or the overlay closes)."""
+        if self._note_job:
+            self.root.after_cancel(self._note_job)
+            self._note_job = None
+        if not self._note_dirty or self._note_key is None:
+            return
+        self._note_dirty = False
+        text = clean_note(self.note_text.get("1.0", "end-1c"))[:NOTE_MAX]
+        try:
+            self.autolog.set_note(self._note_entries, text)
+        except Exception as e:
+            log_error("saving a note", e)
+            self._note_dirty = True
+            self.note_title.config(text="Couldn't save the note (see errors.log).")
+            return
+        for e in self._note_entries:                        # the rows on screen
+            if text:
+                e["note"] = text
+            else:
+                e.pop("note", None)
+        self._note_marks()
+        self.note_title.config(text=f"{self._note_label} \u00b7 saved")
+
+    def _note_marks(self):
+        """The Note column: a mark on the lines that have a note."""
+        for iid, (_, entries) in self.groups.items():
+            self.log_tree.set(iid, "note", NOTE_MARK if notes_of(entries) else "")
+        for iid, e in self.shown.items():
+            self.log_tree.set(iid, "note", NOTE_MARK if note_of(e) else "")
 
     def _log_click(self, event):
         """Clicking a merged party row opens it (a row per party size) or closes it."""
@@ -2832,6 +4719,9 @@ class App:
             self._log_selected(None)
 
     def _log_selected(self, _event):
+        self._note_flush()                                  # the line left is saved first
+        key, entries = self._selected_entries()
+        self._note_show(key, entries)
         sel = self.log_tree.selection()
         group = self.groups.get(sel[0]) if sel else None
         if group:
@@ -2879,8 +4769,13 @@ class App:
         self.log_hint.set("Copied: " + text if len(entries) == 1 else f"Copied {len(entries)} lines, one per party size.")
 
     def _rename(self, entries):
-        name = simpledialog.askstring("Rename map", "Map name:", initialvalue=entries[0]["map"],
-                                      parent=self.root)
+        self._note_flush()
+        self.hotkeys.pause(True)                            # typing "!" in a name isn't Shift+1
+        try:
+            name = simpledialog.askstring("Rename map", "Map name:", initialvalue=entries[0]["map"],
+                                          parent=self.root)
+        finally:
+            self.hotkeys.pause(False)
         if name and name.strip():
             for entry in entries:             # (one rename covers them all, unless it's "Unknown map")
                 if entry["map"] != name.strip():
@@ -2892,8 +4787,11 @@ class App:
             self._fill_log()
 
     def _delete(self, entries):
+        self._note_flush()
         lines = "\n".join(format_entry(e) for e in entries)
         question = f"Delete these {len(entries)} log entries?" if len(entries) > 1 else "Delete this log entry?"
+        if any(note_of(e) for e in entries):
+            question += " The note" + ("s" if len(entries) > 1 else "") + " on " + ("them" if len(entries) > 1 else "it") + " will be deleted too."
         if messagebox.askyesno("Delete entry", f"{question}\n\n{lines}", parent=self.root):
             for entry in entries:
                 self.autolog.delete(entry)
@@ -2925,12 +4823,24 @@ class App:
     # ---- settings
     def _apply_window_settings(self):
         self.root.attributes("-topmost", bool(self.cfg["topmost"]))
-        self.root.attributes("-alpha", 1 - min(90, max(0, int(self.cfg["transparency"]))) / 100)
+        self.root.attributes("-alpha", 1 - min(MAX_TRANSPARENCY, max(0, int(self.cfg["transparency"]))) / 100)
+
+    def _switch(self, parent, text, var):
+        """An on/off switch tied to a BooleanVar."""
+        t = Toggle(parent, self.theme, text, bool(var.get()), lambda on: var.set(on), BG)
+        var.trace_add("write", lambda *_: t.set(bool(var.get())))
+        return t
+
+    def _section(self, parent, text, first=False):
+        tk.Label(parent, text=text.upper(), bg=BG, fg=DIM, font=self.theme.font("semibold", 10)).pack(
+            anchor="w", pady=(0 if first else self.theme.px(20), self.theme.px(8)))
 
     def open_settings(self):
         if self.settings_win and self.settings_win.winfo_exists():
             self.settings_win.lift()
             return
+        th = self.theme
+        px = th.px
         w = self.settings_win = tk.Toplevel(self.root)
         w.title("Settings")
         w.configure(bg=BG)
@@ -2940,63 +4850,120 @@ class App:
         if r:                                    # over the overlay, so on the same screen (and scaling)
             w.geometry(f"+{r[0] + 40}+{r[1] + 40}")
         w.attributes("-topmost", bool(self.cfg["topmost"]))
-        text = dict(bg=BG, fg=FG, font=self.fonts["text"])
+        for delay in (0, 150, 800):
+            w.after(delay, lambda: PLATFORM.style_window(w, INK, TEXT_DIM) if w.winfo_exists() else None)
+        body = tk.Frame(w, bg=BG)
+        body.pack(padx=px(26), pady=px(22))
+        text = dict(bg=BG, fg=FG, font=th.font("semibold", 12))
+        dim = dict(bg=BG, fg=DIM, font=th.font("regular", 11))
+        wrap = px(380)
 
+        self._section(body, "Tracking", first=True)
         gap = tk.StringVar(value=str(self.cfg["gap_seconds"]))
-        tk.Label(w, text="Pause tracking (and restart the 5-minute log timer)\nafter no EXP for",
-                 justify="left", **text).grid(
-            row=0, column=0, sticky="w", padx=14, pady=(14, 4))
-        line = tk.Frame(w, bg=BG)
-        line.grid(row=1, column=0, sticky="w", padx=14)
-        tk.Spinbox(line, from_=5, to=300, width=5, textvariable=gap, bg=FIELD, fg=FG,
-                   buttonbackground=FIELD, insertbackground=FG, relief="flat",
-                   font=self.fonts["text"]).pack(side="left")
-        tk.Label(line, text="seconds", **text).pack(side="left", padx=(6, 0))
+        line = tk.Frame(body, bg=BG)
+        line.pack(fill="x")
+        tk.Label(line, text="Pause after no EXP for", **text).pack(side="left")
+        gap_step = tk.Frame(line, bg=BG)
+        gap_step.pack(side="right")
 
+        def gap_by(by):
+            try:
+                now_ = int(gap.get())
+            except ValueError:
+                now_ = self.cfg["gap_seconds"]
+            gap.set(str(min(300, max(5, now_ + by))))
+        Button(gap_step, th, text="−", kind="secondary", width=38, height=34, radius=10, size=15,
+               command=lambda: gap_by(-5), bg=BG).pack(side="left")
+        tk.Label(gap_step, textvariable=gap, width=4, bg=BG, fg=FG, font=th.font("bold", 12)).pack(side="left")
+        Button(gap_step, th, text="+", kind="secondary", width=38, height=34, radius=10, size=15,
+               command=lambda: gap_by(5), bg=BG).pack(side="left")
+        tk.Label(gap_step, text="s", bg=BG, fg=DIM, font=th.font("regular", 11)).pack(side="left", padx=(px(6), 0))
+        tk.Label(body, text="Pausing also restarts the 5-minute log timer.", **dim).pack(anchor="w", pady=(px(5), 0))
+
+        self._section(body, "Window")
         transparency = tk.IntVar(value=int(self.cfg["transparency"]))
-        tk.Label(w, text="Window transparency (%)", **text).grid(
-            row=2, column=0, sticky="w", padx=14, pady=(14, 0))
-        tk.Scale(w, from_=0, to=90, orient="horizontal", variable=transparency, length=240,
-                 bg=BG, fg=FG, troughcolor=FIELD, highlightthickness=0, bd=0,
-                 font=self.fonts["small"]).grid(row=3, column=0, sticky="w", padx=10)
-
-        size_line = tk.Frame(w, bg=BG)
-        size_line.grid(row=4, column=0, sticky="w", padx=14, pady=(10, 0))
+        line = tk.Frame(body, bg=BG)
+        line.pack(fill="x")
+        tk.Label(line, text="Transparency", **text).pack(side="left")
+        percent = tk.Label(line, text=f"{transparency.get()}%", **dim)
+        percent.pack(side="right")
+        transparency.trace_add("write", lambda *_: percent.config(text=f"{int(float(transparency.get()))}%"))
+        Slider(body, th, transparency, 0, MAX_TRANSPARENCY, 330, BG).pack(anchor="w", pady=(px(6), px(12)))
+        size_line = tk.Frame(body, bg=BG)
+        size_line.pack(fill="x")
         tk.Label(size_line, text="Size", **text).pack(side="left")
-        # − 100% +: steps through UI_SCALES only, so it stops at the smallest and biggest sizes.
+        # \u2212 100% +: steps through UI_SCALES only, so it stops at the smallest and biggest sizes.
         size = tk.StringVar(value=f"{self.cfg['ui_scale']}%")
-        step = dict(bg=FIELD, fg=FG, activebackground="#3a3f49", activeforeground=FG, relief="flat", bd=0,
-                    padx=8, pady=0, font=self.fonts["text"], cursor="hand2", disabledforeground="#555a63")
+        stepper = tk.Frame(size_line, bg=BG)
+        stepper.pack(side="right")
 
         def nudge(by):
             i = UI_SCALES.index(int(size.get().rstrip("%"))) + by
             if 0 <= i < len(UI_SCALES):
                 size.set(f"{UI_SCALES[i]}%")
-            smaller.config(state="normal" if i > 0 else "disabled")
-            bigger.config(state="normal" if i < len(UI_SCALES) - 1 else "disabled")
-        smaller = tk.Button(size_line, text="−", command=lambda: nudge(-1), **step)
-        smaller.pack(side="left", padx=(8, 0))
-        tk.Label(size_line, textvariable=size, width=5, **text).pack(side="left")
-        bigger = tk.Button(size_line, text="+", command=lambda: nudge(1), **step)
+            smaller.set(enabled=i > 0)
+            bigger.set(enabled=i < len(UI_SCALES) - 1)
+        smaller = Button(stepper, th, text="\u2212", kind="secondary", width=38, height=34, radius=10, size=15,
+                         command=lambda: nudge(-1), bg=BG)
+        smaller.pack(side="left")
+        tk.Label(stepper, textvariable=size, width=5, bg=BG, fg=FG, font=th.font("bold", 12)).pack(side="left")
+        bigger = Button(stepper, th, text="+", kind="secondary", width=38, height=34, radius=10, size=15,
+                        command=lambda: nudge(1), bg=BG)
         bigger.pack(side="left")
         nudge(0)
+        shape_line = tk.Frame(body, bg=BG)
+        shape_line.pack(fill="x", pady=(px(14), 0))
+        tk.Label(shape_line, text="Compact shape", **text).pack(side="left")
+        shape_box = tk.Frame(shape_line, bg=BG)
+        shape_box.pack(side="right")
+        shape_btns = {}
+
+        def pick_shape(shape):
+            self.set_shape(shape)
+            for k, b in shape_btns.items():
+                b.set(kind="primary" if k == shape else "secondary")
+        for k in SHAPES:
+            shape_btns[k] = Button(shape_box, th, text=SHAPE_LABELS[k], width=64, height=34, radius=10, size=12, bg=BG,
+                                   kind="primary" if k == self.cfg["compact_shape"] else "secondary",
+                                   command=lambda k=k: pick_shape(k))
+            shape_btns[k].pack(side="left", padx=(px(6), 0))
         topmost = tk.BooleanVar(value=bool(self.cfg["topmost"]))
-        tk.Checkbutton(w, text="Always on top of other windows", variable=topmost, bg=BG, fg=FG,
-                       selectcolor=FIELD, activebackground=BG, activeforeground=FG,
-                       font=self.fonts["text"]).grid(row=5, column=0, sticky="w", padx=10, pady=(8, 0))
+        self._switch(body, "Always on top of other windows", topmost).pack(anchor="w", pady=(px(14), 0))
+
+        self._section(body, "Potions")
+        potions_on = tk.BooleanVar(value=bool(self.cfg["potions_on"]))
+        self._switch(body, "Count potions used and what they cost", potions_on).pack(anchor="w")
+        price_line = tk.Frame(body, bg=BG)
+        price_line.pack(fill="x", pady=(px(8), 0))
+        tk.Label(price_line, text="Your own price for each one", **text).pack(side="left")
+        Button(price_line, th, text="Prices", kind="secondary", width=80, height=34, radius=10, size=12,
+               command=self.open_potion_prices, bg=BG).pack(side="right")
+        self._potions_on = potions_on
+
+        self._section(body, "EXP bar without a number")
+        level_line = tk.Frame(body, bg=BG)
+        level_line.pack(fill="x")
+        tk.Label(level_line, text="Type your level if it can't be read", **text).pack(side="left")
+        self.level_btn = Button(level_line, th, text="Level fallback", kind="secondary", width=124, height=34, radius=10,
+                                size=12, command=lambda: self.type_level(w), bg=BG)
+        self.level_btn.pack(side="right")
+        self.level_btn.set(enabled=self._can_type_level())
+        tk.Label(body, text="Past a certain level the game shows only a percentage. The overlay reads your level "
+                            "from the status bar and estimates EXP from it. Typing it in is only a last resort.",
+                 wraplength=wrap, justify="left", **dim).pack(anchor="w", pady=(px(4), 0))
+
+        self._section(body, "Updates and sharing")
         updates = tk.BooleanVar(value=bool(self.cfg["check_updates"]))
-        tk.Checkbutton(w, text="Check for updates when it starts", variable=updates, bg=BG, fg=FG,
-                       selectcolor=FIELD, activebackground=BG, activeforeground=FG,
-                       font=self.fonts["text"]).grid(row=6, column=0, sticky="w", padx=10, pady=(2, 0))
+        self._switch(body, "Check for updates when it starts", updates).pack(anchor="w")
         sharing = tk.BooleanVar(value=bool(self.cfg.get("share_runs")))
-        share_line = tk.Frame(w, bg=BG)
-        share_line.grid(row=7, column=0, sticky="w", padx=10, pady=(2, 0))
-        tk.Checkbutton(share_line, text=f"Share my {RUN_SECONDS // 60}-minute runs (anonymously) on the best-maps site",
-                       variable=sharing, bg=BG, fg=FG, selectcolor=FIELD, activebackground=BG,
-                       activeforeground=FG, font=self.fonts["text"]).pack(side="left")
-        tk.Button(share_line, text="Open it", command=self.open_best_maps, bg=BG,
-                  fg=ACCENT_SOFT, activebackground=BG, activeforeground=ACCENT, relief="flat", bd=0,
-                  cursor="hand2", font=self.fonts["link"]).pack(side="left", padx=(4, 0))
+        self._switch(body, f"Share my {RUN_SECONDS // 60}-minute runs, anonymously", sharing).pack(anchor="w", pady=(px(6), 0))
+        tk.Label(body, text="They feed the best-maps site. Your notes and log never leave this PC.", wraplength=wrap,
+                 justify="left", **dim).pack(anchor="w", pady=(px(4), 0))
+        health_on = self._health_on = tk.BooleanVar(value=self.cfg.get("share_health") is True)
+        self._switch(body, "Send daily health reports", health_on).pack(anchor="w", pady=(px(6), 0))
+        tk.Label(body, text="A short anonymous summary of how well the overlay reads your game, so problems get "
+                            "fixed. Numbers only: no names, chat, maps or pictures.", wraplength=wrap,
+                 justify="left", **dim).pack(anchor="w", pady=(px(4), 0))
 
         def apply(*_):
             try:
@@ -3005,71 +4972,176 @@ class App:
                 seconds = 0
             if 1 <= seconds <= 3600:
                 self.cfg["gap_seconds"] = self.autolog.gap = self.session.gap = seconds
-            self.cfg["transparency"] = int(transparency.get())
+            self.cfg["transparency"] = min(MAX_TRANSPARENCY, max(0, int(float(transparency.get()))))
             self.cfg["topmost"] = bool(topmost.get())
             self.cfg["check_updates"] = bool(updates.get())
+            self.cfg["potions_on"] = bool(potions_on.get())
             if bool(sharing.get()) != bool(self.cfg.get("share_runs")):
                 self.cfg["share_runs"] = bool(sharing.get())
                 self.share_runs()
+            if bool(health_on.get()) != (self.cfg.get("share_health") is True):
+                self.cfg["share_health"] = bool(health_on.get())
             self._apply_window_settings()
             w.attributes("-topmost", self.cfg["topmost"])
             scale = int(size.get().rstrip("%"))
             if scale in UI_SCALES and scale != self.cfg["ui_scale"]:
                 self.cfg["ui_scale"] = scale
                 self._apply_ui_scale()
+                self.root.after(60, self._reopen_settings)        # (drawn again at the new size)
             save_config(self.cfg)
 
-        for var in (gap, transparency, topmost, updates, sharing, size):
+        for var in (gap, transparency, topmost, updates, sharing, health_on, size, potions_on):
             var.trace_add("write", apply)
-        self._hotkey_settings(w, row=8)
-        buttons = tk.Frame(w, bg=BG)
-        buttons.grid(row=9, column=0, sticky="we", padx=14, pady=(14, 6))
-        style = dict(bg=FIELD, fg=FG, activebackground="#3a3f49", activeforeground=FG, relief="flat",
-                     padx=12, pady=3, font=self.fonts["text"])
-        tk.Button(buttons, text="Open data folder", command=self.open_data_folder, **style).pack(side="left")
-        tk.Button(buttons, text="Check for updates", command=lambda: self.check_updates(manual=True),
-                  **style).pack(side="left", padx=(6, 0))
-        tk.Button(buttons, text="Report a bug", command=lambda: self.report_bug(w),
-                  **style).pack(side="left", padx=(6, 0))
-        tk.Button(buttons, text="Close", command=w.destroy, **style).pack(side="right", padx=(6, 0))
-        tk.Label(w, text=f"Your log and settings are saved in {DATA_DIR}", bg=BG, fg=DIM,
-                 font=self.fonts["small"], wraplength=int(250 * self._px_per_pt), justify="left").grid(
-            row=10, column=0, sticky="w", padx=14)
-        tk.Label(w, text=f"{WINDOW_TITLE} v{VERSION}. This is a beta: it's still being improved.",
-                 bg=BG, fg=DIM, font=self.fonts["small"]).grid(row=11, column=0, sticky="w", padx=14, pady=(2, 12))
+        self._hotkey_settings(body)
+        buttons = tk.Frame(body, bg=BG)
+        buttons.pack(fill="x", pady=(px(22), px(4)))
+        Button(buttons, th, text="Close", kind="primary", width=96, height=38, radius=11, size=12,
+               command=w.destroy, bg=BG).pack(side="right")
+        Button(buttons, th, text="Data folder", kind="secondary", width=104, height=38, radius=11, size=12,
+               command=self.open_data_folder, bg=BG).pack(side="left")
+        Button(buttons, th, text="Check for updates", kind="secondary", width=146, height=38, radius=11, size=12,
+               command=lambda: self.check_updates(manual=True), bg=BG).pack(side="left", padx=(px(8), 0))
+        Button(buttons, th, text="Report a bug", kind="secondary", width=116, height=38, radius=11, size=12,
+               command=lambda: self.report_bug(w), bg=BG).pack(side="left", padx=(px(8), 0))
+        more = tk.Frame(body, bg=BG)
+        more.pack(fill="x", pady=(px(8), 0))
+        Button(more, th, text="What's new", kind="secondary", width=116, height=38, radius=11, size=12,
+               command=self.show_whats_new, bg=BG).pack(side="left")
+        tk.Label(body, text=f"Your log, notes and settings are saved in {DATA_DIR}", wraplength=wrap, justify="left",
+                 bg=BG, fg=FAINT, font=th.font("regular", 10)).pack(anchor="w", pady=(px(8), 0))
+        tk.Label(body, text=f"{WINDOW_TITLE} v{VERSION}. This is a beta: it's still being improved.", bg=BG, fg=FAINT,
+                 font=th.font("regular", 10)).pack(anchor="w", pady=(px(2), 0))
 
-    def _hotkey_settings(self, w, row):
+    def open_potion_prices(self):
+        """One price per item the bar can show, over the shipped one. Clear a box for the default."""
+        if self.prices_win and self.prices_win.winfo_exists():
+            self.prices_win.lift()
+            return
+        table = self._potion_table()
+        if not table:
+            return
+        th = self.theme
+        px = th.px
+        w = self.prices_win = tk.Toplevel(self.root)
+        w.title("Potion prices")
+        w.configure(bg=BG)
+        w.transient(self.settings_win if self.settings_win and self.settings_win.winfo_exists() else self.root)
+        w.attributes("-topmost", bool(self.cfg["topmost"]))
+        for delay in (0, 150, 800):
+            w.after(delay, lambda: PLATFORM.style_window(w, INK, TEXT_DIM) if w.winfo_exists() else None)
+        tk.Label(w, text="Mesos each. Leave a box empty to use the shown price; 0 means free.", bg=BG, fg=DIM,
+                 font=th.font("regular", 11)).pack(anchor="w", padx=px(20), pady=(px(16), px(8)))
+        holder = tk.Frame(w, bg=BG)
+        holder.pack(fill="both", expand=True, padx=px(20))
+        canvas = tk.Canvas(holder, bg=BG, highlightthickness=0, width=px(380), height=px(420))
+        bar = tk.Scrollbar(holder, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=bar.set)
+        bar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        rows = tk.Frame(canvas, bg=BG)
+        canvas.create_window((0, 0), window=rows, anchor="nw")
+        rows.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind_all("<MouseWheel>", lambda e: canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
+        w.bind("<Destroy>", lambda e: canvas.unbind_all("<MouseWheel>") if e.widget is w else None)
+        self._price_vars = {}
+        for item in table.prices.values():
+            if item.get("kind") != "consumable":
+                continue
+            name = item["name"]
+            row = tk.Frame(rows, bg=BG)
+            row.pack(fill="x", pady=px(2))
+            tk.Label(row, text=name, bg=BG, fg=FG, font=th.font("regular", 11), anchor="w", width=24).pack(side="left")
+            default = "no NPC" if item.get("unpriced") else f"{item['price']:,}"
+            own = self.cfg["potion_prices"].get(name)
+            var = tk.StringVar(value="" if own is None else str(own))
+            tk.Entry(row, textvariable=var, width=8, justify="right", relief="flat", bg=INK, fg=FG,
+                     insertbackground=FG, font=th.font("regular", 11)).pack(side="right")
+            tk.Label(row, text=default, bg=BG, fg=DIM, font=th.font("regular", 11), width=8, anchor="e").pack(side="right")
+            var.trace_add("write", lambda *_, n=name, v=var: self._set_price(n, v.get()))
+            self._price_vars[name] = var
+        Button(w, th, text="Close", kind="primary", width=96, height=38, radius=11, size=12,
+               command=w.destroy, bg=BG).pack(side="right", padx=px(20), pady=px(14))
+
+    def _set_price(self, name, text):
+        """A price typed in the prices window: whole mesos, or empty for the default."""
+        text = text.replace(",", "").strip()
+        if text.isascii() and text.isdigit() and len(text) <= 10:
+            self.cfg["potion_prices"][name] = int(text)
+        elif not text:
+            self.cfg["potion_prices"].pop(name, None)
+        else:
+            return                                          # not a number (yet): leave what's saved
+        save_config(self.cfg)
+
+    def _reopen_settings(self):
+        """After a size change: Settings again, in the same place, drawn for the new size."""
+        old = self.settings_win
+        if old and old.winfo_exists():
+            where = f"+{old.winfo_x()}+{old.winfo_y()}"
+            old.destroy()
+            self.open_settings()
+            self.settings_win.geometry(where)
+
+    def _hotkey_settings(self, body):
         """Settings' Hotkeys section: on or off, and each one changeable (click it, then press
         the keys; Esc keeps it as it was, Backspace turns it off)."""
-        box = tk.Frame(w, bg=BG)
-        box.grid(row=row, column=0, sticky="w", padx=10, pady=(10, 0))
+        th, w = self.theme, body.winfo_toplevel()
+        px = th.px
+        self._section(body, "Hotkeys")
+        box = tk.Frame(body, bg=BG)
+        box.pack(anchor="w", fill="x")
         if not self.hotkeys.supported:
             tk.Label(box, text=f"Hotkeys aren't available on {PLATFORM.name} yet: use the buttons.",
-                     bg=BG, fg=DIM, font=self.fonts["text"]).grid(row=0, column=0, sticky="w")
+                     bg=BG, fg=DIM, font=th.font("regular", 11)).pack(anchor="w")
             return
         on = tk.BooleanVar(value=self.cfg["hotkeys_on"])
-        tk.Checkbutton(box, text="Hotkeys, while MapleStory or the overlay is in front:", variable=on, bg=BG,
-                       fg=FG, selectcolor=FIELD, activebackground=BG, activeforeground=FG,
-                       font=self.fonts["text"]).grid(row=0, column=0, columnspan=3, sticky="w")
-        key_style = dict(bg=FIELD, fg=FG, activebackground="#3a3f49", activeforeground=FG, relief="flat", bd=0,
-                         padx=8, pady=1, width=10, font=self.fonts["text"], cursor="hand2")
+        self._switch(box, "Hotkeys, while MapleStory or the overlay is in front", on).pack(anchor="w", pady=(0, px(8)))
+        grid = tk.Frame(box, bg=BG)
+        grid.pack(anchor="w", padx=(px(2), 0))
         buttons, notes, choosing = {}, {}, {"action": None}
-        hint = tk.StringVar(value="Click one, then press the keys you want. Backspace turns it off.")
+        idle_hint = "Click one, then press the keys you want. Backspace turns it off."
+        hint = tk.StringVar(value=idle_hint)
 
         def show():
             for action, b in buttons.items():
                 key = self.cfg["hotkeys"][action]
-                b.config(text=key or "Off", bg=FIELD, fg=FG if key else DIM)
+                if action == choosing["action"]:
+                    b.set(text="Press keys...", kind="primary")
+                else:
+                    b.set(text=key or "Off", kind="secondary" if key else "ghost")
                 notes[action].config(text=self.hotkeys.problems.get(action, ""))
 
+        def stop():
+            """Nobody is waiting for keys: hotkeys work again, every button shows its key."""
+            choosing["action"] = None
+            hint.set(idle_hint)
+            self.hotkeys.pause(False)
+            show()
+
+        def watch():
+            """Clicking away from Settings (into the game, say) ends the wait, so the hotkeys never stay off."""
+            if choosing["action"] and w.winfo_exists():
+                if w.focus_displayof() is None:
+                    stop()
+                else:
+                    w.after(400, watch)
+
         def choose(action):
-            choosing["action"] = action
+            if choosing["action"] == action:         # clicking the waiting one again cancels it
+                stop()
+                return
+            first = choosing["action"] is None
+            choosing["action"] = action              # (one at a time: another that was waiting goes back to its key)
             self.hotkeys.pause(True)                 # so the keys reach this window
-            buttons[action].config(text="Press keys...", bg=ACCENT_SOFT, fg=BG)
+            hint.set(f"Press the keys for {HOTKEY_ACTIONS[action]}. Click it again or press Esc to cancel.")
+            show()
             w.focus_force()
+            if first:
+                w.after(400, watch)
 
         def done(action, key):
             choosing["action"] = None
+            hint.set(idle_hint)
             if key:
                 for other, k in self.cfg["hotkeys"].items():
                     if k == key and other != action:
@@ -3094,23 +5166,25 @@ class App:
                 if not key:
                     hint.set("Use Ctrl, Alt or Shift with a number or letter, or an F key.")
                     return "break"
-                hint.set("Click one, then press the keys you want. Backspace turns it off.")
                 done(action, key)
             return "break"
 
-        for i, (action, name) in enumerate(HOTKEY_ACTIONS.items(), start=1):
-            tk.Label(box, text=name, bg=BG, fg=FG, font=self.fonts["text"]).grid(row=i, column=0, sticky="w",
-                                                                                  padx=(26, 10), pady=1)
-            buttons[action] = tk.Button(box, command=lambda a=action: choose(a), **key_style)
-            buttons[action].grid(row=i, column=1, sticky="w", pady=1)
-            notes[action] = tk.Label(box, bg=BG, fg="#d97a6c", font=self.fonts["small"])
-            notes[action].grid(row=i, column=2, sticky="w", padx=(8, 0))
-        tk.Label(box, textvariable=hint, bg=BG, fg=DIM, font=self.fonts["small"]).grid(
-            row=len(HOTKEY_ACTIONS) + 1, column=0, columnspan=3, sticky="w", padx=(26, 0), pady=(2, 0))
+        for i, (action, name) in enumerate(HOTKEY_ACTIONS.items()):
+            tk.Label(grid, text=name, bg=BG, fg=FG, font=th.font("regular", 12), width=14, anchor="w").grid(
+                row=i, column=0, sticky="w", pady=px(3))
+            buttons[action] = Button(grid, th, text="", kind="secondary", width=124, height=34, radius=10, size=12,
+                                     command=lambda a=action: choose(a), bg=BG)
+            buttons[action].grid(row=i, column=1, sticky="w", pady=px(3))
+            notes[action] = tk.Label(grid, bg=BG, fg="#ff8a7a", font=th.font("regular", 10))
+            notes[action].grid(row=i, column=2, sticky="w", padx=(px(8), 0))
+        tk.Label(box, textvariable=hint, bg=BG, fg=FAINT, font=th.font("regular", 10)).pack(anchor="w", pady=(px(6), 0))
         w.bind("<KeyPress>", pressed)
         w.bind("<Destroy>", lambda e: e.widget is w and self.hotkeys.pause(False))
+        self._hotkey_ui = {"buttons": buttons, "choose": choose, "choosing": choosing, "pressed": pressed, "on": on}   # (tests)
 
         def switch(*_):
+            if choosing["action"]:
+                stop()
             self.cfg["hotkeys_on"] = bool(on.get())
             save_config(self.cfg)
             self.hotkeys.set(self.cfg["hotkeys"], self.cfg["hotkeys_on"])
@@ -3145,15 +5219,27 @@ class App:
 
     # ---- background capture loop
     def _worker(self):
-        with mss.mss() as sct:
-            while not self.stop_evt.is_set():
-                t0 = time.monotonic()
-                try:
-                    self.q.put(("reading", self.reader.read(sct)))
-                except Exception as e:
-                    log_error("reading the screen", e)
-                    self.q.put(("error", f"{type(e).__name__}: {e}"))
-                self.stop_evt.wait(max(0.1, POLL_SECONDS - (time.monotonic() - t0)))
+        while not self.stop_evt.is_set():
+            try:
+                with mss.mss() as sct:
+                    capture = ScreenCapture(sct)
+                    while not self.stop_evt.is_set():
+                        t0 = time.monotonic()
+                        try:
+                            reading = self.reader.read(capture)
+                            self.q.put(("reading", reading._replace(ms=(time.monotonic() - t0) * 1000)))
+                            self.health.finished(t0)
+                        except Exception as e:
+                            log_error("reading the screen", e)
+                            self.health.failed(e)
+                            self.q.put(("error", f"{type(e).__name__}: {e}"))
+                        self.stop_evt.wait(max(0.1, POLL_SECONDS - (time.monotonic() - t0)))
+            except Exception as e:                  # (the screen couldn't be opened, or something outside a look broke:
+                log_error("starting to read the screen", e)         # never the end of the reading, try again)
+                self.health.failed(e)
+                self.q.put(("error", f"{type(e).__name__}: {e}"))
+                self.stop_evt.wait(WORKER_RETRY_SECONDS)
+        self.health.alive = False
 
     # ---- sharing runs
     def open_best_maps(self):
@@ -3161,9 +5247,154 @@ class App:
         ask = {k: v for k, v in (("level", self.level), ("party", self.party), ("job", self.job)) if v}
         webbrowser.open(STATS_SITE + ("/?" + urllib.parse.urlencode(ask) if ask else ""))
 
+    def _first_run(self):
+        """Once per install or update: a new install picks its compact shape, an update shows what's new. The
+        sharing question comes after."""
+        seen = self.cfg.get("seen_version", "")
+        newer = not seen or version_key(VERSION) > version_key(seen)
+        if newer:
+            self.cfg["seen_version"] = VERSION                 # (first, so a crash in a window can't repeat it)
+            save_config(self.cfg)
+        if self._fresh and newer:
+            self._shape_picker(self._ask_to_share)
+        elif newer and WHATS_NEW.get(VERSION):
+            self._whats_new(WHATS_NEW[VERSION], self._ask_to_share)
+        else:
+            self._ask_to_share()
+
+    def _small_window(self, title, then):
+        """A window for the one-time messages: like the other dialogs, and `then` runs when it closes."""
+        th = self.theme
+        w = tk.Toplevel(self.root)
+        w.title(title)
+        w.configure(bg=BG, padx=th.px(26), pady=th.px(22))
+        w.resizable(False, False)
+        w.transient(self.root)
+        w.attributes("-topmost", bool(self.cfg["topmost"]))
+        for delay in (0, 150, 800):
+            w.after(delay, lambda: PLATFORM.style_window(w, INK, TEXT_DIM) if w.winfo_exists() else None)
+        w.bind("<Destroy>", lambda e: then and e.widget is w and self.root.after(100, then))
+        return w
+
+    def _shape_photo(self, shape, width):
+        """The picture of a compact shape in the picker (assets/shape_<name>.png), `width` logical pixels wide."""
+        try:
+            img = Image.open(ASSETS / f"shape_{shape}.png").convert("RGBA")
+            w = self.theme.px(width)
+            return ImageTk.PhotoImage(img.resize((w, max(1, round(img.height * w / img.width))), Image.LANCZOS), master=self.root)
+        except Exception:
+            return None
+
+    def _shape_picker(self, then):
+        """A new install chooses how compact mode looks. Closing the window keeps Square."""
+        th = self.theme
+        w = self._small_window("Choose a compact look", then)
+        tk.Label(w, text="Pick a compact look", bg=BG, fg=ACCENT, font=th.font("extra", 20)).pack(anchor="w")
+        tk.Label(w, text="Compact mode is the small version of the overlay (the compact icon, or Shift+4). "
+                         "Choose how it looks. You can change it any time in Settings.", bg=BG, fg=DIM,
+                 font=th.font("regular", 12), wraplength=th.px(500), justify="left").pack(anchor="w", pady=(2, th.px(14)))
+        widths = {"square": 150, "wide": 250, "bar": 300}
+
+        def choose(shape):
+            self.set_shape(shape)
+            w.destroy()
+        for shape in SHAPES:
+            card = tk.Frame(w, bg=LIST_BG, highlightthickness=1, highlightbackground=LINE)
+            card.pack(fill="x", pady=(0, th.px(10)))
+            photo = self._shape_photo(shape, widths[shape])
+            if photo:
+                pic = tk.Label(card, image=photo, bg=LIST_BG, cursor="hand2")
+                pic.image = photo
+                pic.pack(side="left", padx=th.px(12), pady=th.px(12))
+                pic.bind("<Button-1>", lambda e, s=shape: choose(s))
+            side = tk.Frame(card, bg=LIST_BG)
+            side.pack(side="left", fill="both", expand=True, padx=(0, th.px(12)), pady=th.px(12))
+            tk.Label(side, text=SHAPE_LABELS[shape], bg=LIST_BG, fg=FG, font=th.font("bold", 14)).pack(anchor="w")
+            tk.Label(side, text=SHAPE_BLURBS[shape], bg=LIST_BG, fg=DIM, font=th.font("regular", 11),
+                     wraplength=th.px(190), justify="left").pack(anchor="w", pady=(2, th.px(8)))
+            Button(side, th, text=f"Use {SHAPE_LABELS[shape]}", kind="primary" if shape == "square" else "secondary",
+                   width=120, height=34, radius=10, size=12, command=lambda s=shape: choose(s), bg=LIST_BG).pack(anchor="w")
+        w.update_idletasks()
+
+    def show_whats_new(self):
+        """Settings > What's new: this version's notes again (they are otherwise shown once, after an update)."""
+        self._whats_new(WHATS_NEW.get(VERSION) or ("Nothing new to show for this version.",), None)
+
+    def _note_photo(self, name, width):
+        """A picture from assets/ for the What's new window, `width` logical pixels wide (None if it can't be read)."""
+        try:
+            img = Image.open(ASSETS / name).convert("RGBA")
+            w = self.theme.px(width)
+            return ImageTk.PhotoImage(img.resize((w, max(1, round(img.height * w / img.width))), Image.LANCZOS),
+                                      master=self.root)
+        except Exception:
+            return None
+
+    def _whats_new(self, notes, then):
+        """After an update: a few plain lines on what changed, in one or more pages (see WHATS_NEW).
+        Shown once per version."""
+        th = self.theme
+        pages = notes if notes and not isinstance(notes[0], str) else ((None, None, tuple(notes)),)
+        w = self._small_window("What's new", then)
+        body = tk.Frame(w, bg=BG)
+        body.pack(anchor="w")
+        w._pictures = []                                  # (kept, or tk drops them)
+
+        def show(n, size=0):
+            """Page n, its pictures at the first width in PICTURE_WIDTHS (then smaller, and finally none)
+            if the page would be taller than the screen."""
+            for child in body.winfo_children():
+                child.destroy()
+            w._pictures.clear()
+            pic_width = PICTURE_WIDTHS[size]
+            title, sub, items = pages[n]
+            tk.Label(body, text=title or f"What's new in v{VERSION.split('-')[0]}", bg=BG, fg=ACCENT,
+                     font=th.font("extra", 20)).pack(anchor="w")
+            tk.Label(body, text=sub or "Thanks for updating. Your log, notes and settings are kept.", bg=BG, fg=DIM,
+                     font=th.font("regular", 12)).pack(anchor="w", pady=(2, th.px(12)))
+            for item in items:
+                kind, text = ("dot", item) if isinstance(item, str) else item[:2]
+                if kind == "head":
+                    tk.Label(body, text=text, bg=BG, fg=FG, font=th.font("bold", 14)).pack(anchor="w", pady=(th.px(4), th.px(4)))
+                elif kind == "pic":
+                    photo = self._note_photo(text, pic_width) if pic_width else None
+                    if photo:
+                        w._pictures.append(photo)
+                        tk.Label(body, image=photo, bg=BG).pack(anchor="w", pady=(0, th.px(8)))
+                else:
+                    row = tk.Frame(body, bg=BG)
+                    row.pack(fill="x", pady=(0, th.px(6)))
+                    tk.Label(row, text="\u2022", bg=BG, fg=ACCENT, font=th.font("bold", 12)).pack(side="left", anchor="n")
+                    tk.Label(row, text=text, bg=BG, fg=FG, font=th.font("regular", 12), wraplength=th.px(430),
+                             justify="left").pack(side="left", padx=(th.px(8), 0))
+            last = n == len(pages) - 1
+            Button(body, th, text="Got it" if last else "Next", kind="primary", width=110, height=40, radius=12, size=13,
+                   command=w.destroy if last else lambda: show(n + 1), bg=BG).pack(anchor="e", pady=(th.px(10), 0))
+            w.update_idletasks()
+            if w.winfo_reqheight() > w.winfo_screenheight() - th.px(80) and size < len(PICTURE_WIDTHS) - 1:
+                show(n, size + 1)
+        show(0)
+
     def _ask_to_share(self):
-        if "share_runs" in self.cfg:
+        if "share_runs" not in self.cfg:
+            self._ask_run_sharing()
+        self._ask_health()
+
+    def _ask_health(self):
+        """Once: may the overlay send a short anonymous summary of how well it reads the game each day?"""
+        if "share_health" in self.cfg:
             return
+        yes = messagebox.askyesno(
+            "Help make the overlay more reliable?",
+            "Once a day, send a short anonymous summary of how well the overlay is reading your game "
+            "(for example how often it found the EXP bar, your game's window size and the overlay's "
+            "version), so problems can be fixed even when nobody reports them.\n\n"
+            "Never your character's name, chat, maps, pictures or your log. You can change this any "
+            "time in Settings.", parent=self.root)
+        self.cfg["share_health"] = bool(yes)
+        save_config(self.cfg)
+
+    def _ask_run_sharing(self):
         yes = messagebox.askyesno(
             "Help other players pick maps?",
             "Share your farming, so everyone can see which maps give the most EXP for their "
@@ -3193,6 +5424,78 @@ class App:
                 self.q.put(("shared", None))           # offline or the site is down: later
         threading.Thread(target=work, daemon=True).start()
 
+    # ---- health reports (healthlog.py): numbers only, once a day, only if the player said yes
+    def _count_health(self, r, now):
+        """Counts one look in today's health record. Runs on the main thread, once per Reading, so the
+        categories always add up to the number of looks."""
+        try:
+            last, self._health_at = self._health_at, now
+            rect, gh = self.reader.last_rect, self.reader.gh
+            game = None
+            if rect and gh:
+                game = (rect[2], rect[3], any(rect[2] == w and rect[3] == h for w, h, _ in self._health_monitors), gh)
+            self.healthlog.look(healthlog.kind_of(r), r.percent_only, r.tries, r.ms,
+                                (now - last) if last is not None and self.tracker.running else 0.0, game, r.shadow)
+        except Exception as e:                      # (counting must never keep a reading from being handled)
+            log_error("counting a look for the health report", e)
+
+    def _health_snapshot(self):
+        """What the setup is like today (recorded while the game is there, not when the report is sent)."""
+        screens = []
+        try:
+            with mss.mss() as sct:
+                for m in sct.monitors[1:5]:
+                    dpi = PLATFORM.screen_dpi(m["left"] + m["width"] // 2, m["top"] + m["height"] // 2)
+                    scale = round(dpi / 96 * 100) if dpi else None
+                    screens.append((m["width"], m["height"], scale if scale and 50 <= scale <= 500 else None))
+        except Exception as e:
+            log_error("listing the screens for the health report", e)
+        self._health_monitors = screens
+        capture = self.reader.capture.name
+        self.healthlog.snapshot(VERSION, PLATFORM.version(), screens,
+                                "region" if self.reader.mode == "region" else capture if capture == "window" else "screen",
+                                tesseract_state)
+
+    def _health_tick(self):
+        """Called a few times a second from the refresh: keeps the record up to date and saved, and sends a
+        finished day when it is time (at most one a hour, even across restarts)."""
+        now = time.monotonic()
+        if now >= self._health_snap_at:
+            self._health_snap_at = now + healthlog.SAVE_EVERY
+            self._health_snapshot()
+        try:
+            seen = dict(self.reader.error_types)
+        except RuntimeError:                            # (the reading thread changed it just then: next time)
+            seen = self._health_errors
+        self.healthlog.errors({k: n - self._health_errors.get(k, 0) for k, n in seen.items()})
+        self._health_errors = seen
+        self.healthlog.save(force=False)
+        if self.cfg.get("share_health") is not True or self._health_sending or sharing_blocked():
+            return
+        if healthlog.ensure_id(self.cfg):
+            save_config(self.cfg)
+        due = self.healthlog.due(self.cfg["health_id"])
+        if due is None:
+            return
+        day, body = due
+        self._health_sending = True
+        self.healthlog.attempting()
+
+        def work():
+            try:
+                self.q.put(("health_sent", (day,) + post_health(body)))
+            except Exception:
+                self.q.put(("health_sent", (day, "later", "")))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _health_done(self, day, outcome, detail):
+        self._health_sending = False
+        if outcome == "bad":
+            log_error(f"the site refused the health report for {day}", ValueError(detail or "unknown field"))
+        elif outcome == "big":
+            log_error(f"the site refused the health report for {day}", ValueError("too large"))
+        self.healthlog.finish(day, outcome)
+
     # ---- updates
     def check_updates(self, manual=False):
         """Asks GitHub for a newer version in the background; the answer comes via _pump."""
@@ -3220,20 +5523,22 @@ class App:
             return
         w = tk.Toplevel(self.root)
         w.title("Update available")
-        w.configure(bg=BG, padx=16, pady=14)
+        w.configure(bg=BG, padx=self.theme.px(26), pady=self.theme.px(22))
         w.resizable(False, False)
         w.transient(self.root)
         w.attributes("-topmost", bool(self.cfg["topmost"]))
-        tk.Label(w, text=f"{WINDOW_TITLE} v{version} is out", bg=BG, fg=ACCENT,
-                 font=self.fonts["title"]).pack(anchor="w")
-        tk.Label(w, text=f"You have v{VERSION}. Your log and settings are kept when you update.",
-                 bg=BG, fg=DIM, font=self.fonts["text"]).pack(anchor="w", pady=(2, 10))
-        tk.Label(w, text="What's new:", bg=BG, fg=FG, font=self.fonts["text"]).pack(anchor="w")
-        box = tk.Frame(w, bg=BG)
-        box.pack(fill="both", expand=True, pady=(4, 12))
-        text = tk.Text(box, width=64, height=12, wrap="word", bg=LIST_BG, fg=FG, relief="flat",
-                       font=self.fonts["text"], padx=8, pady=6, highlightthickness=0)
-        scroll = tk.Scrollbar(box, command=text.yview)
+        for delay in (0, 150, 800):
+            w.after(delay, lambda: PLATFORM.style_window(w, INK, TEXT_DIM) if w.winfo_exists() else None)
+        th = self.theme
+        tk.Label(w, text=f"v{version} is out", bg=BG, fg=ACCENT, font=th.font("extra", 20)).pack(anchor="w")
+        tk.Label(w, text=f"You have v{VERSION}. Your log, notes and settings are kept when you update.",
+                 bg=BG, fg=DIM, font=th.font("regular", 12)).pack(anchor="w", pady=(2, th.px(14)))
+        tk.Label(w, text="WHAT'S NEW", bg=BG, fg=DIM, font=th.font("semibold", 10)).pack(anchor="w", pady=(0, th.px(6)))
+        box = tk.Frame(w, bg=LIST_BG, highlightthickness=1, highlightbackground=LINE)
+        box.pack(fill="both", expand=True, pady=(0, th.px(16)))
+        text = tk.Text(box, width=62, height=12, wrap="word", bg=LIST_BG, fg=FG, relief="flat",
+                       font=th.font("regular", 12), padx=th.px(12), pady=th.px(10), highlightthickness=0)
+        scroll = ttk.Scrollbar(box, command=text.yview, style="Dark.Vertical.TScrollbar")
         text.configure(yscrollcommand=scroll.set)
         text.insert("1.0", notes or "(No details were given for this version.)")
         text.configure(state="disabled")
@@ -3241,8 +5546,6 @@ class App:
         scroll.pack(side="right", fill="y")
         buttons = tk.Frame(w, bg=BG)
         buttons.pack(fill="x")
-        style = dict(bg=FIELD, fg=FG, activebackground="#3a3f49", activeforeground=FG, relief="flat",
-                     padx=12, pady=3, font=self.fonts["text"])
 
         def get_it():
             webbrowser.open(RELEASES_PAGE)                # always your own releases page
@@ -3252,10 +5555,12 @@ class App:
             self.cfg["skip_version"] = version
             save_config(self.cfg)
             w.destroy()
-        tk.Button(buttons, text="Get the update", command=get_it, **{**style, "bg": ACCENT_SOFT, "fg": BG,
-                  "activebackground": ACCENT, "activeforeground": BG}).pack(side="left")
-        tk.Button(buttons, text="Not now", command=w.destroy, **style).pack(side="left", padx=(6, 0))
-        tk.Button(buttons, text="Skip this version", command=skip, **style).pack(side="right")
+        Button(buttons, th, text="Get the update", kind="primary", width=140, height=40, radius=12, size=13,
+               command=get_it, bg=BG).pack(side="left")
+        Button(buttons, th, text="Not now", kind="secondary", width=96, height=40, radius=12, size=12,
+               command=w.destroy, bg=BG).pack(side="left", padx=(th.px(8), 0))
+        Button(buttons, th, text="Skip this version", kind="ghost", width=140, height=40, radius=12, size=12,
+               command=skip, bg=BG).pack(side="right")
 
     def _oops(self, what, exc):
         """Something unexpected went wrong: note it in errors.log and keep going."""
@@ -3268,6 +5573,8 @@ class App:
             while True:
                 kind, payload = self.q.get_nowait()
                 if kind == "error":
+                    self.healthlog.errors({payload.split(":")[0].strip(): 1})      # (the type's name, never the message)
+                    self.recent.add(f"Error reading the screen: {payload}")
                     self.status.set("Something went wrong reading the screen. Trying again... "
                                     "(details are in errors.log: Settings > Open data folder)")
                 elif kind == "update":
@@ -3278,6 +5585,10 @@ class App:
                     self._sharing = False
                     if payload:
                         self.autolog.mark_shared(payload)
+                elif kind == "health_sent":
+                    self._health_done(*payload)
+                elif kind == "report_sent":
+                    self._report_done(*payload)
                 else:
                     self._handle(payload)
         except queue.Empty:
@@ -3290,6 +5601,7 @@ class App:
 
     def _handle(self, r):
         t, now = self.tracker, time.monotonic()
+        self._count_health(r, now)
         if r.image is not None:
             self.last_capture = r
         if r.mesos_image is not None:
@@ -3298,6 +5610,20 @@ class App:
             self.cfg["mesos_box"] = list(r.mesos_at)
             self.reader.saved_mesos = tuple(r.mesos_at)
             save_config(self.cfg)
+        if r.v2_at:                                     # ...and where reader v2 found the EXP bar
+            key, box = r.v2_at
+            spots = {k: v for k, v in (self.cfg.get("exp_v2_spots") or {}).items() if k != key}
+            spots[key] = list(box)
+            self.cfg["exp_v2_spots"] = dict(list(spots.items())[-V2_SPOTS_MAX:])
+            self.reader.saved_v2 = dict(self.cfg["exp_v2_spots"])
+            save_config(self.cfg)
+        if r.bar is not None:
+            self.potion_bar = r.bar
+            if self.cfg["potions_on"]:
+                self.session.look_at_bar(r.bar)
+            else:
+                self.session.potions.pause()            # (switched on again later: nothing used meanwhile counts)
+        self.meso.set_window(r.window, now)             # mesos moved at these windows aren't earned
         if r.mesos is not None:
             self.meso.observe(r.mesos, now, t.elapsed(), t.running)
         if r.party is not None:                         # believe a new party size once seen twice
@@ -3315,13 +5641,28 @@ class App:
             waiting = self.session.waiting
             self.session.map_seen(self.map_name)
             self._after_pause_check(waiting)
+        self.in_town = is_town(self.map_name)
+        hidden = self._name_hidden()
+        if hidden != self.map_hidden:
+            self.map_hidden = hidden
+            if not hidden:
+                self.map_back_at = now          # (says "back" for a few seconds)
+        if (self.session.on and self.map_name and self.reader.mode == "window" and tesseract_ok
+                and self.reader.map_blind_seconds() > MAP_BLIND_SECONDS):
+            self.session.map_blind()
         self.note = r.note
         if r.candidates:
             if self.found_at is None or t.req is not None:
                 self.found_at = now
             before = t.gained
-            ok, note = self.session.observe(r.candidates, r.confident, now)
-            self.rejected = 0 if ok else self.rejected + 1
+            if r.percent_only:
+                ok, note = self._observe_percent(r, now)
+            else:
+                ok, note = self.session.observe(r.candidates, r.confident, now)
+                self.level_wait, self.pct_note = False, ""
+                self._char_print = self.reader.name_print if self.reader.name_print is not None else self._char_print
+            waiting = r.percent_only and self.pct_note.startswith(PCT_WAIT_NOTES)    # (a %-only bar waiting for its level isn't misread)
+            self.rejected = 0 if ok or self.level_wait or waiting else self.rejected + 1
             if self.rejected >= 10:                 # keeps not adding up: find the EXP bar again
                 self.reader.box, self.rejected = None, 0
             if t.running and t.gained != before and not self.skip_log:
@@ -3335,11 +5676,107 @@ class App:
             status = self._status_for(note)
         else:
             status = r.where
+        if self.in_town:
+            status += "\nIn a town: nothing is logged here."
+        if self.map_hidden and self.tracker.running:
+            status += (f"\nCan't see the minimap's name. Still tracking; it pauses if this lasts "
+                       f"{MAP_BLIND_SECONDS} seconds.")
+        elif self.map_back_at and now - self.map_back_at < 6 and self.session.on:
+            status += "\nThe minimap's name is back."
         if self.note:
             status += f"\n{self.note}"
+        if r.percent_only and self.name_note:
+            status += f"\n{self.name_note}"
+        if self.autolog.settle(now, self.tracker.running, **self.meso.for_log()):
+            self.share_runs()                          # a finished run got its mesos (or went without)
+        stale = self.meso.stale_note(now, self.tracker.running)       # (always asked, it keeps its own time)
+        left_out = (self.autolog.alert(now, self.tracker.running) or self.meso.ignored_note(now) or stale
+                    or self._net(self.tracker.elapsed())[1])
+        if left_out:
+            status += f"\n{left_out}"
         self.status.set(status)
+        self.recent.add(status)
         self.level = level_for_req(t.req) or self.level
         self._log_tick(now)
+
+    def _observe_percent(self, r, now):
+        """A bar with only a %: the level comes from the badge (or the level known before, or typed in)."""
+        level, source = r.level or (None, None)
+        if self._check_character():
+            self.level_wait = True
+            return False, "another character"           # (this reading's level may be the other one's)
+        stale = self._stale_level
+        if stale and level is not None and level == stale[0] and time.monotonic() - stale[1] < STALE_LEVEL_SECONDS:
+            level, source = None, None                  # (read before the switch was seen: the old character's)
+        if level is None and self.tracker.req is not None and self.tracker.level_source is None and not self._same_char:
+            self.tracker.forget_level()                 # a level carried over from the number, but the character can't be told
+        had_level = self.tracker.req is not None
+        ok, note = self.session.observe_percent(r.candidates[0][1], level, source, now)
+        if had_level and self.tracker.req is None:
+            self.reader.forget_level()                  # (the tracker gave its level up: the badge's old one must not bring it back)
+        self.level_wait = note == "waiting to read your level"
+        self.pct_note = note
+        if note.startswith(("percentage wrapped", "level up?")):
+            self.reader.recheck_level()                 # it may have gone up: look at the badge now
+        return ok, note
+
+    def _check_character(self):
+        """Another character (its name row looks different) has its own level: start over for it. Only a
+        print that differs on two looks in a row counts. A name row partly covered is judged by what shows:
+        the parts that show matching = the same character (kept, but said), not matching = another one.
+        Nothing showing = can't tell: it says so. Returns True when it started over."""
+        cur = self.reader.name_print
+        if cur is None:
+            self._same_char = False
+            self.name_note = "The name under your character is covered, so it can't tell if it's the same character. Move what covers it."
+            return False
+        if cur is self._char_seen:
+            return False
+        self._char_seen = cur
+        self.name_note = ""
+        match = "same" if self._char_print is None else level_ocr.name_match(self._char_print, cur)
+        if match == "hidden":                        # (so little shows it can't tell: like a covered name, never a reset)
+            self._same_char = False
+            self.name_note = "Most of the name under your character is covered, so it can't tell if it's the same character. Move what covers it."
+            return False
+        if match in ("same", "alike"):
+            self._same_char = self._char_print is not None
+            self._char_print, self._char_diff = (cur if self._char_print is None else self._char_print), 0
+            if match == "alike":
+                self.name_note = "Part of the name is hidden. It still looks like the same character."
+            return False
+        self._same_char = False
+        self._char_diff += 1
+        if self._char_diff < 2:
+            return False
+        old_level = self.reader.level or level_for_req(self.tracker.req)
+        self.reset()
+        self._stale_level = (old_level, time.monotonic())   # (a reading already queued still carries it)
+        self._char_print = self._char_seen = cur          # (the new character is the one to compare with from now on)
+        self.other_char_at = time.monotonic()
+        return True
+
+    def _can_type_level(self):
+        """Typing the level in is offered only when it can help: a %-only bar, no level known, and
+        reading it from the badge keeps failing."""
+        t = self.tracker
+        return bool(t.req is None and self.level_wait and self.reader.level is None
+                    and self.reader.level_failures >= LEVEL_FAILS_FOR_FALLBACK)
+
+    def type_level(self, parent=None):
+        """Settings > Level fallback: the player types the level shown in the game. Session only."""
+        if not self._can_type_level():
+            messagebox.showinfo("Level fallback", "Not needed right now: the level is read from the game by itself.",
+                                parent=parent or self.root)
+            return
+        level = simpledialog.askinteger("Level fallback", "Your character's level, as the game shows it:",
+                                        parent=parent or self.root, minvalue=1, maxvalue=len(EXP_TABLE))
+        if level is None or not self._can_type_level():      # (cancelled, or the badge was read while it was open)
+            return
+        self.tracker.set_level(level, "typed")      # (nothing was counted without a level, so a session that runs carries on)
+        self.level_wait, self.pct_note = False, ""
+        self._char_print = self.reader.name_print
+        self.status.set(f"Using Lv {level} as you typed it. EXP is estimated from the % until the badge can be read.")
 
     def _status_for(self, note):
         """What the status line says while the EXP bar is being read (details: View capture)."""
@@ -3352,9 +5789,30 @@ class App:
             return f"You died and lost {t.last_loss:.1f}% EXP. That isn't taken off your EXP/hr."
         if self.rejected >= 5:
             return "Having trouble reading the EXP bar clearly. View capture shows what it sees."
+        if self.other_char_at and time.monotonic() - self.other_char_at < 8:
+            return "This looks like another character: starting over for it."
+        if self.level_wait and t.req is None:
+            if self.reader.mode == "region":
+                return ("Selected area: the level badge can't be read from here. "
+                        "Settings, Level fallback lets you type your level in.")
+            if self.reader.badge_covered:
+                return ("The EXP bar shows only a percentage, and a window is covering the level badge: move it"
+                        + (". Or Settings, Level fallback lets you type your level in." if self._can_type_level() else "."))
+            if self._can_type_level():
+                return ("The EXP bar shows only a percentage, and your level can't be read from the badge. "
+                        "Settings, Level fallback lets you type it in.")
+            return "The EXP bar shows only a percentage. Reading your level from the badge..."
+        if self.pct_note.startswith("level changed"):
+            return "Your level changed. Press Reset to start again on the new level."
+        if self.pct_note.startswith("level ") and "isn't supported" in self.pct_note:
+            return f"Can't estimate EXP: {self.pct_note}."
+        if self.pct_note.startswith("percentage wrapped"):
+            return "The percentage wrapped around. Looking at the level badge to see if you leveled up..."
+        if self.pct_note.startswith("level up?"):
+            return "Level up? Making sure from the level badge..."
         if t.req is None:
             # Normally the level is known within seconds; if not, it needs an EXP gain.
-            if time.monotonic() - self.found_at < 8:
+            if self.found_at is None or time.monotonic() - self.found_at < 8:
                 return "Found your EXP bar. Working out your level..."
             return "Found your EXP bar. Your level shows after your next EXP gain."
         s = self.session
@@ -3364,19 +5822,33 @@ class App:
         if s.waiting == "map":
             return ("Paused: you left the map. It carries on at your next EXP gain "
                     "(from zero if that's on a different map).")
+        if s.waiting == "blind":
+            return ("Paused: the minimap's name can't be seen, so it can't tell which map you're on. "
+                    "It carries on when the minimap is back.")
         if t.running:
-            return "Tracking your EXP. Not logging this run." if self.skip_log else "Tracking your EXP."
+            where = {"badge": "read from the badge", "typed": "typed by you"}.get(t.level_source, "known from before")
+            how = f" Estimated from the % (the bar shows no number; your level was {where})." if t.percent_mode else ""
+            return ("Tracking your EXP. Not logging this run." if self.skip_log else "Tracking your EXP.") + how
         if t.elapsed() > 0:
             return "Paused. Press Resume to carry on."
         return "Ready. Press Start when you begin farming."
 
+    def _name_hidden(self):
+        """True while tracking and the minimap's name hasn't been seen for a few seconds."""
+        return bool(self.session.on and self.map_name and self.reader.mode == "window" and tesseract_ok
+                    and self.reader.map_blind_seconds() > MAP_HIDDEN_SECONDS)
+
     def _log_tick(self, now):
-        if not self.tracker.running or self.skip_log:
+        if not self.tracker.running or self.skip_log or self.in_town:
             return
-        m = self.meso
-        mesos = (m.gained, m.seen_at) if m.value is not None and now - m.seen_at <= 30 else None
         runs = len(self.autolog.runs)
-        entry = self.autolog.tick(now, self.map_name, self.level, self.party, mesos, self.job, self.map_read)
+        potions_now = None
+        if self.cfg["potions_on"]:
+            used = self.session.potions.used
+            potions_now = (dict(used), self.session.potions.cost(self._prices().mapping()))
+        entry = self.autolog.tick(now, self.map_name, self.level, self.party, job=self.job, map_read=self.map_read,
+                                  hidden=self.map_hidden, potions=potions_now,
+                                  estimated=self.tracker.estimated and self.tracker.percent_mode, **self.meso.for_log())
         if len(self.autolog.runs) > runs:
             self.share_runs()                          # a run just finished
         if entry:
@@ -3394,37 +5866,93 @@ class App:
             if not self.stop_evt.is_set():
                 self.root.after(500, self._refresh)
 
+    def _state(self):
+        """A word for the status pill: where things stand."""
+        t, sess = self.tracker, self.session
+        if self.reader.mode == "window" and not self.reader.hwnd:
+            return "waiting", "Looking for the game"
+        if self.rejected >= 5:
+            return "alert", "Can't read the EXP bar"
+        if t.req is None:
+            return "waiting", "Reading your EXP bar"
+        if self.level_up_at and time.monotonic() - self.level_up_at < 6:
+            return "tracking", "Level up!"
+        if sess.waiting:
+            return "paused", "Paused"
+        if t.running:
+            return "tracking", f"Tracking \u00b7 Lv {self.level}" if self.level else "Tracking"
+        return ("paused", "Paused") if t.elapsed() > 0 else ("ready", "Ready")
+
+    def _potion_table(self):
+        """The shipped item table, for prices (the reader loads its own copy at the first look at the bar)."""
+        if self._price_table is None:
+            try:
+                self._price_table = potions.PotionTable.load(ASSETS / "potion_table.json")
+            except Exception as e:
+                log_error("loading the potion table", e)
+        return self._price_table
+
+    def _net(self, el):
+        """(Net mesos/hr as text, a note or None): mesos/hr less the potion cost per hour. A dash when
+        potions are off, nothing has run yet, or a potion that was used was priced at 0 by the player."""
+        dash = "—"
+        if not self.cfg["potions_on"] or not el:
+            return dash, None
+        prices, used = self._prices(), self.session.potions.used
+        note = prices.note(used)
+        if note:
+            return dash, note
+        gross = self.meso.per_hour(el)
+        if gross is None:
+            return dash, None
+        cost = self.session.potions.cost(prices.mapping())
+        return fmt_num(gross - cost / el * 3600), None
+
+    def _prices(self):
+        table = self._potion_table()
+        return potions.Prices(table.prices if table else {}, self.cfg["potion_prices"])
+
     def _update_display(self):
         t, now = self.tracker, time.monotonic()
-        rate = t.rate()
-        self.big.config(text=fmt_num(rate) if rate is not None else "—",
-                        fg=ACCENT if rate is not None else DIM)
-        self.vars["Last 5 min"].set(fmt_num(t.rolling_rate()))
-        self.vars["% / hr"].set(f"{rate / t.req * 100:.2f}%" if rate and t.req else "—")
-        lvl = f"  (+{t.levels} lvl)" if t.levels else ""
-        self.vars["Gained"].set(f"{fmt_short(t.gained)}{lvl}")
+        rate, rolling = t.rate(), t.rolling_rate()
         shown = (t.exp, t.pct) if t.exp is not None else t.last_read
-        if shown:
-            self.vars["Current"].set(f"{fmt_num(shown[0])} [{shown[1]:.2f}%]")
-        best_rate = t.rolling_rate() or rate
+        best_rate = rolling or rate
         level = level_for_req(t.req) or self.level
         eta = fmt_eta((t.req - t.exp) / best_rate * 3600) if (
             t.req and t.exp is not None and best_rate and best_rate > 0) else None
-        if level and eta:
-            self.next_level.config(text=f"Lv {level + 1} in {eta}")
-        else:
-            self.next_level.config(text=f"Lv {level}" if level else "")
+        if t.running and rolling and now - self._trend_at >= 15:      # a point on the trend line every 15 s
+            self._trend.append(rolling)
+            self._trend_at = now
         m, el = self.meso, t.elapsed()
         if m.value is None:
-            self.vars["Mesos"].set("move this window" if self.reader.mesos_covered else "open inventory")
+            mesos = "move this window" if self.reader.mesos_covered else "open inventory"
         else:
-            self.vars["Mesos"].set(fmt_num(m.value) + (f"  (+{fmt_short(m.gained)})" if m.gained > 0 else ""))
-        self.vars["Mesos / hr"].set(fmt_num(m.per_hour(el)))
-        self.vars["Mesos / 5 min"].set(fmt_num(m.per_5min(el)))
-        self.vars["Elapsed"].set(fmt_dur(el))
-        if self.compact:
-            self.compact_line.config(text=f"Last 5 min  {self.vars['Last 5 min'].get()}    "
-                                          f"Mesos / hr  {self.vars['Mesos / hr'].get()}")
+            mesos = fmt_num(m.value) + (f"  (+{fmt_short(m.gained)})" if m.gained > 0 else "")
+        state, state_text = self._state()
+        net = self._net(el)[0]
+        est = lambda text: APPROX + text if t.estimated and text and text != "\u2014" else text     # (worked out from a % alone)
+        self.view.show(
+            rate=approx_num(rate, t.estimated) if rate is not None else None,
+            delta=(rolling / rate - 1) if rate and rolling else None,
+            spark=list(self._trend), pct=shown[1] if shown else None,
+            eta=f"Lv {level + 1} in {eta}" if level and eta else f"Lv {level}" if level else "",
+            level=level or None, eta_time=eta or "",
+            mesos=fmt_num(m.per_hour(el)),
+            net=net if self.cfg["potions_on"] and net != "\u2014" else "",
+            tiles={"Last 5 min": approx_num(rolling, t.estimated), "Mesos / hr": fmt_num(m.per_hour(el)),
+                   "Net / hr": net, "Elapsed": fmt_dur(el)},
+            details={"% / hr": f"{rate / t.req * 100:.2f}%" if rate and t.req else "\u2014",
+                     "Gained": est(f"{fmt_short(t.gained)}{f'  (+{t.levels} lvl)' if t.levels else ''}"),
+                     "Current": (APPROX if t.percent_mode else "") + f"{fmt_num(shown[0])} [{shown[1]:.2f}%]" if shown else "\u2014",
+                     "Mesos": mesos, "Mesos / 5 min": fmt_num(m.per_5min(el)),
+                     "Potion cost": (fmt_num(self.session.potions.cost(self._prices().mapping()))
+                                     if self.cfg["potions_on"] else "—"),
+                     "Net mesos / hr": net,
+                     "Left out": (f"+{fmt_short(m.left_out[0])} / -{fmt_short(m.left_out[1])}"
+                                  if any(m.left_out) else "—")},
+            state=state, state_text=state_text)
+        if self.level_btn is not None and self.level_btn.winfo_exists():
+            self.level_btn.set(enabled=self._can_type_level())
         waiting = self.session.waiting
         self.session.tick(now)
         if self.session.waiting != waiting:             # just paused by itself: say why now
@@ -3435,6 +5963,7 @@ class App:
         self.reader.own_rect = self._window_rect()
         if now >= self._next_share:                   # retry runs that couldn't be sent
             self.share_runs()
+        self._health_tick()
 
     # ---- buttons
     def _hotkey(self, action):
@@ -3455,22 +5984,34 @@ class App:
 
     def toggle(self):
         if self.session.on:                     # (also while it's paused by itself)
+            self.recent.add("You paused")
             self.session.pause()
-            self.start_btn.config(text="Resume")
+            self._set_start("Resume")
         else:
+            self.recent.add("You pressed Start")
             self.session.start(time.monotonic())
             self.reader.request_map()           # read the map name now
-            self.start_btn.config(text="Pause")
+            self._set_start("Pause")
         self.autolog.reset_clock()
         if self.tracker.exp is not None:
             self.status.set(self._status_for(""))   # right away, not at the next read
 
+    def _set_start(self, text):
+        """The Start button: gold when pressing it starts something, quiet while it's running."""
+        self._start_text = text
+        self.view.set_start(text, "pause" if text == "Pause" else "play", "secondary" if text == "Pause" else "primary")
+
     def reset(self):
         self.session.reset()
         self.autolog.reset_clock()
+        self._char_print = self._char_seen = self.other_char_at = None      # (what was known about the character is over too)
+        self._char_diff, self._same_char = 0, False
+        self.pct_note, self.level_wait = "", False
+        self.reader.forget_level()
+        self._stale_level = None
         self.skip_log = False
         self._show_skip_log()
-        self.start_btn.config(text="Start")
+        self._set_start("Start")
         # Also look for the minimap, inventory and party list again (e.g. after moving them).
         self.reader.look_again()
         self.map_name, self.party, self._party_seen = None, 1, (None, 0)
@@ -3486,14 +6027,7 @@ class App:
                         "or stop getting EXP." if self.skip_log else "Logging this run again.")
 
     def _show_skip_log(self):
-        if self.skip_log:
-            self.skip_btn.config(text="Not logging", bg=ACCENT_SOFT, fg=BG, activebackground=ACCENT,
-                                 activeforeground=BG)
-        else:
-            style = self._btn_style
-            self.skip_btn.config(text="Don't log", bg=style["bg"], fg=style["fg"],
-                                 activebackground=style["activebackground"],
-                                 activeforeground=style["activeforeground"])
+        self.view.logging.set(not self.skip_log, "Not logging" if self.skip_log else "Log this run")
 
     def _after_pause_check(self, waiting_before):
         """When the run ends (tracking pauses by itself), "Don't log" turns off again, so
@@ -3510,7 +6044,7 @@ class App:
         save_config(self.cfg)
 
     def _show_area_mode(self):
-        self.area_btn.config(text="Follow game" if self.reader.mode == "region" else "Select area")
+        pass                                              # (the More menu reads the mode when it opens)
 
     def toggle_area(self):
         if self.reader.mode == "region":
@@ -3552,6 +6086,17 @@ class App:
     def _boxed(self, bgr, boxes):
         return ImageTk.PhotoImage(self._boxed_image(bgr, boxes))
 
+    def _class_line(self):
+        """What the class reading shows: (picture or None, boxes, a line saying how it went)."""
+        look = self.reader.job_look
+        if self.job:
+            how = f"Class. Read: {self.job}"
+        elif look:
+            how = f"Class. Not read: {look.get('why') or 'no clear look yet'}"
+        else:
+            how = "Class. Not read yet (it's tried every few seconds once the EXP bar is found)"
+        return (look or {}).get("image"), (look or {}).get("boxes", []), how
+
     def view_capture(self):
         r, mr = self.last_capture, self.last_mesos
         if not r and not mr:
@@ -3563,56 +6108,341 @@ class App:
         win.title("Last capture")
         win.configure(bg=BG)
         win.attributes("-topmost", bool(self.cfg["topmost"]))
-        shots = []
-        if r:
-            shots.append((r.image, r.boxes, f"EXP bar. Read: {r.text or 'nothing'}   ({r.where})"))
-        if mr:
-            read = fmt_num(mr.mesos) if mr.mesos is not None else "nothing (waiting for a clear look)"
-            shots.append((mr.mesos_image, mr.mesos_boxes, f"Mesos. Read: {read}"))
+        for delay in (0, 150, 800):
+            win.after(delay, lambda: PLATFORM.style_window(win, INK, TEXT_DIM) if win.winfo_exists() else None)
+        th = self.theme
+        shots = self._look_shots()
         win._imgs = []
         for shot, boxes, text in shots:
-            win._imgs.append(self._boxed(shot, boxes))
-            tk.Label(win, image=win._imgs[-1], bg=BG).pack(padx=8, pady=(8, 2))
-            tk.Label(win, text=text, bg=BG, fg=FG).pack(anchor="w", padx=8)
+            if shot is not None and shot.size:
+                win._imgs.append(self._boxed(shot, boxes))
+                tk.Label(win, image=win._imgs[-1], bg=BG).pack(padx=th.px(16), pady=(th.px(16), th.px(4)))
+            else:
+                tk.Frame(win, bg=BG, height=th.px(12)).pack()
+            tk.Label(win, text=text, bg=BG, fg=FG, font=th.font("semibold", 12), wraplength=th.px(560),
+                     justify="left").pack(anchor="w", padx=th.px(16))
         bottom = tk.Frame(win, bg=BG)
-        bottom.pack(fill="x", padx=8, pady=(4, 8))
-        tk.Label(bottom, text="Boxes show where each digit was found.", bg=BG, fg=DIM).pack(side="left")
-        tk.Button(bottom, text="Something's wrong? Report a bug", command=lambda: self.report_bug(win),
-                  bg=FIELD, fg=FG, activebackground="#3a3f49", activeforeground=FG, relief="flat",
-                  padx=10, pady=2, font=self.fonts["text"]).pack(side="right")
+        bottom.pack(fill="x", padx=th.px(16), pady=(th.px(12), th.px(16)))
+        tk.Label(bottom, text="Boxes show where each digit was found.", bg=BG, fg=DIM,
+                 font=th.font("regular", 11)).pack(side="left")
+        Button(bottom, th, text="Something's wrong? Report a bug", kind="secondary", width=240, height=36, radius=10,
+               size=12, command=lambda: self.report_bug(win), bg=BG).pack(side="right")
 
     # ---- bug reports
     def report_bug(self, parent=None):
+        """Asks how to report: straight to the developer (no account) or on GitHub."""
+        parent = parent or self.root
+        th = self.theme
+        w = self._small_window("Report a bug", None)
+        tk.Label(w, text="Report a bug", bg=BG, fg=ACCENT, font=th.font("extra", 20)).pack(anchor="w")
+        tk.Label(w, text="How would you like to report it?", bg=BG, fg=DIM, font=th.font("regular", 12)
+                 ).pack(anchor="w", pady=(2, th.px(14)))
+
+        def pick(then):
+            w.destroy()
+            then(parent)
+        Button(w, th, text="Send to the developer", kind="primary", width=300, height=40, radius=12, size=13,
+               command=lambda: pick(self.send_report), bg=BG).pack(anchor="w")
+        tk.Label(w, text="No account needed. You see exactly what is sent first.", bg=BG, fg=FAINT,
+                 font=th.font("regular", 11)).pack(anchor="w", pady=(2, th.px(12)))
+        Button(w, th, text="Report on GitHub", kind="secondary", width=300, height=40, radius=12, size=13,
+               command=lambda: pick(self._report_on_github), bg=BG).pack(anchor="w")
+        tk.Label(w, text="Needs a free GitHub account. You can add pictures.", bg=BG, fg=FAINT,
+                 font=th.font("regular", 11)).pack(anchor="w", pady=(2, th.px(12)))
+        Button(w, th, text="Cancel", kind="secondary", width=96, height=36, radius=10, size=12,
+               command=w.destroy, bg=BG).pack(anchor="e")
+        self._report_choice = w
+        return w
+
+    def _report_on_github(self, parent=None):
         """Opens a new GitHub issue in the browser, filled in with what the tracker knows, and
-        saves a picture of what it last read for the player to drag in. Nothing is sent by
-        the tracker itself: the player sees everything and clicks Submit (or doesn't)."""
+        saves a picture and a text file of the details for the player to drag in. Nothing is
+        sent by the tracker itself: the player sees everything and clicks Submit (or doesn't)."""
         parent = parent or self.root
         if not messagebox.askokcancel(
                 "Report a bug",
                 "Your browser will open a bug report on GitHub, already filled in with your "
                 "version and what the overlay was reading (nothing personal).\n\n"
                 "1. Write a sentence about what went wrong.\n"
-                "2. Drag in the picture from the folder that opens.\n"
+                "2. Drag in the two files from the folder that opens.\n"
                 "3. Click Submit.\n\n"
                 "You need a free GitHub account.", parent=parent):
             return
-        picture = self._save_report_picture()
+        screen = messagebox.askyesno(
+            "Report a bug",
+            "Also save a small picture of the whole game window?\n\n"
+            "It shows exactly what the overlay sees, which helps a lot when something can't be found. "
+            "But it can include chat and character names, so only drag it in if you're happy with that.\n\n"
+            "(No is fine: the report works without it.)", default="no", parent=parent)
+        files = self._save_report_files(screen)
         query = urllib.parse.urlencode({"title": f"Bug: (describe it here) [v{VERSION}]",
-                                        "body": self._report_text(picture)})
+                                        "body": self._report_text(files)})
         webbrowser.open(f"https://github.com/{GITHUB_REPO}/issues/new?{query}")
-        if picture:
+        shown = files.get("picture") or files.get("details")
+        if shown:
             try:
-                PLATFORM.show_file(picture)
+                PLATFORM.show_file(shown)
             except Exception as e:
-                log_error("opening the bug report picture's folder", e)
+                log_error("opening the bug report's folder", e)
+
+    def _report_details(self):
+        """The bug report's details text, scrubbed: the same words go to GitHub and to Send report."""
+        facts = self._report_facts()
+        self._report_facts_cache = facts
+        return self._private(report.details(facts))
+
+    def send_report(self, parent=None):
+        """The Send report dialog: the player types what went wrong, sees exactly what will be sent
+        (text only), and the overlay posts it to the stats site."""
+        th = self.theme
+        try:
+            details = self._report_details()
+        except Exception as e:
+            log_error("collecting the details for Send report", e)
+            details = ""
+        w = self._small_window("Send to the developer", None)
+        w.details = details
+        tk.Label(w, text="Send to the developer", bg=BG, fg=ACCENT, font=th.font("extra", 20)).pack(anchor="w")
+        tk.Label(w, text="What went wrong?", bg=BG, fg=FG, font=th.font("semibold", 12)
+                 ).pack(anchor="w", pady=(th.px(10), th.px(4)))
+        box = tk.Frame(w, bg=LIST_BG, highlightthickness=1, highlightbackground=LINE)
+        box.pack(fill="x")
+        w.message = tk.Text(box, width=58, height=5, wrap="word", bg=LIST_BG, fg=FG, insertbackground=FG, relief="flat",
+                            font=th.font("regular", 12), padx=th.px(10), pady=th.px(8), highlightthickness=0, undo=True)
+        w.message.pack(fill="x")
+        counter = tk.Label(w, text=f"0 / {report.MAX_MESSAGE:,}", bg=BG, fg=FAINT, font=th.font("regular", 10))
+        counter.pack(anchor="e")
+
+        def typed(event=None):
+            text = w.message.get("1.0", "end-1c")
+            counter.configure(text=f"{report.units(text):,} / {report.MAX_MESSAGE:,}",
+                              fg=BAD if report.units(report.clean_message(text)) > report.MAX_MESSAGE else FAINT)
+        w.message.bind("<KeyRelease>", typed)
+        w.counter, w.typed = counter, typed
+        fold = tk.Frame(w, bg=BG)
+        shown = tk.BooleanVar(value=False)
+        w.fold, w.fold_open = fold, shown
+        w.sent_text = tk.Text(fold, width=58, height=10, wrap="word", bg=LIST_BG, fg=DIM, relief="flat",
+                              font=th.font("regular", 10), padx=th.px(10), pady=th.px(8), highlightthickness=0)
+        w.sent_text.insert("1.0", details or "(nothing)")
+        w.sent_text.configure(state="disabled")
+        scroll = ttk.Scrollbar(fold, command=w.sent_text.yview, style="Dark.Vertical.TScrollbar")
+        w.sent_text.configure(yscrollcommand=scroll.set)
+        w.sent_text.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+
+        def toggle():
+            if shown.get():
+                fold.pack_forget()
+            else:
+                fold.pack(fill="x", before=w.note)
+            shown.set(not shown.get())
+            w.fold_button.set(text="What will be sent  ▾" if shown.get() else "What will be sent  ▸")
+        w.fold_button = Button(w, th, text="What will be sent  ▸", kind="secondary", width=200, height=32, radius=10,
+                               size=11, command=toggle, bg=BG)
+        w.fold_button.pack(anchor="w", pady=(th.px(8), th.px(6)))
+        w.note = tk.Label(w, text="No pictures are sent. To add a picture, use Report on GitHub.", bg=BG, fg=FAINT,
+                          font=th.font("regular", 11), wraplength=th.px(520), justify="left")
+        w.note.pack(anchor="w")
+        w.status = tk.Label(w, text="", bg=BG, fg=DIM, font=th.font("regular", 11), wraplength=th.px(520), justify="left")
+        w.status.pack(anchor="w", pady=(th.px(6), 0))
+        buttons = tk.Frame(w, bg=BG)
+        buttons.pack(fill="x", pady=(th.px(10), 0))
+        w.cancel_button = Button(buttons, th, text="Cancel", kind="secondary", width=96, height=38, radius=11, size=12,
+                                 command=w.destroy, bg=BG)
+        w.cancel_button.pack(side="right")
+        w.send_button = Button(buttons, th, text="Send", kind="primary", width=96, height=38, radius=11, size=12,
+                               command=lambda: self._submit_report(w), bg=BG)
+        w.send_button.pack(side="right", padx=(0, th.px(8)))
+        self._report_window = w
+        w.message.focus_set()
+        return w
+
+    def _submit_report(self, w):
+        """Send was clicked: check the text and the daily limit, then post in the background."""
+        def say(text, bad=True):
+            w.status.configure(text=text, fg=BAD if bad else GOOD)
+        message = w.message.get("1.0", "end-1c")
+        problem = report.message_problem(message)
+        if problem:
+            return say(problem)
+        if reports_sent_today(self.cfg) >= MAX_REPORTS_PER_DAY:
+            return say("You've sent 3 reports today. Please try again tomorrow, or use Report on GitHub.")
+        if sharing_blocked():
+            return say("Sending is off while testing.")
+        if healthlog.ensure_id(self.cfg):
+            save_config(self.cfg)
+        body = report.report_body(self.cfg["health_id"], VERSION, message, w.details)
+        w.send_button.set(enabled=False)
+        say("Sending...", bad=False)
+
+        def work():
+            try:
+                outcome = post_report(body)
+            except Exception:
+                outcome = "later"
+            self.q.put(("report_sent", (w, outcome)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _report_done(self, w, outcome):
+        """The site answered a Send report."""
+        if not w.winfo_exists():
+            if outcome == "ok":
+                self._count_report()
+            return
+        texts = {"limit": "You've sent 3 reports today. Please try again tomorrow, or use Report on GitHub.",
+                 "message": "Please leave out links.",
+                 "bad": "The site couldn't take this report. Please use Report on GitHub instead.",
+                 "later": "Couldn't send it. Are you connected to the internet?"}
+        if outcome == "ok":
+            self._count_report()
+            w.status.configure(text="Sent, thank you!", fg=GOOD)
+            w.cancel_button.set(text="Close")
+            return
+        if outcome == "limit":
+            self.cfg["reports_sent"] = {"day": healthlog.utc_day(time.time()), "n": MAX_REPORTS_PER_DAY}
+            save_config(self.cfg)
+        w.status.configure(text=texts.get(outcome, texts["later"]), fg=BAD)
+        w.send_button.set(enabled=True)
+
+    def _count_report(self):
+        self.cfg["reports_sent"] = {"day": healthlog.utc_day(time.time()), "n": reports_sent_today(self.cfg) + 1}
+        save_config(self.cfg)
+
+    @staticmethod
+    def _private(text, limit=report.MAX_DETAILS):
+        """Nothing personal: file paths cut to their last part, and the Windows or macOS user name and the
+        computer name taken out wherever they appear (see report.scrub)."""
+        names = [Path.home().name, os.environ.get("USERNAME", ""), os.environ.get("USER", ""),
+                 os.environ.get("LOGNAME", ""), os.environ.get("COMPUTERNAME", ""), platform.node()]
+        return report.scrub(text, names, limit)
+
+    @staticmethod
+    def _errors_tail(size=2500):
+        """The end of errors.log, scrubbed. All of it is scrubbed first and only then cut, so the cut can't
+        leave half a path, and it really is the end of the file."""
+        try:
+            return App._private(ERROR_LOG_PATH.read_text(encoding="utf-8", errors="replace"), None)[-size:]
+        except Exception:
+            return ""
+
+    def _report_facts(self):
+        """Everything a bug report says, as a plain dict (see report.py)."""
+        r, t = self.last_capture, self.tracker
+        d = self.reader.diagnostics()
+        rect = d["rect"]
+        monitors = []
+        try:
+            with mss.mss() as sct:
+                monitors = [(m_["width"], m_["height"]) for m_ in sct.monitors[1:]]
+        except Exception as e:
+            log_error("listing the screens for a bug report", e)
+        errors = self._errors_tail()
+        now = time.monotonic()
+        h = self.health
+        up = max(1.0, now - self.started)
+        tess = TESS
+        return {
+            "version": VERSION, "frozen": bool(getattr(sys, "frozen", False)), "system": PLATFORM.version(),
+            "python": sys.version.split()[0], "monitors": monitors, "uptime_s": up,
+            "cpu_pct": round((time.process_time() - self.cpu0) / up * 100, 1),
+            "dpi_awareness": PLATFORM.dpi_awareness(),
+            "dpi": PLATFORM.screen_dpi(rect[0] + rect[2] // 2, rect[1] + rect[3] // 2) if rect else None,
+            "tesseract": {"found": bool(tess), "version": tess.version() if tess else None,
+                          "where": ("included" if str(APP_DIR) in str(tess.cmd) else "installed") if tess else None,
+                          "state": tesseract_state, "why": tesseract_why or None,
+                          "exe": self._private(tesseract_where[0]) if tesseract_where[0] else None,
+                          "tessdata": self._private(tesseract_where[1]) if tesseract_where[1] else None},
+            "game": {"mode": d["mode"], "found": d["found"], "rect": rect, "gh": d["gh"], "region": d["region"],
+                     "minimized": bool(d["found"] and not rect and d["mode"] == "window"),
+                     "fullscreen": bool(rect and any(rect[2] == mw and rect[3] == mh for mw, mh in monitors))},
+            "overlay": {"rect": d["own_rect"], "covering": d["covering"]},
+            "reader": {**{k: d[k] for k in ("exp_box", "exp_misses", "map_box", "mesos_box", "mesos_fails", "two_boxes",
+                                            "mesos_learned", "party_area", "job_why")},
+                       "level_unknown": t.req is None},
+            "shadow": self.reader.shadow.facts(),
+            "health": {"alive": h.alive and self._worker_alive(), "polls": h.polls, "errors": h.errors,
+                       "last_error": h.last_error, "average_ms": h.average_ms(), "max_ms": h.max_ms,
+                       "last_ms": h.last_ms, "age": None if h.last_at is None else now - h.last_at},
+            "rejected": self.rejected, "status": self.status.get().replace("\n", " | "),
+            "last_exp": r.text if r else None, "level": self.level, "job": self.job, "map": self.map_name,
+            "party": party_label(self.party),
+            "mesos": fmt_num(self.meso.value) if self.meso.value is not None else None, "tracking": bool(self.session.on),
+            "tracker": f"paused: {self.session.waiting or 'no'}, gained {fmt_num(t.gained)} EXP in {fmt_dur(t.elapsed())}",
+            "settings": {"mode": self.reader.mode, **{k: self.cfg.get(k) for k in ("gap_seconds", "transparency", "topmost", "ui_scale",
+                                                      "compact", "hotkeys_on", "share_runs", "check_updates")},
+                         "share_health": self.cfg.get("share_health"), "health_last_sent": self.healthlog.last_sent or None},
+            "timeline": [self._private(x) for x in self.recent.lines()], "errors": errors,
+        }
+
+    def _worker_alive(self):
+        return getattr(self, "_worker_thread", None) is None or self._worker_thread.is_alive()
+
+    def _look_shots(self):
+        """What each reader last saw, with a line on how it went: [(picture or None, boxes, text)]."""
+        r, mr = self.last_capture, self.last_mesos
+        shots = []
+        if r:
+            shots.append((r.image, r.boxes, f"EXP bar. Read: {r.text or 'nothing'}   ({r.where})"))
+        if mr:
+            read = fmt_num(mr.mesos) if mr.mesos is not None else "nothing (waiting for a clear look)"
+            shots.append((mr.mesos_image, mr.mesos_boxes, f"Mesos. Read: {read}"))
+        for kept in list(self.reader.shadow.kept):
+            shots.append((kept["image"], kept["boxes"], f"Reader v2 test ({kept['kind']}). Old: {report.answer_text(kept['old'])}"
+                                                        f"   v2: {report.answer_text(kept['v2'])}"))
+        if r:
+            shots.append(self._class_line())
+            look = self.reader.map_look
+            if look:
+                shots.append((look["image"], [], f"Map name. Read: {look['text'] or 'nothing (not clear yet)'}"))
+        return shots
+
+    def _save_report_files(self, with_screen=False):
+        """The picture of what was read, the details as text, and (if asked) the game window:
+        saved in the data folder. Returns {"picture", "details", "screen"} (missing ones left out)."""
+        files = {}
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            log_error("making the data folder for a bug report", e)
+            return files
+        facts = None
+        try:
+            facts = self._report_facts()
+            path = DATA_DIR / "bug-report.txt"
+            path.write_text(self._private(report.details(facts)), encoding="utf-8")
+            files["details"] = path
+        except Exception as e:
+            log_error("saving the bug report details", e)
+        self._report_facts_cache = facts
+        picture = self._save_report_picture()
+        if picture:
+            files["picture"] = picture
+        if with_screen:
+            screen = self._save_report_screen()
+            if screen:
+                files["screen"] = screen
+        return files
+
+    def _captioned(self, image, text):
+        """A crop with a line of text above it."""
+        try:
+            font = ImageFont.truetype(str(ASSETS / "fonts" / "ManropeSemiBold.ttf"), 15)
+        except Exception:
+            font = ImageFont.load_default()
+        w = max(image.width if image is not None else 0, 760)
+        sheet = Image.new("RGB", (w, (image.height if image is not None else 0) + 26), BG)
+        ImageDraw.Draw(sheet).text((2, 3), text[:110], fill=FG, font=font)
+        if image is not None:
+            sheet.paste(image, (0, 26))
+        return sheet
 
     def _save_report_picture(self):
-        """What the tracker last read (EXP bar and mesos, with the digit boxes), as one PNG."""
+        """What each reader last saw (EXP bar, mesos, class, map name), with captions, as one PNG."""
         parts = []
-        if self.last_capture is not None:
-            parts.append(self._boxed_image(self.last_capture.image, self.last_capture.boxes))
-        if self.last_mesos is not None:
-            parts.append(self._boxed_image(self.last_mesos.mesos_image, self.last_mesos.mesos_boxes))
+        for shot, boxes, text in self._look_shots():
+            image = self._boxed_image(shot, boxes) if shot is not None and shot.size else None
+            parts.append(self._captioned(image, text))
         if not parts:
             return None
         sheet = Image.new("RGB", (max(p.width for p in parts), sum(p.height + 8 for p in parts)), BG)
@@ -3622,52 +6452,52 @@ class App:
             y += p.height + 8
         path = DATA_DIR / "bug-report.png"
         try:
-            DATA_DIR.mkdir(parents=True, exist_ok=True)
             sheet.save(path)
             return path
         except Exception as e:
             log_error("saving the bug report picture", e)
             return None
 
-    def _report_text(self, picture):
-        """The bug report's text: room to describe it, then the details, without anything
-        personal (your Windows user name is taken out of file paths)."""
-        def private(text):
-            for secret in {str(Path.home()), os.environ.get("USERNAME", "")}:
-                if len(secret) > 2:
-                    text = text.replace(secret, "<you>")
-            return text
-        r, mr, t = self.last_capture, self.last_mesos, self.tracker
-        errors = ""
+    def _save_report_screen(self):
+        """A fresh game-window picture, or a masked screen copy, shrunk as a JPEG."""
+        rect = self.reader.last_rect
+        if not rect:
+            return None
         try:
-            errors = private(ERROR_LOG_PATH.read_text(encoding="utf-8", errors="replace"))[-1500:]
-        except Exception:
-            pass
+            reader = self.reader
+            window = capture_window(PLATFORM, reader.hwnd, rect) if reader.mode == "window" else None
+            if window is not None:
+                shot = window.grab(*rect)
+            else:
+                with mss.mss() as sct:
+                    shot = reader._hide_own(grab(sct, *rect), screen_copy=True)
+            if not shot:
+                return None
+            img = Image.fromarray(cv2.cvtColor(shot[0], cv2.COLOR_BGR2RGB))
+            img.thumbnail((1600, 900), Image.LANCZOS)
+            path = DATA_DIR / "bug-report-game.jpg"
+            img.save(path, quality=72)
+            return path
+        except Exception as e:
+            log_error("saving the bug report's game picture", e)
+            return None
+
+    def _report_text(self, files):
+        """The bug report's text: room to describe it, then the short details (the whole of it is
+        in bug-report.txt: the address a report is opened with can't be very long)."""
+        facts = getattr(self, "_report_facts_cache", None) or self._report_facts()
+        attach = [f"`{files[k].name}`" for k in ("picture", "details", "screen") if k in files]
+        errors = (facts.get("errors") or "").strip()[-700:]
         lines = [
             "**What went wrong?**", "(Describe it here: what did you do, what did you expect, what did it show?)", "",
-            "**Screenshot**",
-            ("(Drag in `bug-report.png` from the folder that just opened: it shows what the overlay read.)"
-             if picture else "(If you can, add a screenshot of the game and the overlay.)"), "",
+            "**Files**",
+            (f"(Drag in {' and '.join(attach)} from the folder that just opened: they show what the overlay read "
+             "and how it's doing.)" if attach else "(If you can, add a screenshot of the game and the overlay.)"), "",
             "---", "<details><summary>Details (filled in by the overlay)</summary>", "",
-            f"- Version: {VERSION} ({'download' if getattr(sys, 'frozen', False) else 'from source'})",
-            f"- System: {PLATFORM.version()}",
-            f"- Game window: {'x'.join(map(str, self.reader.size)) if self.reader.size else 'not found'}"
-            f" (EXP digits {fmt_num(self.reader.gh) if self.reader.gh else '?'} px)",
-            f"- Last EXP read: {r.text if r else 'nothing'}",
-            f"- Level: {self.level or '?'}, class: {self.job or 'not read'}, map: {self.map_name or 'not read'},"
-            f" party: {party_label(self.party)}",
-            f"- Mesos: {fmt_num(self.meso.value) if self.meso.value is not None else 'not read'}"
-            f" (last read {fmt_num(mr.mesos) if mr and mr.mesos is not None else 'nothing'})",
-            f"- Tracking: {'on' if self.session.on else 'off'}, paused: {self.session.waiting or 'no'},"
-            f" gained {fmt_num(t.gained)} EXP in {fmt_dur(t.elapsed())}",
-            f"- Status: {private(self.status.get())}",
-            f"- Sharing runs: {'on' if self.cfg.get('share_runs') else 'off'}"
-            f" ({len(self.autolog.runs)} runs, {len(self.autolog.unshared_runs())} not sent)",
-            f"- Settings: pause after {self.cfg['gap_seconds']} s, transparency {self.cfg['transparency']}%,"
-            f" map names {'on' if self.reader.text_ocr.available else 'off (no Tesseract)'}",
+            self._private(report.summary(facts)),
         ]
         if errors:
-            lines += ["", "Recent errors:", "```", errors.strip(), "```"]
+            lines += ["", "Recent errors:", "```", errors, "```"]
         lines += ["", "</details>"]
         return "\n".join(lines)
 
@@ -3683,6 +6513,7 @@ class App:
             self.cfg["log_size"] = size if size != natural else None
 
     def close(self):
+        self._note_flush()
         self.stop_evt.set()
         try:
             self._remember_log_size()
@@ -3690,10 +6521,12 @@ class App:
             log_error("saving the log size", e)
         self.cfg["pos"] = [self.root.winfo_x(), self.root.winfo_y()]
         save_config(self.cfg)
+        self.healthlog.save()
         self.root.destroy()
 
 
 def main():
+    global tesseract_ok, TESS, tesseract_state, tesseract_why
     # Only one copy at a time (per data folder): two copies would each keep their own log.
     # If it's already running, bring that window to the front instead. (The lock keeps the old
     # name, so an older version and this one can't run at the same time either.)
@@ -3702,8 +6535,14 @@ def main():
         return
     PLATFORM.ask_permissions()
     move_old_data()
-    # MAPLE_EXP_OCR=none turns the text OCR off (e.g. to see how the overlay does without it).
-    text_ocr = create_text_ocr(os.environ.get("MAPLE_EXP_OCR", "auto"), find_tesseract())
+    try:
+        tess, tessdata, tesseract_state, tesseract_why = locate_tesseract()
+    except Exception as e:                  # (EXP and mesos work without Tesseract: never a reason not to start)
+        log_error("looking for Tesseract", e)
+        tess, tessdata = None, None
+    text_ocr = create_text_ocr(os.environ.get("MAPLE_EXP_OCR", "auto"), tess, tessdata=tessdata or None)
+    TESS = text_ocr if text_ocr.available else None
+    tesseract_ok = text_ocr.available
     root = tk.Tk()
     App(root, DigitTemplates.load(), text_ocr)
     root.mainloop()

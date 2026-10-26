@@ -12,7 +12,7 @@ __all__ = ["CANON", "GlyphMatcher", "NoTextOCR", "TemplateMatcher", "TextOCR", "
 BACKENDS = ("auto", "tesseract", "none")
 
 
-def create_text_ocr(backend="auto", tesseract_cmd=None):
+def create_text_ocr(backend="auto", tesseract_cmd=None, tessdata=None):
     """The TextOCR to read with.
 
     backend: "tesseract" (needs tesseract_cmd, the path of the program), "none" (read no
@@ -25,4 +25,6 @@ def create_text_ocr(backend="auto", tesseract_cmd=None):
     if not tesseract_cmd:
         raise ValueError("the tesseract text OCR needs the path of the tesseract program")
     from .tesseract import TesseractOCR            # only imported when it's used
-    return TesseractOCR(tesseract_cmd)
+    return TesseractOCR(tesseract_cmd, tessdata=tessdata)
+
+from .tesseract import TesseractOCR as Tesseract, TesseractError, PAUSE_AFTER_TIMEOUT

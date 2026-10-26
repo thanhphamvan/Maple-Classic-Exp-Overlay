@@ -9,14 +9,14 @@
 <meta property="og:description" content="Real EXP/hr and mesos/hr per map, for your class and level, solo or in a party. A community project, filled in by players.">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="Maple Classic Exp Overlay">
-<meta property="og:url" content="https://maple-classic-exp-overlay.pages.dev/">
-<meta property="og:image" content="https://maple-classic-exp-overlay.pages.dev/og.jpg">
+<meta property="og:url" content="https://mcwo.app/">
+<meta property="og:image" content="https://mcwo.app/og.jpg">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta property="og:image:alt" content="Find the best place to farm: Maple Classic Exp Overlay showing EXP/hr, mesos/hr and a log of maps">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="theme-color" content="#ffcc33">
-<link rel="canonical" href="https://maple-classic-exp-overlay.pages.dev/">
+<link rel="canonical" href="https://mcwo.app/">
 <link rel="icon" href="/favicon.png">
 <script>
   // The hero fades in once the page's script runs (never if motion is turned down, and
@@ -31,7 +31,7 @@
  "name": "Maple Classic Exp Overlay", "alternateName": ["MapleStory Classic EXP tracker", "Maple Classic EXP overlay"],
  "description": "A free EXP and mesos tracker for MapleStory Classic World: EXP/hr, mesos/hr, time to level, a log of every map you farm, and the best maps for your class.",
  "applicationCategory": "GameApplication", "operatingSystem": "Windows 10, Windows 11",
- "url": "https://maple-classic-exp-overlay.pages.dev/",
+ "url": "https://mcwo.app/",
  "downloadUrl": "https://github.com/beanguri/Maple-Classic-Exp-Overlay/releases/latest",
  "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"}}
 </script>
@@ -73,6 +73,21 @@
   .news .more { flex: none; font-size: 12.5px; color: var(--faint); white-space: nowrap; }
   .ticker .n-short { display: none; }
   @media (prefers-reduced-motion: reduce) { .live i { animation: none; } }
+
+  /* ---- under it: what's coming next (static list in the page, no requests) */
+  .next { background: rgba(255, 204, 51, 0.07); border-bottom: 1px solid var(--line); font-size: 13.5px; }
+  .next[hidden] { display: none; }
+  .next .wrap { display: flex; align-items: center; gap: 14px; min-height: 36px; padding-top: 4px; padding-bottom: 4px; }
+  .tag-next { flex: none; font-size: 12px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+    color: #17181c; background: var(--gold-soft); padding: 1px 9px; border-radius: 999px; white-space: nowrap; }
+  .next ul { flex: 1; min-width: 0; margin: 0; padding: 0; list-style: none; display: flex; flex-wrap: wrap; gap: 2px 18px; color: var(--text); }
+  .next li { position: relative; }
+  .next li + li::before { content: ""; position: absolute; left: -10px; top: 50%; width: 3px; height: 3px; margin-top: -1.5px;
+    border-radius: 50%; background: var(--faint); }
+  .next button { flex: none; font: inherit; font-size: 20px; line-height: 1; color: var(--faint); background: none; border: 0;
+    padding: 2px 6px; cursor: pointer; border-radius: 6px; }
+  .next button:hover { color: var(--text); }
+  .next button:focus-visible { outline: 2px solid rgba(255, 204, 51, 0.5); }
 
   /* ---- top bar */
   header.bar { position: sticky; top: 0; z-index: 10; background: rgba(19, 21, 25, 0.86); backdrop-filter: blur(10px);
@@ -163,6 +178,7 @@
   .lg-med { width: 3px; height: 14px; border-radius: 2px; background: var(--gold); }
   .lg-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dot); }
   .lg-out { width: 8px; height: 8px; border-radius: 50%; box-shadow: inset 0 0 0 1.5px var(--out); }
+  .lg-fresh { opacity: 0.5; }
   .chart-top small { font-size: 12.5px; color: var(--faint); }
   .row, .axis { display: grid; grid-template-columns: 32px minmax(150px, 230px) minmax(0, 1fr) 118px; gap: 0 22px;
     align-items: center; padding: 0 22px; }
@@ -195,6 +211,7 @@
   .dot { position: absolute; z-index: 1; width: 8px; height: 8px; margin: -4px 0 0 -4px; top: calc(50% + var(--y, 0px));
     border-radius: 50%; background: var(--dot); box-shadow: 0 0 0 1.5px var(--card); transition: transform 0.2s, background 0.2s; }
   .dot.out { background: var(--card); box-shadow: inset 0 0 0 1.5px var(--out); }
+  .dot.fresh { opacity: 0.5; }                        /* a new player (only with "Include new players"): faded */
   .dot.on { z-index: 2; transform: scale(1.7); background: var(--gold); }
   .dot.out.on { background: var(--card); }
   .edge { position: absolute; top: calc(50% - 25px); font-size: 11px; color: var(--out); white-space: nowrap; }
@@ -209,7 +226,7 @@
   .row.early:hover { background: rgba(0, 0, 0, 0.06); }
   .row.early .rank { visibility: hidden; }
   .row.early h3 { color: #c9c6bf; }
-  .row.early .dot:not(.out) { background: #8d929b; }
+  .row.early .dot:not(.out):not([data-b]) { background: #8d929b; }
   .row.early .dot.on:not(.out) { background: var(--text); }
   .row.early .med { width: 2px; margin-left: -1px; background: var(--dim); box-shadow: none; }
   .row.early .nums .exp { color: #c9c6bf; font-size: 20px; }
@@ -275,6 +292,108 @@
   footer .brand { font-size: 16px; }
   footer nav { display: flex; gap: 18px; }
 
+
+
+  /* dots and legend swatches coloured by the player's level against yours */
+  :root { --b0: #4f86f0; --b1: #92b8ff; --b2: #fff3d1; --b3: #ffb067; --b4: #ff6f3d; }
+  .dot[data-b="0"], .lg-dot[data-b="0"] { background: var(--b0); }
+  .dot[data-b="1"], .lg-dot[data-b="1"] { background: var(--b1); }
+  .dot[data-b="2"], .lg-dot[data-b="2"] { background: var(--b2); box-shadow: 0 0 0 1.5px var(--card), 0 0 0 3px var(--gold); }
+  .lg-dot[data-b="2"] { box-shadow: 0 0 0 1.5px var(--card), 0 0 0 2.5px var(--gold); margin: 0 1px; }
+  .dot[data-b="3"], .lg-dot[data-b="3"] { background: var(--b3); }
+  .dot[data-b="4"], .lg-dot[data-b="4"] { background: var(--b4); }
+  .dot.out[data-b] { background: var(--card); box-shadow: inset 0 0 0 1.5px var(--out); }
+  .dot.on[data-b]:not(.out) { background: var(--gold); }
+  .row.early .dot[data-b]:not(.out) { opacity: 0.8; }
+  .lv-legend { flex-basis: 100%; align-items: center; }
+  .lv-legend b { font-weight: 600; color: var(--dim); }
+  .wide-head { background: rgba(120, 170, 255, 0.05); }
+  .wide-head b { color: #9cc4ff; }
+
+  /* ---- results: tabs, sort and filter, map details, the leveling ladder */
+  .viewbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 16px; margin: -6px 0 16px; }
+  .seg { display: inline-flex; padding: 3px; gap: 2px; background: var(--card); border: 1px solid var(--line); border-radius: 11px; }
+  .seg button { font: inherit; font-size: 14px; font-weight: 600; color: var(--dim); background: none; border: 0; border-radius: 8px;
+    padding: 7px 16px; cursor: pointer; transition: background 0.2s, color 0.2s; }
+  .seg button:hover { color: var(--text); }
+  .seg button[aria-selected="true"] { background: var(--card2); color: var(--gold); box-shadow: inset 0 0 0 1px var(--line); }
+  .btn.small { padding: 7px 14px; font-size: 14px; border-radius: 9px; cursor: pointer; font-family: inherit; }
+  .tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 22px; padding: 14px 22px 0; font-size: 13.5px; color: var(--dim); }
+  .tools label { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; margin: 0; font-size: 13.5px; font-weight: 400; color: var(--dim); }
+  .tools select { font: inherit; font-size: 13.5px; color: var(--text); background: var(--card2); border: 1px solid var(--line);
+    border-radius: 8px; padding: 5px 10px; }
+  .tools .chk { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
+  .tools input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--gold); }
+  .chip.fresh { color: var(--dim); background: var(--card2); box-shadow: inset 0 0 0 1px var(--line); margin-top: 0; }
+  .chip.widen { color: #9cc4ff; background: rgba(120, 170, 255, 0.1); box-shadow: inset 0 0 0 1px rgba(120, 170, 255, 0.28); margin-top: 0; }
+  .meta .chip { vertical-align: 1px; }
+  .more-btn { display: block; width: 100%; padding: 14px 22px; font: inherit; font-size: 14px; font-weight: 600; color: var(--gold-soft);
+    background: rgba(0, 0, 0, 0.12); border: 0; border-top: 1px solid var(--line); cursor: pointer; }
+  .more-btn:hover { color: var(--gold); background: rgba(0, 0, 0, 0.06); }
+  .more-btn.inline { display: inline-block; width: auto; margin-top: 10px; padding: 8px 14px; border: 1px solid var(--line); border-radius: 10px; }
+  .none-head { padding-bottom: 20px; }
+  .open { margin-top: 6px; display: inline-flex; align-items: center; gap: 6px; font: inherit; font-size: 12.5px; font-weight: 600;
+    color: var(--gold-soft); background: none; border: 0; padding: 2px 0; cursor: pointer; }
+  .open:hover { color: var(--gold); }
+  .open i { width: 7px; height: 7px; border-right: 2px solid currentColor; border-bottom: 2px solid currentColor;
+    transform: rotate(45deg) translate(-1px, -1px); transition: transform 0.2s; }
+  .open[aria-expanded="true"] i { transform: rotate(-135deg) translate(-1px, -1px); }
+  .row .info, .row .nums { cursor: pointer; }
+  .detail { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; padding: 4px 22px 22px;
+    background: rgba(0, 0, 0, 0.1); animation: openup 0.25s ease-out; }
+  @keyframes openup { from { opacity: 0; transform: translateY(-6px); } }
+  .d-card { background: var(--card2); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; min-width: 0; }
+  .d-card h4 { margin: 0 0 10px; font-size: 12.5px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--faint); }
+  .pt-rows { display: grid; gap: 9px; }
+  .pt { display: grid; grid-template-columns: 82px 1fr auto; align-items: center; gap: 10px; }
+  .pt span { font-size: 13px; color: var(--text); line-height: 1.2; }
+  .pt small { display: block; font-size: 11.5px; color: var(--faint); }
+  .pt > i { display: block; height: 8px; border-radius: 4px; background: rgba(255, 255, 255, 0.05); overflow: hidden; }
+  .pt > i i { display: block; height: 100%; border-radius: 4px; background: #4a4f59; }
+  .pt b { font-size: 14px; color: var(--text); font-variant-numeric: tabular-nums; min-width: 58px; text-align: right; }
+  .pt.me span, .pt.me b { color: var(--gold); font-weight: 700; }
+  .pt.me > i i { background: var(--gold); }
+  .d-none { margin: 0; font-size: 13px; color: var(--faint); }
+  .lv-bars { display: flex; align-items: flex-end; gap: 4px; height: 92px; }
+  .lvb { position: relative; flex: 1; min-width: 0; height: 100%; display: flex; flex-direction: column; justify-content: flex-end; align-items: center; gap: 4px; }
+  .lvb i { display: block; width: 100%; max-width: 22px; border-radius: 4px 4px 0 0; background: #4a4f59; transition: background 0.2s; }
+  .d-card { position: relative; }
+  .lv-bars { touch-action: pan-y; }
+  .lvb { cursor: default; border-radius: 4px; }
+  .lvb:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+  .lvb.on i { background: var(--gold-soft); }
+  .lv-tip { position: absolute; z-index: 5; left: 0; top: 0; transform: translate(-50%, -100%); pointer-events: none; opacity: 0;
+    background: #14161a; border: 1px solid #3a3f4a; border-radius: 9px; padding: 7px 11px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+    transition: opacity 0.12s; white-space: nowrap; }
+  .lv-tip.show { opacity: 1; }
+  .lv-tip b { display: block; font-size: 13.5px; color: var(--text); font-variant-numeric: tabular-nums; }
+  .lv-tip span { display: block; font-size: 12px; color: var(--dim); margin-top: 1px; }
+  .lvb:hover i { background: var(--gold-soft); }
+  .lvb.me i { background: var(--gold); }
+  .lvb span { font-size: 10.5px; color: var(--faint); font-variant-numeric: tabular-nums; }
+  .lvb.me span { color: var(--gold); font-weight: 700; }
+  .ladder .stage { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 10px 22px; padding: 16px 22px; border-top: 1px solid var(--line); align-items: start; }
+  .ladder .stage:first-child { border-top: 0; }
+  .ladder .stage.me { background: rgba(255, 204, 51, 0.05); }
+  .ladder .lv { font-size: 17px; font-weight: 700; color: var(--text); font-variant-numeric: tabular-nums; }
+  .ladder .lv small { display: block; font-size: 11.5px; font-weight: 600; color: var(--gold); }
+  .ladder .picks { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; }
+  .pick { text-align: left; font: inherit; color: var(--text); background: var(--card2); border: 1px solid var(--line); border-radius: 11px;
+    padding: 10px 14px; cursor: pointer; transition: border-color 0.2s, background 0.2s; }
+  .pick:hover { border-color: var(--gold-soft); background: #2a2d36; }
+  .pick.top { box-shadow: inset 3px 0 0 var(--gold); }
+  .pick b { display: block; font-size: 15px; font-weight: 600; }
+  .pick span { display: block; font-size: 12.5px; color: var(--dim); margin-top: 2px; }
+  .seg button:focus-visible, .open:focus-visible, .more-btn:focus-visible, .pick:focus-visible, .tools select:focus-visible, .tools input:focus-visible, .btn.small:focus-visible {
+    outline: 2px solid var(--gold); outline-offset: 2px; }
+  @media (prefers-reduced-motion: reduce) { .detail { animation: none; } }
+  @media (max-width: 720px) {
+    .tools { padding: 12px 16px 0; }
+    .detail { padding: 4px 16px 18px; grid-template-columns: 1fr; }
+    .ladder .stage { grid-template-columns: 1fr; padding: 14px 16px; }
+    .seg button { padding: 7px 12px; }
+  }
+
   @media (max-width: 880px) {
     .hero .wrap, .tracker .wrap { grid-template-columns: 1fr; }
     .shot.close { right: 0; }
@@ -308,6 +427,8 @@
     .news .more, .ticker .p, .ticker .says, .ticker .n-full, .live .word { display: none; }
     .ticker .n-short { display: inline; }
     .news { font-size: 13px; }
+    .next li:nth-child(n+2) { display: none; }      /* phones: the first item only */
+    .next .wrap { gap: 10px; }
     .news .wrap { gap: 10px; }
     .classes { grid-template-columns: 1fr 1fr; }
     .rules { grid-template-columns: 1fr; }
@@ -326,6 +447,19 @@
     <span class="live"><i aria-hidden="true"></i><span class="word">Latest runs</span></span>
     <div class="ticker" id="ticker"><button type="button" tabindex="-1">Loading...</button></div>
     <span class="more" id="news-more"></span>
+  </div>
+</div>
+
+<!-- What's coming next: edit the list below, then deploy. Visitors who closed it see it again when the list changes. -->
+<div class="next" id="next" role="region" aria-label="What is coming next" hidden>
+  <div class="wrap">
+    <span class="tag-next">Coming next</span>
+    <ul>
+      <li>Chat filter</li>
+      <li>Loot log</li>
+      <li>Item drop chance %, from community data from MCWO</li>
+    </ul>
+    <button type="button" id="next-x" aria-label="Close this notice">&times;</button>
   </div>
 </div>
 
@@ -349,7 +483,7 @@
       <p class="sub">Real EXP/hr and mesos/hr for every map, for your class and level, solo or in a party. Every number is real farming, shared by players using the free <a href="#overlay">Maple Classic Exp Overlay</a>.</p>
       <div class="counts" id="counts">
         <div class="count"><b id="c-hours">–</b><span>hours shared</span></div>
-        <div class="count"><b id="c-players">–</b><span>players</span></div>
+        <div class="count"><b id="c-players">–</b><span id="c-players-l">players</span></div>
         <div class="count"><b id="c-maps">–</b><span>maps</span></div>
       </div>
     </div>
@@ -386,6 +520,13 @@
 <section class="results" id="results-section">
   <div class="wrap">
     <div class="section-head"><h2 id="results-title">Best maps</h2><p id="results-sub"></p></div>
+    <div class="viewbar">
+      <div class="seg" role="tablist" aria-label="What to show">
+        <button type="button" role="tab" id="tab-maps" aria-selected="true">Best maps</button>
+        <button type="button" role="tab" id="tab-ladder" aria-selected="false" tabindex="-1">Leveling ladder</button>
+      </div>
+      <button type="button" class="btn ghost small" id="copy-link">Copy link</button>
+    </div>
     <div id="results" class="chart-wrap"></div>
   </div>
 </section>
@@ -457,7 +598,7 @@
       <div class="rule"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>
         <h3>Outliers left out</h3><p>Runs under half or over double what others get on that map are dropped.</p></div>
       <div class="rule"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="9" r="3"/><circle cx="16" cy="9" r="3"/><path d="M2 20c0-3 2.7-5 6-5s6 2 6 5m0-5c3.3 0 8 2 8 5"/></svg>
-        <h3>3 players or more</h3><p>A map is only ranked once 3 different players have farmed it. Before that, it's shown greyed out as early data.</p></div>
+        <h3>3 players or more</h3><p>A map is only ranked once 3 different players have farmed it. Before that, it's early data: hidden at first, and greyed out when you show it.</p></div>
     </div>
   </div>
 </section>
@@ -476,7 +617,7 @@
     <details><summary>How do I read the chart?</summary>
       <p>Each row is a map, and every row uses the same scale, so further right means more EXP/hr. Each dot is one player: their typical run on that map, however much they've played it. The gold line is the typical EXP/hr there (half of players get more, half less), and the shaded bar is what the middle half of players get. A short bar means most players get about the same; a long one means gear, skills and how busy the map is make a big difference. Hollow red rings are runs left out of the numbers for being under half or over double what others get, like an AFK player or a leech. Point at anything (or tap it) for the exact numbers.</p></details>
     <details><summary>Why isn't my map or class here yet?</summary>
-      <p>A map is ranked once 3 different players around your level (within 5 levels), on the same path, and solo or in a party like you, have shared a run there. Until then, it's listed under Early data, greyed out, so you can see what's come in so far. The more people share, the faster it fills in. You can help by sharing yours!</p></details>
+      <p>A map is ranked once 3 different players around your level (close to your level: a map starts with players within 3 levels of yours and only goes up to 5 if it needs more players, and says so), on the same path, and solo or in a party like you, have shared a run there. Until then, it's early data: untick Hide early data to see what's come in so far, greyed out. A new player's runs start counting a day after their first one, and once they have a few, so a flood of made-up players can't change the numbers at once. Map names that the game doesn't have (an event map, say) show once 3 players have shared them on 2 different days. The more people share, the faster it fills in. You can help by sharing yours!</p></details>
     <details><summary>Found a problem?</summary>
       <p>Use <b>Report a bug</b> in the overlay's settings, or open an issue on <a href="https://github.com/beanguri/Maple-Classic-Exp-Overlay/issues">GitHub</a>.</p></details>
   </div></div>

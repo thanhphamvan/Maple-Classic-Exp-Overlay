@@ -1,11 +1,16 @@
 # Builds the Windows download on GitHub from this code. Release downloads only ever come from
 # here (never from someone's own PC), so anyone can check where a download came from.
 #
-# - Pushing a version tag (e.g. v0.9.7-beta) builds it, signs the .exe once SignPath is set
-#   up, records a signed attestation (this workflow built this zip from this commit), and
-#   makes a DRAFT release with the zip and its SHA-256. A person reads it over and publishes
-#   it. A release that's already published is never changed from here.
+# - Pushing a version tag (e.g. v0.9.10-beta) builds it, signs the .exe once SignPath is set
+#   up, records a signed attestation (this workflow built this zip from this commit), checks
+#   that attestation itself, and makes a DRAFT release with the zip and its SHA-256. A person
+#   reads it over and publishes it. A release that's already published is never changed from
+#   here.
 # - "Run workflow" (Actions tab) just builds, and leaves the zip on the run's page.
+#
+# The zip is kept on the run's page as it is (not wrapped in another zip, which GitHub does
+# to artifacts unless told not to), so the SHA-256 shown there is the zip's own SHA-256: the
+# same as SHA256SUMS.txt and the release page.
 #
 # Check a download:   gh attestation verify <the zip> --repo beanguri/Maple-Classic-Exp-Overlay
 #
@@ -38,6 +43,15 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           persist-credentials: false
+      - name: The tag matches the program's version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          version=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' maple_exp.py)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::The tag is $GITHUB_REF_NAME but maple_exp.py says VERSION = $version. Fix one, and tag again."
+            exit 1
+          fi
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: "3.10"
@@ -49,13 +63,17 @@ jobs:
         run: |
           python tests/test_logic.py
           python tests/test_screen.py
-          python tests/test_pipeline.py
           python tests/test_ocr.py
+          python tests/test_report.py
+          python tests/test_health.py
+          python tests/test_capture.py
+          python tests/test_pipeline.py
+          python tests/test_ocr_backends.py
       - name: Build
         run: python build.py
       - name: Keep the unsigned build
         id: unsigned
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: unsigned
           path: build/dist/Maple Classic Exp Overlay
@@ -74,35 +92,79 @@ jobs:
         if: env.SIGNPATH_API_TOKEN != ''
         run: python build.py zip signed
       - name: SHA-256 of the download
+        id: sum
         shell: bash
         run: |
           cd release
-          sha256sum *.zip | tee SHA256SUMS.txt
+          sha256sum --text *.zip | tee SHA256SUMS.txt
+          echo "zip=release/$(ls *.zip)" >> "$GITHUB_OUTPUT"
           { echo "### The download"; echo; echo '```'; cat SHA256SUMS.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - name: Record where the download came from (attestation)
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6  # v4.2.2
         with:
-          subject-path: release/*.zip
-      - name: Keep the download
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+          subject-path: ${{ steps.sum.outputs.zip }}
+      - name: Check the attestation (the build proves itself)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ZIP: ${{ steps.sum.outputs.zip }}
+        run: |
+          for try in 1 2 3 4 5 6; do
+            if gh attestation verify "$ZIP" --repo "$GITHUB_REPOSITORY" \
+                 --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/build.yml"; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::The attestation doesn't verify."
+          exit 1
+      - name: Keep the download on this run's page (the zip itself, not wrapped in another zip)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
-          name: download
-          path: |
-            release/*.zip
-            release/SHA256SUMS.txt
+          path: ${{ steps.sum.outputs.zip }}
+          archive: false
+      - name: Keep the checksum on this run's page
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          path: release/SHA256SUMS.txt
+          archive: false
       - name: Draft the release
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
+          ZIP: ${{ steps.sum.outputs.zip }}
         run: |
-          state=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || echo none)
+          name=$(basename "$ZIP")
+          hash=$(sha256sum "$ZIP" | cut -d' ' -f1)
+          title="Maple Classic Exp Overlay $(echo "$TAG" | sed -E 's/-beta$/ (beta)/')"
+          run="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          cat > notes.md <<'EOF'
+          (Notes to come.)
+
+          ---
+          **Check this download**
+          - SHA-256 of __NAME__: `__HASH__` (also in SHA256SUMS.txt). In PowerShell: `Get-FileHash .\__NAME__`
+          - Built by GitHub from this tag, not on a PC. Check it with the GitHub CLI: `gh attestation verify __NAME__ --repo __REPO__`
+          - The same file is on [the build's page](__RUN__), where GitHub shows the same SHA-256.
+          EOF
+          sed -i -e "s|__NAME__|$name|g" -e "s|__HASH__|$hash|g" -e "s|__REPO__|$GITHUB_REPOSITORY|g" -e "s|__RUN__|$run|g" notes.md
+          state=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || echo none)
           if [ "$state" = "none" ]; then
-            gh release create "$TAG" release/*.zip release/SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" \
-              --draft --verify-tag --title "$TAG" --notes "Built on GitHub from $TAG. (Notes to come.)"
+            gh release create "$TAG" "$ZIP" release/SHA256SUMS.txt --draft --verify-tag --title "$title" --notes-file notes.md
           elif [ "$state" = "true" ]; then
-            gh release upload "$TAG" release/*.zip release/SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --clobber
+            gh release upload "$TAG" "$ZIP" release/SHA256SUMS.txt --clobber
+            if gh release view "$TAG" --json body --jq .body | grep -q '(Notes to come.)'; then
+              gh release edit "$TAG" --notes-file notes.md
+            else
+              echo "::warning::The draft's notes were already written. If they show a SHA-256, update it to: $hash"
+            fi
           else
             echo "::warning::$TAG is already published, so it's left as it is. The build is on this run's page."
+            exit 0
           fi
+          # What's on the draft must be exactly what was built.
+          mkdir check
+          gh release download "$TAG" --pattern "$name" --dir check
+          (cd check && sha256sum --check ../release/SHA256SUMS.txt)

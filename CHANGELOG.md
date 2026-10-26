@@ -1,10 +1,151 @@
 # Changelog
 
-## Not released yet
+## Unreleased (fork)
+
+- Detect Nexon's Mac launcher game window above the menu-bar layer and ignore tiny launcher windows.
+- On macOS, try one picture of the game window per look so overlapping windows do not obscure readings. Fall back to the existing screen capture if the API is unavailable, returns an invalid picture, or raises an exception. Selected-area mode still reads the screen.
+- Bug-report game pictures use the same window-capture approach, with overlay masking on screen-capture fallback.
+
+## 0.9.13-beta
+
+**Fewer reading problems**
+- One part that can't be read (map name, class, mesos, potions, level badge) never stops the others: EXP keeps reading, and the status line says which part is having trouble.
+- A stuck or missing Tesseract (the text reader) no longer freezes the EXP display, and the message says what's wrong and how to fix it (a missing `eng.traineddata`, or a folder name with unusual characters).
+- The overlay keeps starting even if a folder on your PC can't be looked into, and the reading tries again if Windows briefly refuses the screen capture.
+
+**High levels (a bar with only a percentage, about Lv 57+)**
+- Leveling up from the last level with an EXP number to the first one with only a % no longer gets stuck on "level changed".
+- Runs at these levels count in the log and on the overlay (they showed 0). They're still never shared.
+- A window over the LV badge now says so and offers Settings, Level fallback; Reset and switching to Select area forget the old level.
+- A partly covered name row no longer starts the session over by itself.
+
+**Health reports (your choice, off until you say yes)**
+- Once a day the overlay can send numbers about how well it reads your screen: how many looks read fine, screen and game size, how long a look takes, which error types happened. Never pictures, names, chat, map names or your log. It uses its own random ID, not linked to shared runs. It asks once; change it any time in Settings. See Privacy in the README.
+
+**Send a report without GitHub**
+- Report a bug, then **Send to the developer**: type what went wrong and send it. It shows exactly what is sent first. Text only, at most 3 a day.
+- Bug reports (both ways) now remove your Windows user name and folders from file paths in error messages too.
+
+**A new EXP reader, tested quietly**
+- A new way to find and read the EXP bar (by shape, not colour) runs in the background and only notes whether it agrees with the current one. It changes nothing you see; if it costs too much CPU on your PC it slows down or switches itself off.
+
+## 0.9.12-beta
+
+**Hotfix: an EXP bar that shows only a percentage**
+- Players at high levels (about Lv 57 and up, where a level needs a million EXP or more) reported that the overlay found no EXP bar. From there the game shows only the percentage, like `EXP. [58.47%]`, with no EXP number, and the overlay needed the number. It reads that bar now.
+- Your level comes from the orange **LV** badge on the status bar. EXP is then worked out from your level's EXP and the percentage, so EXP/hr, last 5 minutes, gained and current are estimates, and show a ≈ in front (in your log too).
+- If the badge can't be read, it keeps your level from before the number went away, but only for the same character: it compares a small picture of the name row, which only lives in memory. It never reads, saves or sends your character's name.
+- If that fails too, **Settings, Level fallback** lets you type your level. It lasts for this session only.
+- Estimates stay on your PC: a run made from a percentage alone is never shared with the best-maps website.
+- Fixed an error in the status line before the first EXP reading.
+
+## 0.9.11-beta
+
+**Mesos/hr you can trust**
+- Mesos you spend or move at an NPC shop, storage or a trade are left out of mesos/hr (the status line says what was left out). Only mesos you pick up count.
+- The inventory doesn't have to stay open: the first look sets the start, a later look adds what you earned since, and mesos/hr holds still while it is closed.
+- After a trip to town, open the inventory when it asks, so what you earned before the trip is kept.
+- Your log shows a stretch's mesos from the first to the last look at the inventory, however far apart.
+
+**Potion cost and net mesos/hr: what you really make**
+- Mesos/hr says what you pick up. **Net mesos/hr** takes off what the potions and food you drink cost, so you can see which map really pays. Example: 300,000 mesos/hr, and in that hour 200 Red Potions (50 each) and 30 Blue Potions (220 each) = 16,600 in potions, so net is **283,400 mesos/hr**.
+- **Keep the potions you use on the quick-slot bar**, the hotkey slots at the bottom right of the game, so their counts show. The overlay reads that bar every 3 seconds: when a count goes down (326 to 325), that's one used. Potions that are only in your inventory window aren't seen. Skills, empty slots and other items (stars, scrolls, pet food) are ignored.
+- **It counts only while tracking is on** and EXP is coming in. Paused or in town, nothing counts. Buying or looting more of a potion (its count going up) is never a use. Reset starts the count again from zero.
+- **Prices** are the NPC shop prices (Red Potion 50, Orange 150, White 350, Blue 220, Elixir 3,000...). Potions no NPC sells (Mana Elixir, Power Elixir, Sap of Ancient Tree, Drake's Blood...) count as free until you type what you pay for them: **Settings, Potions, Prices**. If you set a shop potion you used to 0, net shows a dash and the status line asks for a price.
+- **Where you see it:** a Net / hr tile in the full view (next to Last 5 min, Mesos / hr and Elapsed), Potion cost and Net mesos / hr in Details, a Net/hr column in your log, and a small "net" in the Square, Wide and Bar shapes. It shows the cost in mesos, never a count of potions.
+- Don't want it? Switch it off in **Settings, Potions**: potions aren't counted and no net is shown.
+- Potion data stays on your computer: nothing about it is sent to the best-maps website.
+
+**Clean runs for the best-maps website**
+- A run counts for the website only after 15 minutes on one map without a break: 15 seconds without EXP ends it, whatever your log's gap setting (your log still uses your setting).
+- A run where a shop, storage or trade window was open is kept in your own records and never shared.
+- A run is sent with mesos only when the inventory was looked at when it started and within 30 seconds after it ended. Otherwise it is sent with EXP only. Mesos that look impossible (below zero, over 20M an hour, or a reading that later snapped back) are never sent.
+- If you pause right after a run while it waits for that look, it asks: "Open the inventory now so your run is logged for the website." It waits 7 seconds.
+- The website now ignores mesos it can't trust (from older overlay versions, a week after this release), and its map figures use the last 60 days.
+
+## 0.9.10-beta
+
+**When the minimap's name is covered**
+- After 3 seconds without the minimap's name, the status line says so ("Can't see the minimap's name. Still tracking...") and says when it is back. A short cover changes nothing in your run; it still pauses after 45 seconds.
+- While the name is hidden, nothing new is saved to the log. If the name comes back on the same map, the hidden time counts. If it comes back on a different map, the stretch that was in progress is dropped (stretches already saved stay as they were), so the new map's EXP is never saved under the old map.
+- It looks for a missing name every second (was every 3), and retries an unreadable one every 2 seconds (was 5).
+
+**Compact shapes and what's new**
+- **Compact mode has three shapes:** **Square** (as before), **Wide** (longer sideways, with a row of four numbers like a streamer's tracker) and **Bar** (one thin strip). Pick one in Settings, under Compact shape. The full view and the log are unchanged.
+- **A new install picks its shape on the first launch**, from three small pictures.
+- **A short "What's new" window** shows once after you update to a new version (never on a first install).
+
+**New address**
+- The best-maps website is now at **mcwo.app** (opening the old maple-classic-exp-overlay.pages.dev page now sends you there; older overlays keep working on the old address for now). The overlay's Best maps button and sharing use the new one.
+
+**Cleaner map names**
+- A map's name is now put right against the game's own list of maps (from meowdb.com, thank you): OCR slips like "ist Accompaniment" for "1st Accompaniment" or "Boar Il" for "Boar II" become one map, in your log and on the best-maps site. A map that isn't on the list (an event map, a new map) is used as it was read.
+- **The minimap's name can't be seen** (hidden, covered): after 45 seconds the overlay pauses instead of carrying on under the map you were on before, and carries on when it can read the name again. (This is likely why a town like Perion could end up in people's logs.)
+- **Towns** aren't logged ("In a town: nothing is logged here"), and the site turns town runs down.
+
+**The best-maps website: harder to fake**
+- A new player's runs start counting a day after their first, and after 4 runs, so made-up players can't change the numbers at once. Runs from a banned player are refused and hidden.
+- Runs are checked before anything is stored: the job must be a real job, the map name plain English text (adverts, links and look-alike letters are turned down), and EXP and mesos must be believable for the level.
+- One home's IPv6 addresses count as one connection, a day's new players and runs have a limit (so a flood can't use up the database), and nobody farms more than 12 different maps a day.
+- A map name the game doesn't list shows only once 3 players have shared it on 2 different days.
+
+**The best-maps website**
+- **Include new players.** A new box in Best maps and the ladder shows the players who joined lately and don't count yet (they count for everyone after a day and 4 runs). Maps that use them say so, their dots are faded, and the header shows how many are new. Off by default; map names the game doesn't list never come from new players.
+- **A closer level range.** A map's numbers start from players within 3 levels of yours, and go to 5 or 8 only if the map needs more players to be ranked (the row says "wider range").
+- **% of a level per hour and time per level** on every map ("about 14 h per level"), which compares players at different levels.
+- **Sort** by EXP/hr, %/hr or mesos/hr, and **hide early data**.
+- **Details** under every map: solo vs party, EXP/hr at each level, and the last 7 days against before.
+- **Leveling ladder:** the best map for each 5 levels of your class and path.
+- **Copy link**: the address always holds your level, class, path and sort, so a view can be shared.
+- It tells you when the newest run was shared.
+- **Maps at your level come first**: maps that had to use players from further away (up to 8 levels) are listed under their own "Wider range" heading.
+- **Dots are coloured by the player's level** against yours (4+ lower, 1–3 lower, your level, 1–3 higher, 4+ higher), so you can see which level the high-EXP players are at, and hovering a dot or a level bar in Details says the level and number of players.
+
+## 0.9.9-beta
 
 **New**
+- **Smaller sizes:** Settings > Size now goes down to 70% and 60% (it was 80%). The smallest text stops at a readable size.
+- **Transparency stops at 40%.** More and the window could fade so far that you couldn't find Settings again. A higher saved value becomes 40%.
+
+**Fixed**
+- **Hotkeys in Settings:** clicking one to change it could leave several looking selected (and the first click could fail with an error). Now only one waits for keys at a time: clicking another moves it, clicking the same one again (or Esc) cancels, and hotkeys come back right away if you turn them off or click away from Settings.
+- A long number in the three small panels (like 99,999,999) now shrinks to fit instead of running out of its box.
+- **Select area** crashed on Windows ("expected integer but got bold") since 0.9.7. It opens again.
+
+**Better bug reports**
+- The report now also saves **bug-report.txt**: your screens and Windows scaling, the game window, where each part (EXP bar, mesos, minimap, party list) was found, how the reading thread is doing, what the overlay last said (with times), and the end of errors.log. At the top it lists what looks wrong, like "the overlay is covering the class name".
+- The picture now also shows where the class and map name are read, with a line on how each went. View capture shows the same, and says why the class wasn't read.
+- Optionally (it asks) a small picture of the whole game window, saved only if you say yes.
+
+## 0.9.8-beta
+
+**Lighter and more reliable**
+- **Far less CPU:** the overlay used a thread per core for tiny pictures, and the threads mostly waited on each other. It now uses one. In a test on a 1080p game window that took a normal look from about 100 ms of CPU to 12 ms, and the look at the whole window (every 4 seconds) from about 350 ms to 60 ms. How much you gain depends on your core count; the more cores, the more.
+- Reading the map name and your class asks Tesseract once instead of six times (about 4.5 times faster), with the same answers.
+- **Storage and trade windows:** they show a second mesos box next to yours, and the overlay could read that one instead. It now sees there are two, reads neither, and picks yours up again once the window closes (thanks to Xoere, whose recording showed it).
+- Map names and classes now also work when your Windows user name has letters your PC's text code page can't hold (some non-Latin names): Tesseract couldn't open its pictures there, so they were never read.
+- `pytesseract` isn't used any more: one less package in the download.
+- Thanks to thanhphamvan, whose fork's measurements pointed at the extra threads and the six Tesseract runs.
+
+**A new look**
+- The whole overlay is redrawn: a big glowing EXP/hr, a live trend line (is your pace rising or falling vs the last 5 minutes?), a progress bar to your next level, a status pill (looking for the game / ready / tracking / paused), and one clear Start button. The title bar matches the window (Windows 10 and 11).
+- Less clutter: three key numbers up front (last 5 min, mesos/hr, elapsed); everything else is one click away under **Details**, and it remembers if you opened it.
+- "Don't log" is now a switch called **Log this run** (no more double negatives). Select area and View capture are under the **...** menu.
+- Log, notes, Settings and the update window match, with a bundled typeface (Manrope, SIL Open Font License), real switches, a gold slider and thin scrollbars.
+- **Compact mode shows mesos/hr** too, under the EXP/hr number, in the same window size.
+- Just as light as before: the numbers move pre-drawn pictures instead of redrawing, and nothing is redrawn while nothing changes.
+
+## 0.9.7-beta
+
+**New**
+- **Notes on your log lines:** click a line and write a note about it in the box under the log. A ✎ in the new **Note** column marks lines that have one. Notes save as you type and **stay on your PC only**: they live in your log file, are never shared with the best-maps site, and the overlay's tests check that nothing the overlay sends can include them. Renaming a map (even when it merges two lines), farming more on a line, and updating keep your notes. Deleting a line asks first, and says its note goes too. Typing in the box doesn't trigger the hotkeys.
+- **A backup of your log each day** (the last 7, in a `backups` folder next to it), so a recent copy of your log and notes is always there.
 - **One log line per party**: playing a map in a party, people join and leave, and each party size used to get its own line. Now a map's party sizes on a day share one line (e.g. "4–5ppl ▸"), with EXP/hr and mesos/hr over all of that time. Click it to see a line for each party size, to compare them. Solo play keeps its own line. Your log itself isn't changed, only how it's shown.
-- **macOS** (running from source): works on a Mac with the game in CrossOver, Whisky, Parallels or a game stream. It finds the game window by itself, as on Windows. See "For developers" in the README. Hotkeys aren't available on macOS yet.
+- **macOS** (running from source; thanks to thanhphamvan): works on a Mac with the game in CrossOver, Whisky, Parallels or a game stream. It finds the game window by itself, as on Windows. See "For developers" in the README. Hotkeys aren't available on macOS yet. It has only been tried with the game by its author; the maintainer has no Mac, so reports are welcome.
+
+**Fixed**
+- Mesos: a small change across a digit boundary, like 9,980 to 10,020, is now counted instead of dropped (thanks to TaylorAdamCA).
+- Typing "!" in a note or a map name no longer triggers the Shift+1 hotkey.
 
 **Lighter**
 - **About half the CPU while tracking**, and almost none between kills: the EXP bar and mesos aren't read again while they look exactly as they did. Reads just the same as before.
@@ -13,9 +154,10 @@
 - On macOS, one screenshot of the game a look instead of two or three (each costs the same there, at any size).
 
 **Safer**
-- Downloads are now built by GitHub from this code, never on a PC, from exact package files checked against their SHA-256. Each one gets an attestation anyone can check (`gh attestation verify`), and its SHA-256 is on the release page. See "Where the download comes from" in the README.
+- Downloads are now built by GitHub from this code, never on a PC, from exact package files checked against their SHA-256. Each one gets an attestation anyone can check (`gh attestation verify`), and its SHA-256 is on the release page and on the build's page (the same one in all three places). See "Where the download comes from" in the README.
 - Built with Pillow 12.3, which fixes the problems published since 11.3. (The overlay never opens image files from elsewhere, so it wasn't affected, but now nothing is flagged.)
 - It never runs a `tesseract.exe` from the folder it happens to be started from, only its own or an installed one.
+- Sharing is off whenever the overlay runs in test mode (`MAPLE_EXP_DATA` set), so made-up test runs can never reach the real site.
 
 **The best-maps website**
 - Security headers: browsers only run the site's own scripts, and other sites can't show it inside theirs.
