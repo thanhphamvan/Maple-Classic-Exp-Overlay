@@ -92,6 +92,15 @@ class Platform(ABC):
     def tesseract_candidates(self, home_dir, app_dir):
         """Where to look for Tesseract, best first. Never the current folder."""
 
+    def tessdata_candidates(self, exe):
+        """The folders that may hold `eng.traineddata` for this Tesseract program (a Path), best first."""
+        return [exe.parent / "tessdata"]
+
+    def tessdata_arg(self, exe, folder):
+        """The --tessdata-dir value to pass for this data folder: "" to leave Tesseract to find it
+        itself, None if it can't be given to Tesseract at all."""
+        return ""
+
     @abstractmethod
     def claim_single_instance(self, key, title, old_titles=()):
         """Makes this the only copy running for `key` (one per data folder). If another copy
@@ -136,6 +145,18 @@ class Platform(ABC):
     def show_file(self, path):
         """Opens the file's folder in the OS's file browser, with the file selected."""
 
+    def dpi_awareness(self):
+        """How this program handles screen scaling, in words, for bug reports (None if n/a)."""
+        return None
+
     def font(self, family, weight):
         """(family, weight) to use for one of the overlay's fonts, named by its Windows font."""
         return family, weight
+
+    def register_fonts(self, paths):
+        """Makes the font files available to this program only (not installed). True if all worked."""
+        return False
+
+    def style_window(self, root, background, text):
+        """Makes the window's frame match the overlay's colours where the OS allows it
+        (the title bar), given as '#rrggbb'. Does nothing where it can't."""

@@ -1,0 +1,74 @@
+// Checks the formatting part of tools/health_summary.mjs with canned query results (no database needed).
+//   node server/test_health_summary.mjs
+import assert from "node:assert/strict";
+import { summarize, summarizeReports, formatOne, oneReportQuery, queries } from "./tools/health_summary.mjs";
+
+const base = { looks: 0, secs: 0, gh: null, e_read: 0, e_tess: 0, e_unclear: 0, e_nf: 0, e_cov: 0, e_nowin: 0, e_pct: 0,
+  map_r: 0, map_u: 0, cls_r: 0, cls_u: 0, mes_r: 0, mes_u: 0, pot_r: 0, pot_u: 0, sh_agree: 0, sh_dis: 0, sh_v2only: 0,
+  sh_oldonly: 0, sh_neither: 0, sh_skipped: 0, sh_err: 0, ms_look_w: 0, ms_v2_w: 0, v2_looks: 0 };
+
+// Empty database.
+assert.deepEqual(summarize({ groups: [] }, 7), ["No health reports yet in the last 7 days."]);
+assert.deepEqual(summarizeReports([]), ["No Send reports in that time."]);
+
+const data = {
+  groups: [
+    { ...base, v: "0.9.14-beta", w: 2560, h: 1440, fs: 1, tess: "ok", cap: "screen", players: 12, looks: 10000, gh: 14,
+      e_read: 6500, e_tess: 200, e_unclear: 300, e_nf: 3000, e_cov: 0, e_nowin: 0, e_pct: 100,
+      map_r: 90, map_u: 10, ms_look_w: 250000, ms_v2_w: 80000, v2_looks: 10000, sh_agree: 9000, sh_dis: 4 },
+    { ...base, v: "0.9.14-beta", w: 1920, h: 1080, fs: 0, tess: "no_eng", cap: "region", players: 2, looks: 2000, gh: 10.5,
+      e_read: 1990, e_nf: 10 },
+  ],
+  days: [{ day: "2026-10-25", v: "0.9.14-beta", players: 14 }, { day: "2026-10-26", v: "0.9.14-beta", players: 9 }],
+  errors: [{ name: "TesseractError", n: 7, players: 2 }],
+  disagree: [{ sid: "a1b2c3", d: 4 }],
+  worst: [{ sid: "a1b2c3", v: "0.9.14-beta", w: 2560, h: 1440, fs: 1, looks: 800, bad: 400 }],
+};
+const text = summarize(data, 7).join("\n");
+for (const want of [
+  "14 players", "2026-10-25  14", "2026-10-26  9", "0.9.14-beta 14",
+  "2560x1440 fullscreen", "12 players", "gh 14.0", "not found 30.0%", "Tesseract 2.0%", "bar only 1.0%",
+  "1920x1080 windowed",
+  "map name 90.0% (100 tries)",
+  "no_eng 2 players", "TesseractError x7 (2 players)",
+  "agree 9,000, disagree 4", "new reader 8.0", "whole look 20.8", "a1b2c3 x4",
+  "a1b2c3  2560x1440 fullscreen", "50.0% of 800 looks",
+  "2560x1440 fullscreen (0.9.14-beta): EXP not found/unclear 33.0% of looks (12 players)",
+  'Tesseract "no_eng" on 2 players', "shadow mode disagreed 4 times",
+]) assert.ok(text.includes(want), "missing: " + want + "\n" + text);
+assert.ok(!/conn/i.test(text), "no connection codes in the summary");
+
+// No shadow data and a healthy day: a quiet "what to look at".
+const quiet = summarize({ groups: [{ ...base, v: "0.9.13-beta", w: 1920, h: 1080, fs: 0, tess: "ok", cap: "screen", players: 1,
+  looks: 500, e_read: 500 }], days: [{ day: "2026-10-25", v: "0.9.13-beta", players: 1 }] }, 7).join("\n");
+assert.ok(quiet.includes("no shadow data yet") && quiet.includes("nothing stands out"), quiet);
+
+// Send report lists and one report in full.
+const lines = summarizeReports([{ n: 12, d: "2026-10-25", version: "0.9.14-beta", id: "0123456789abcdef", m: "it says not found" }]);
+assert.ok(lines[1].includes("#12") && lines[1].includes("it says not found"));
+assert.ok(formatOne({ n: 12, id: "x", received: "t", version: "v", message: "hello", details: "" }).join("\n").includes("(none)"));
+assert.deepEqual(formatOne(undefined), ["No such report."]);
+
+// The report id/number is checked before it goes near SQL.
+assert.ok(oneReportQuery("12").includes("n = 12"));
+assert.ok(oneReportQuery("0123ab").includes("LIKE '0123ab%'"));
+for (const bad of ["1; DROP TABLE x", "abc' OR 1=1", "ABCDEF", ""]) assert.throws(() => oneReportQuery(bad), bad);
+
+// Every query filters on `received` (the indexed column).
+for (const sql of Object.values(queries("2026-10-01T00:00:00.000Z"))) assert.ok(sql.includes("received >= '2026-10-01T00:00:00.000Z'"));
+
+// One row that isn't JSON (it can't arrive through the site, only by hand) must not stop the whole summary.
+let sqlite = null;
+try { sqlite = await import("node:sqlite"); } catch { console.log("health_summary: SKIPPED the bad-row check (this Node has no node:sqlite)"); }
+if (sqlite) {
+  const db = new sqlite.DatabaseSync(":memory:");
+  db.exec("CREATE TABLE health_reports (id TEXT, day TEXT, received TEXT, conn TEXT, body TEXT)");
+  const put = db.prepare("INSERT INTO health_reports VALUES (?, '2026-10-25', '2026-10-25T10:00:00Z', 'c', ?)");
+  put.run("aaaaaaaaaaaaaaaa", JSON.stringify({ version: "0.9.14-beta", looks: 10, exp: { read: 10 }, errors: { OSError: 1 } }));
+  put.run("bbbbbbbbbbbbbbbb", "not json {{");
+  for (const [name, sql] of Object.entries(queries("2026-10-01T00:00:00.000Z"))) {
+    assert.doesNotThrow(() => db.prepare(sql).all(), `query ${name} survives a row that isn't JSON`);
+  }
+}
+
+console.log("health_summary: all checks passed");

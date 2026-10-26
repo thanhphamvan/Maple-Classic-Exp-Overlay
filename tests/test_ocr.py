@@ -1,14 +1,11 @@
-"""Tests for character recognition, in two halves that don't need each other:
-
-- the OCR backends on their own (ocr/: the game-font TemplateMatcher, Tesseract, and the
-  factory), on pictures of characters, with no game logic;
-- the readers that use them (EXP bar, mesos, map name, class), each handed a fake backend
-  with scripted answers, so what they do with an answer (where they look, cleaning it up,
-  voting, what they believe) is tested with no Tesseract and no font examples.
+"""Tests for ocr.py: Tesseract reading many pictures in one run must give the same text as
+reading each picture on its own, and fail loudly (never with a wrong answer) when it can't.
 
 Run from the project folder:  py -3 tests/test_ocr.py
-"""
+The Tesseract parts need Tesseract installed (the overlay's own is found the same way)."""
 import os
+import random
+import subprocess
 import sys
 import tempfile
 import time
@@ -16,266 +13,353 @@ from pathlib import Path
 
 os.environ["MAPLE_EXP_DATA"] = tempfile.mkdtemp()           # never touch your real data
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
-from PIL import Image, ImageDraw, ImageFont  # noqa: E402
-
 import maple_exp as m  # noqa: E402
-import ocr  # noqa: E402
-from harness import EXP, MESOS, PCT, Checks, FakeGlyphMatcher, FakeTextOCR, Pipeline, Scene  # noqa: E402
-from harness.scenes import FRAMES, PARTS  # noqa: E402
-from ocr.templates import CANON, PH, PW, TemplateMatcher, glyph_patch  # noqa: E402
+assert Path(os.environ["MAPLE_EXP_DATA"]) == m.DATA_DIR, "tests must run on their own temp data folder, never on real data"
+from ocr import tesseract as ocr  # noqa: E402
 
-c = Checks()
-rnd = np.random.default_rng(1)
-examples = {k[1:]: v for k, v in np.load(m.TEMPLATE_PATH).items() if k.startswith("d")}
-learned = m.MesosDigits(path=Path(tempfile.mkdtemp()) / "x.npz").templates()
+failures = 0
 
 
-def on_canvas(patch, scale=1, size=(60, 60)):
-    """A brightness image with patch (one PH x PW example) in its middle, scaled up."""
-    canvas = np.full(size, float(np.median(patch)), np.float32)
-    y, x = (size[0] - PH) // 2, (size[1] - PW) // 2
-    canvas[y:y + PH, x:x + PW] = patch
-    canvas = cv2.resize(canvas, None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST)
-    return canvas, (x + PW / 2) * scale, (y + PH / 2) * scale
+def check(name, ok):
+    global failures
+    print(("PASS " if ok else "FAIL ") + name)
+    failures += not ok
 
 
-# ===================================================================== the backends on their own
-c.section("glyph matcher (TemplateMatcher), on its own")
-tm = TemplateMatcher.load(m.TEMPLATE_PATH)
-c.check(f"loads the game's digit examples ({len(tm.labels)} examples of {''.join(tm.digits)})",
-        tm is not None and tm.digits == list("0123456789"))
-c.check("it's a GlyphMatcher", isinstance(tm, ocr.GlyphMatcher))
-for scale in (1, 2, 3):
-    wrong = []
-    for d, patches in sorted(examples.items()):
-        for patch in patches[:: max(1, len(patches) // 3)]:
-            img, cx, cy = on_canvas(np.asarray(patch, np.float32), scale)
-            got, score, lead = tm.match(img, cx, cy, CANON * scale)
-            if got != d or score < 0.9:
-                wrong.append(f"{d}->{got} ({score:.2f})")
-    c.check(f"recognises every digit drawn {CANON * scale} px tall ({', '.join(wrong[:4]) or 'all right'})", not wrong)
-blank = np.full((60, 60), 128, np.float32)
-c.check(f"an empty spot doesn't pass for a digit (score {tm.match(blank, 30, 30, CANON)[1]:.2f})",
-        tm.match(blank, 30, 30, CANON)[1] < m.MIN_SCORE)
-noisy = [tm.match(rnd.normal(128, 40, (60, 60)).astype(np.float32), 30, 30, CANON) for _ in range(30)]
-c.check(f"noise never passes for a clear digit (best {max(s for _, s, _ in noisy):.2f})",
-        all(s < m.MIN_SCORE or lead < m.MIN_LEAD for _, s, lead in noisy))
-patch = glyph_patch(np.arange(100 * 100, dtype=np.float32).reshape(100, 100), 50, 40, CANON)
-c.check(f"glyph_patch cuts around the spot, at {CANON} px ({patch.shape}, middle {patch[PH // 2, PW // 2]:.0f})",
-        patch.shape == (PH, PW) and abs(patch[PH // 2, PW // 2] - (40 * 100 + 50)) <= 101)
-folder = Path(tempfile.mkdtemp())
-TemplateMatcher.save(folder / "t.npz", {"1": examples["1"][:2], "7": examples["7"][:2]})
-small = TemplateMatcher.load(folder / "t.npz")
-img, cx, cy = on_canvas(np.asarray(examples["7"][0], np.float32))
-c.check("saves and loads its examples (and only knows those characters)",
-        small.digits == ["1", "7"] and small.match(img, cx, cy, CANON)[0] == "7")
-np.savez(folder / "old.npz", canon=CANON + 1, d1=examples["1"][:1])
-(folder / "junk.npz").write_bytes(b"not a file of examples")
-c.check("a missing, broken or other-size examples file loads as None",
-        TemplateMatcher.load(folder / "none.npz") is None and TemplateMatcher.load(folder / "junk.npz") is None
-        and TemplateMatcher.load(folder / "old.npz") is None)
+# ---- with a fake Tesseract: what the wrapper asks for, and how it fails
+calls = []
+real_run = subprocess.run
 
-c.section("text OCR backends and the factory, on their own")
-none = ocr.create_text_ocr("none")
-c.check("'none' reads nothing and says it can't", isinstance(none, ocr.NoTextOCR) and not none.available
-        and none.read_line(np.full((40, 200), 255, np.uint8)) == "")
-c.check("'auto' with no Tesseract found: none", not ocr.create_text_ocr("auto", None).available)
-for bad, args in (("an unknown backend", ("easyocr",)), ("Tesseract without its path", ("tesseract", None))):
+
+def fake_run(output="", code=0, err=b""):
+    def run(args, **kw):
+        calls.append((args, kw))
+        return subprocess.CompletedProcess(args, code, output.encode(), err)
+    return run
+
+
+two = [np.full((20, 60), 255, np.uint8)] * 2
+t = ocr.Tesseract(r"C:\somewhere\tesseract.exe")
+ocr.subprocess.run = fake_run("12\r\n\f34\r\n")
+check("two pictures come back as two texts (split at the page break)",
+      [x.strip() for x in t.read_lines(two, "0123456789")] == ["12", "34"])
+args, kw = calls[-1]
+check("it runs the given program, one line of text per picture, on a list of files",
+      args[0] == r"C:\somewhere\tesseract.exe" and args[2] == "stdout" and "--psm" in args and "7" in args)
+check("the allowed characters are passed on", "tessedit_char_whitelist=0123456789" in args)
+check("Tesseract's own threads are off, and it can't wait forever or ask for input",
+      kw["env"]["OMP_THREAD_LIMIT"] == "1" and kw["timeout"] > 0 and kw["stdin"] == subprocess.DEVNULL)
+check("it ran once for both pictures", t.runs == 1)
+ocr.subprocess.run = fake_run("12\r\n")
+try:
+    t.read_lines(two)
+    check("fewer texts than pictures is an error, not a guess", False)
+except ocr.TesseractError:
+    check("fewer texts than pictures is an error, not a guess", True)
+ocr.subprocess.run = fake_run("", 1, b"Error opening data file")
+try:
+    t.read_lines(two)
+    check("a failing Tesseract is an error", False)
+except ocr.TesseractError as e:
+    check("a failing Tesseract is an error that says why", "data file" in str(e))
+n = len(calls)
+check("no pictures means no run", t.read_lines([]) == [] and len(calls) == n)
+
+# a Tesseract that hangs ends each run at the timeout: the wait is paid once, then it is left alone for a while
+# (every look asks for it: the class, the map name, the badge; 30 s each would freeze the whole reading)
+clock = [1000.0]
+real_monotonic = time.monotonic
+time.monotonic = lambda: clock[0]
+hang_runs = []
+
+
+def hangs(args, **kw):
+    hang_runs.append(kw["timeout"])
+    raise subprocess.TimeoutExpired(args, kw["timeout"])
+
+
+def asks(h):
     try:
-        ocr.create_text_ocr(*args)
-        refused = False
-    except ValueError:
-        refused = True
-    c.check(f"{bad} is turned down clearly", refused)
-tess = ocr.create_text_ocr("auto", m.find_tesseract())
-if tess.available:
-    def line(text, size=40):
-        font = ImageFont.load_default(size=size)
-        img = Image.new("L", (24 + int(size * 0.7 * len(text)), size + 32), 255)
-        ImageDraw.Draw(img).text((12, 8), text, fill=0, font=font)
-        return np.array(img)
-    c.check(f"'auto' finds Tesseract ({type(tess).__name__} at {tess.cmd})", tess.name == "tesseract")
-    got = tess.read_line(line("68,601"), chars="0123456789,")
-    c.check(f"Tesseract reads a line of digits ({got.strip()!r})", got.strip() == "68,601")
-    got = tess.read_line(line("Rocky Road"))
-    c.check(f"Tesseract reads a line of words ({got.strip()!r})", got.strip() == "Rocky Road")
-    got = tess.read_line(line("A1B2"), chars="0123456789")
-    c.check(f"   only gives back the characters it's allowed ({got.strip()!r})", set(got.strip()) <= set("0123456789"))
+        return h.read_lines(two)
+    except ocr.TesseractError as e:
+        return str(e)
+    except Exception as e:
+        return type(e).__name__
+
+
+try:
+    ocr.subprocess.run = hangs
+    h = ocr.Tesseract(r"C:\somewhere\tesseract.exe", timeout=30)
+    got = asks(h)
+    check(f"a run that times out is a TesseractError saying so ({got})", "30" in got and len(hang_runs) == 1)
+    for _ in range(5):
+        clock[0] += 10
+        asks(h)
+    check(f"...and for the next minute Tesseract isn't started again ({len(hang_runs)} run in 50 s)", len(hang_runs) == 1)
+    clock[0] += 20
+    asks(h)
+    check("...then it gets another try", len(hang_runs) == 2)
+    ocr.subprocess.run = fake_run("12\r\n\f34\r\n")
+    clock[0] += 61
+    check("...and once a run works it is used as usual", [x.strip() for x in h.read_lines(two)] == ["12", "34"])
+    ocr.subprocess.run = hangs
+    clock[0] += 1
+    asks(h)
+    check("...a fresh hang pauses it again", len(hang_runs) == 3)
+finally:
+    time.monotonic = real_monotonic
+ocr.subprocess.run = real_run
+ocr.subprocess.run = real_run
+
+# ---- with the real Tesseract: one run for many pictures gives the same text as one run each
+tess = m.find_tesseract()
+if not tess:
+    print("     (Tesseract isn't installed: the real-Tesseract tests are skipped)")
 else:
-    print("     (Tesseract isn't installed: the Tesseract backend isn't tested)")
+    real = ocr.Tesseract(tess)
+    rnd = random.Random(5)
+    words = ["Rocky Road II", "Ant Tunnel I", "The Land of Wild Boar II", "Bandit", "Night Lord",
+             "Hidden Street <Henesys>", "", "123,456,789", "0", "12", "x"]
+    pictures = []
+    for i in range(40):
+        text = rnd.choice(words) if i % 5 else "".join(rnd.choice("0123456789,.") for _ in range(rnd.randint(1, 12)))
+        img = np.full((70, 520), 255, np.uint8)
+        cv2.putText(img, text, (10, 45), cv2.FONT_HERSHEY_SIMPLEX, rnd.choice([0.6, 0.9, 1.3]), 0, rnd.choice([1, 2]))
+        if i % 3 == 0:                                       # noisy
+            img = np.clip(img.astype(int) + np.random.default_rng(i).integers(-70, 70, img.shape), 0, 255).astype(np.uint8)
+        pictures.append(img)
+    pictures += [np.full((40, 200), 255, np.uint8), np.zeros((40, 200), np.uint8)]   # blank, black
+    for chars in (None, "0123456789,."):
+        together = real.read_lines(pictures, chars)
+        alone = [real.read_line(p, chars) for p in pictures]
+        check(f"{len(pictures)} pictures read together = read one by one (characters: {chars})",
+              [x.strip() for x in together] == [x.strip() for x in alone])
+    check("a picture's text doesn't depend on which others are read with it",
+          [x.strip() for x in real.read_lines(pictures[::-1])][::-1] == [x.strip() for x in real.read_lines(pictures)])
 
-# ===================================================================== the readers, with fake backends
-c.section("EXP bar reader, with a fake glyph matcher")
-lay = m.find_exp(cv2.imread(str(FRAMES / "exp_win-1280x720.png")))
-cells = len(lay.exp) + len(m._pct_cells(lay))
-fake = FakeGlyphMatcher.reading("686017168")
-got = m.read_layout(fake, lay)
-c.check(f"puts the digits it's given together as EXP and % ({got})", got == (68601, 71.68))
-c.check(f"   asks about every digit spot, where the digits are ({len(fake.calls)} spots)",
-        len(fake.calls) == cells and all(abs(cy - lay.cy) < 1e-6 and h == lay.gh for _, cy, h in fake.calls))
-c.check("a leading 0 (digits cut off) isn't believed", m.read_layout(FakeGlyphMatcher.reading("086017168"), lay) is None)
-unclear = [("6", 0.95, 0.2)] * 2 + [("6", 0.6, 0.2)] + [("1", 0.95, 0.2)] * 6
-close = [("6", 0.95, 0.2)] * 2 + [("6", 0.95, 0.01)] + [("1", 0.95, 0.2)] * 6
-c.check("one unclear digit (low score) and nothing is believed", m.read_layout(FakeGlyphMatcher(unclear), lay) is None)
-c.check("one digit too close to the runner-up and nothing is believed", m.read_layout(FakeGlyphMatcher(close), lay) is None)
-with Pipeline(gh=7, templates=FakeGlyphMatcher.reading("686017168" * 50)) as p:
-    p.show(Scene(gh=7))
-    r = p.poll()
-    c.check(f"the screen reader reads the EXP bar with any glyph matcher ({r.text})", r.confident and r.text == f"{EXP:,} [{PCT:.2f}%]")
-
-c.section("EXP bar fallback, with a fake text OCR")
-fake = FakeTextOCR(["68,601", "68601", "71.68", "7168"])
-got = m.ocr_candidates(cv2.imread(str(FRAMES / "exp_win-1280x720.png")), lay, fake)
-c.check(f"turns what it reads into (EXP, %) guesses ({got})", got == [(68601, 71.68)])
-c.check(f"   asks for digits only, two ways each for EXP and % ({len(fake.calls)} reads)",
-        len(fake.calls) == 4 and all(ch == "0123456789,." for _, ch in fake.calls))
-c.check("   on dark-on-white pictures with a white border",
-        all(img.dtype == np.uint8 and img.ndim == 2 and img[0].min() == 255 and img[:, 0].min() == 255
-            for img, _ in fake.calls))
-got = m.ocr_candidates(cv2.imread(str(FRAMES / "exp_win-1280x720.png")), lay, FakeTextOCR(["68601", "6860", "71.68", "7"]))
-c.check(f"two different answers: both kept as guesses; a % that can't be one (1 digit) dropped ({got})",
-        got == [(6860, 71.68), (68601, 71.68)])
-c.check("no text OCR: no guesses, and nothing is asked",
-        m.ocr_candidates(cv2.imread(str(FRAMES / "exp_win-1280x720.png")), lay, ocr.NoTextOCR()) == [])
-with Pipeline(gh=7, templates=None, text_ocr=FakeTextOCR(["68601", "68601", "7168", "7168"])) as p:
-    p.show(Scene(gh=7))
-    r = p.poll()
-    c.check(f"with no font examples the reader falls back to the text OCR, but doesn't fully trust it "
-            f"({r.text}, confident {r.confident})", r.candidates == [(68601, 71.68)] and not r.confident)
-
-c.section("map name reader, with a fake text OCR")
-gh = 11
-box = np.empty((int(7.3 * gh), 30 * gh, 3), np.uint8)
-box[:] = cv2.cvtColor(np.uint8([[[100, 64, 204]]]), cv2.COLOR_HSV2BGR)[0, 0]      # the info box's light blue
-for text, y in (("Victoria Road", int(2.4 * gh)), ("Rocky Road", int(5.6 * gh))):
-    cv2.putText(box, text, (int(7 * gh), y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
-fake = FakeTextOCR("Rocky Road Il")
-got = m.read_map_name(box, gh, fake)
-c.check(f"cleans up what it reads (a Roman II read as 'Il') ({got!r})", got == "Rocky Road II")
-h0 = fake.calls[0][0].shape[0]
-c.check(f"   reads only the lower line (the map, not the region): {len(fake.calls)} tries, any characters",
-        len(fake.calls) == 6 and all(ch is None for _, ch in fake.calls))
-c.check(f"   ...at three sizes ({sorted({img.shape[0] for img, _ in fake.calls})})",
-        len({img.shape[0] for img, _ in fake.calls}) == 3 and h0 < 2 * (36 + 48))
-c.check("answers that never agree twice: no name", m.read_map_name(box, gh, FakeTextOCR([f"Map {i}" for i in "ABCDEF"])) is None)
-c.check("only junk read: no name", m.read_map_name(box, gh, FakeTextOCR("~ |")) is None)
-empty = np.empty_like(box)
-empty[:] = box[0, 0]
-fake = FakeTextOCR("Rocky Road")
-c.check("no text in the box: nothing asked, no name", m.read_map_name(empty, gh, fake) is None and not fake.calls)
-
-c.section("class reader, with a fake text OCR")
-status = {k: v for k, v in PARTS["status"].items() if k == "status_gh7.png"}
-for name, info in status.items():
-    img = cv2.imread(str(FRAMES / name))
-    args = (img, info["x0"], info["cy"], info["gh"])
-    c.check("a near miss is matched to the closest class ('Bandlt' -> Bandit)", m.read_job(*args, FakeTextOCR("Bandlt")) == "Bandit")
-    c.check("a clear reading that's no known class is kept as read, if 3 tries agree",
-            m.read_job(*args, FakeTextOCR("Zzyzx")) == "Zzyzx")
-    c.check("   but not on just 2", m.read_job(*args, FakeTextOCR(["Zzyzx", "Zzyzx"] + [f"Q{i}" for i in range(9)])) is None)
-    c.check("nothing read: no class", m.read_job(*args, FakeTextOCR("")) is None)
-blank = np.zeros((46, 336, 3), np.uint8)
-fake = FakeTextOCR("Bandit")
-c.check("no status bar where it looks: nothing asked, no class",
-        m.read_job(blank, 462, 21.5, 7, fake) is None and not fake.calls)
-
-c.section("mesos check, with a fake text OCR")
-inv = cv2.imread(str(FRAMES / "inventory_gh7.png"))
-mesos_lay = m.mesos_layout(inv, tuple(PARTS["inventory"]["inventory_gh7.png"]["box"]))
-c.check("6 of 6 tries agree: believed", m.ocr_mesos(mesos_lay, FakeTextOCR("18,047")) == (MESOS, 6))
-c.check("only half agree: not believed", m.ocr_mesos(mesos_lay, FakeTextOCR(["18047", "18041"] * 3))[0] is None)
-c.check("letters in it: not a number", m.ocr_mesos(mesos_lay, FakeTextOCR("18O47"))[0] is None)
-fake = FakeTextOCR("18047")
-m.ocr_mesos(mesos_lay, fake)
-c.check("   asks for digits and commas only", all(ch == "0123456789," for _, ch in fake.calls))
-c.check("no text OCR: (None, 0)", m.ocr_mesos(mesos_lay, ocr.NoTextOCR()) == (None, 0))
-
-# ===================================================================== doing no more work than needed
-c.section("doing no more work than needed")
-big = np.random.default_rng(2).integers(0, 255, (2160, 3840, 3), dtype=np.uint8)
-t0, c0 = time.perf_counter(), sum(os.times()[:2])
-for _ in range(10):
-    cv2.morphologyEx(cv2.cvtColor(big, cv2.COLOR_BGR2HSV), cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-wall, cpu = time.perf_counter() - t0, sum(os.times()[:2]) - c0
-c.check(f"OpenCV works on one thread: no more CPU than time taken ({cpu / wall:.2f}x; on all cores it's ~2.5x)",
-        cpu <= 1.3 * wall)
-img, cx, cy = on_canvas(np.asarray(examples["4"][0], np.float32))
-spots = [(cx, cy, CANON), (cx + 3, cy, CANON), (10, 10, CANON * 0.8)]
-c.check("matching many spots at once gives what matching them one at a time does",
-        all(a[0] == b[0] and abs(a[1] - b[1]) < 1e-5 and abs(a[2] - b[2]) < 1e-5
-            for a, b in zip(tm.match_many(img, spots), [tm.match(img, *s) for s in spots])))
-fake = FakeGlyphMatcher.reading("686017168")
-m.read_layout(fake, lay)
-c.check(f"the EXP bar's digits are matched in one go ({fake.batches})", fake.batches == [cells])
-for what, fn, want in (
-        ("map name", lambda f: m.read_map_name(box, gh, f), [6]),
-        ("class", lambda f: m.read_job(cv2.imread(str(FRAMES / "status_gh7.png")), 462, 21.5, 7, f), [6]),
-        ("mesos check", lambda f: m.ocr_mesos(mesos_lay, f), [6]),
-        ("EXP fallback", lambda f: m.ocr_candidates(cv2.imread(str(FRAMES / "exp_win-1280x720.png")), lay, f), [4])):
-    fake = FakeTextOCR("Bandit")
-    fn(fake)
-    c.check(f"the {what}'s tries go to the text OCR in one go ({fake.batches})", fake.batches == want)
-if tess.available:
-    pics = [line(t) for t in ("Rocky Road II", "68,601", "Kerning City")] + [np.full((60, 200), 255, np.uint8)]
-    before = tess.runs
-    batch = tess.read_lines(pics)
-    c.check(f"Tesseract reads a batch in one run ({tess.runs - before}), each as it would alone "
-            f"({[t.strip() for t in batch]})", tess.runs - before == 1 and batch == [tess.read_line(p) for p in pics])
-    c.check("   an empty batch doesn't start it", tess.read_lines([]) == [] and tess.runs == before + 1 + len(pics))
+    # a user name with letters outside a Western PC's code page (so the temp folder has them too)
+    odd = Path(tempfile.mkdtemp()) / "Jösé 名前"
+    odd.mkdir()
+    old_tempdir, tempfile.tempdir = tempfile.tempdir, str(odd)
     try:
-        ocr.create_text_ocr("tesseract", "/no/such/tesseract").read_line(pics[0])
-        failed = False
-    except Exception:
-        failed = True
-    c.check("a Tesseract that won't run is an error, not an empty answer", failed)
+        sample = np.full((60, 300), 255, np.uint8)
+        cv2.putText(sample, "AB 12", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, 0, 2)
+        check("reads fine when the temp folder's name has accents and non-Latin letters",
+              [x.strip() for x in real.read_lines([sample, sample])] == ["AB 12", "AB 12"])
+    finally:
+        tempfile.tempdir = old_tempdir
+    check("...and leaves nothing behind in it", not any(odd.iterdir()))
 
-with Pipeline(gh=7, templates=FakeGlyphMatcher.reading("686017168" * 100)) as p:
-    p.show(Scene(gh=7).inventory())
-    p.poll()
-    p.poll()
-    before = len(p.reader.templates.calls)
-    r = p.poll()
-    c.check(f"an EXP bar that looks just as it did isn't read again ({len(p.reader.templates.calls) - before} digits matched)",
-            len(p.reader.templates.calls) == before and r.confident)
-    p.show(Scene(gh=7).exp(68681, 71.76).inventory())
-    before = len(p.reader.templates.calls)
-    r = p.poll()
-    c.check(f"   a changed one is ({len(p.reader.templates.calls) - before} digits matched)",
-            len(p.reader.templates.calls) - before == cells)
-with Pipeline(gh=7) as p:
-    p.show(Scene(gh=7).inventory())
-    p.poll()
-    p.poll()
-    look = p.reader.last_mesos.answer
-    r = p.poll()
-    c.check(f"a mesos box that looks just as it did gives the same reading without reading it ({r.mesos})",
-            r.mesos == MESOS and p.reader.last_mesos.answer is look)
-    p.show(Scene(gh=7).inventory(alpha=0.7))
-    r = p.poll()
-    c.check(f"   one that changed is read again ({r.mesos})", p.reader.last_mesos.answer is not look)
-scene = Scene(gh=28).inventory().render()
-field = m.find_mesos_field(scene, 28)
-part, there = m.around_mesos(scene, field)
-whole, near = m.read_mesos_positions(scene, field, learned), m.read_mesos_positions(part, there, learned)
-c.check(f"reading the mesos box in just the part around it gives what the whole shot does "
-        f"({whole[0]}, {part.shape[1]}x{part.shape[0]} of {scene.shape[1]}x{scene.shape[0]})",
-        whole[0] == near[0] and abs(whole[2] - near[2]) < 1e-5 and abs(whole[3] - near[3]) < 1e-5)
+    # the readers: the class from the real status bars costs one Tesseract run, not six
+    import json
+    m.TESS, m.tesseract_ok = real, True
+    frames = Path(__file__).parent / "frames"
+    parts = json.loads((frames / "screen_parts.json").read_text())["status"]
+    for name, info in sorted(parts.items()):
+        before = real.runs
+        got = m.read_job(cv2.imread(str(frames / name)), info["x0"], info["cy"], info["gh"])
+        check(f"{name}: class {got!r} read in {real.runs - before} Tesseract run", got == info["job"] and real.runs - before == 1)
 
-# ===================================================================== how they're wired together
-c.section("wiring")
-c.check("the EXP bar's examples load as a GlyphMatcher", isinstance(m.DigitTemplates.load(), ocr.GlyphMatcher))
-c.check("the mesos digits (as they come, before any are learned) make a GlyphMatcher", isinstance(learned, ocr.GlyphMatcher))
-c.check("a screen reader made without a text OCR has none", not m.ScreenReader(None).text_ocr.available)
-with Pipeline(gh=7) as p:
-    p.show(Scene(gh=7))
-    r = p.poll()
-    c.check(f"   and says map names can't be read ({r.note!r})", "Map names can't be read" in (r.note or ""))
-with Pipeline(gh=7, text_ocr=FakeTextOCR("")) as p:
-    p.show(Scene(gh=7))
-    r = p.poll()
-    c.check("with a text OCR, it doesn't say that", "Map names can't be read" not in (r.note or ""))
+# ---- which Tesseract is used: it needs a usable English file, and is told where it is
+import ast
+import types
+big = b"x" * (m.ENG_DATA_MIN + 1)
+saved_cands, saved_data = m.PLATFORM.tesseract_candidates, m.PLATFORM.tessdata_candidates
 
-c.done()
+
+def fake_install(root, data=None):
+    """A folder with a tesseract program (an empty file) and, if `data` is given, tessdata/eng.traineddata."""
+    root.mkdir(parents=True, exist_ok=True)
+    exe = root / "tesseract.exe"
+    exe.write_bytes(b"")
+    exe.chmod(0o755)                    # (a program must be allowed to run: on macOS a new file isn't)
+    if data is not None:
+        (root / "tessdata").mkdir(exist_ok=True)
+        (root / "tessdata" / "eng.traineddata").write_bytes(data)
+    return exe
+
+
+try:
+    base = Path(tempfile.mkdtemp())
+    bad, cut, good = fake_install(base / "bad"), fake_install(base / "cut", b"x" * 1000), fake_install(base / "good", big)
+    m.PLATFORM.tessdata_candidates = lambda exe: [exe.parent / "tessdata"]
+    m.PLATFORM.tessdata_arg = lambda exe, folder: str(folder)
+    m.PLATFORM.tesseract_candidates = lambda home, app: [bad, cut, good]
+    exe, arg, state, why = m.locate_tesseract()
+    check("a program without eng.traineddata (or with a cut-off one) is skipped for the next good one",
+          exe == str(good) and state == "ok" and why == "" and Path(arg) == good.parent / "tessdata")
+    m.PLATFORM.tesseract_candidates = lambda home, app: [bad, cut]
+    exe, arg, state, why = m.locate_tesseract()
+    check("programs but no usable English file: state no_eng (file), nothing to use",
+          exe is None and state == "no_eng" and why == "file")
+    m.PLATFORM.tesseract_candidates = lambda home, app: [base / "nowhere" / "tesseract.exe"]
+    exe, arg, state, why = m.locate_tesseract()
+    check("no program at all: state missing", exe is None and state == "missing" and why == "")
+    m.PLATFORM.tessdata_arg = lambda exe, folder: None            # a folder name that can't be given to Tesseract
+    m.PLATFORM.tesseract_candidates = lambda home, app: [good]
+    exe, arg, state, why = m.locate_tesseract()
+    check("a data folder that can't be passed on: no_eng with the path reason", exe is None and state == "no_eng" and why == "path")
+    m.tesseract_state, m.tesseract_why = "no_eng", "file"
+    check("the 'file is missing' message names tessdata\\eng.traineddata and says EXP still works",
+          "tessdata\\eng.traineddata" in m.tesseract_note() and "EXP and mesos still work" in m.tesseract_note())
+    m.tesseract_why = "path"
+    check("the 'unusual characters' message says to move the folder",
+          "unusual characters" in m.tesseract_note() and "C:\\Games\\" in m.tesseract_note())
+    m.tesseract_state, m.tesseract_why = "missing", ""
+    check("the missing message keeps today's wording",
+          m.tesseract_note() == "Map names can't be read: Tesseract OCR is missing (see the README).")
+    m.tesseract_state = "ok"
+    check("no message when Tesseract works", m.tesseract_note() == "")
+finally:
+    del m.PLATFORM.tessdata_arg                                   # (back to the class's own)
+    m.PLATFORM.tesseract_candidates, m.PLATFORM.tessdata_candidates = saved_cands, saved_data
+    m.tesseract_state, m.tesseract_why = "missing", ""
+
+# a program Windows won't let us look at (a PATH folder we have no access to) is skipped, not a crash at start-up
+class Locked:
+    def is_file(self):
+        raise PermissionError(13, "Access is denied")
+
+
+try:
+    base2 = Path(tempfile.mkdtemp())
+    good2 = fake_install(base2 / "good", big)
+    m.PLATFORM.tessdata_candidates = lambda exe: [exe.parent / "tessdata"]
+    m.PLATFORM.tessdata_arg = lambda exe, folder: str(folder)
+    m.PLATFORM.tesseract_candidates = lambda home, app: [Locked(), good2]
+    try:
+        exe, arg, state, why = m.locate_tesseract()
+        check("a candidate that can't be looked at is skipped for the next good one", exe == str(good2) and state == "ok")
+    except Exception as e:
+        check(f"a candidate that can't be looked at is skipped for the next good one (it raised {type(e).__name__})", False)
+    m.PLATFORM.tesseract_candidates = lambda home, app: [Locked()]
+    try:
+        exe, arg, state, why = m.locate_tesseract()
+        check("...and when it is the only one there is no Tesseract (missing), not a crash", exe is None and state == "missing")
+    except Exception as e:
+        check(f"...and when it is the only one there is no Tesseract (it raised {type(e).__name__})", False)
+finally:
+    del m.PLATFORM.tessdata_arg
+    m.PLATFORM.tesseract_candidates, m.PLATFORM.tessdata_candidates = saved_cands, saved_data
+    m.tesseract_state, m.tesseract_why = "missing", ""
+
+# --tessdata-dir is passed, and a TESSDATA_PREFIX of ours can't redirect it
+os.environ["TESSDATA_PREFIX"] = r"C:\wrong\place"
+try:
+    calls.clear()
+    ocr.subprocess.run = fake_run("12\r\n")
+    ocr.Tesseract(r"C:\somewhere\tesseract.exe", tessdata=r"C:\data\tessdata").read_lines(two[:1])
+    args, kw = calls[-1]
+    check("--tessdata-dir <folder> is passed to every read", args[args.index("--tessdata-dir") + 1] == r"C:\data\tessdata")
+    check("TESSDATA_PREFIX is removed from the child's environment", "TESSDATA_PREFIX" not in kw["env"])
+    ocr.Tesseract(r"C:\somewhere\tesseract.exe").read_lines(two[:1])
+    check("without a data folder nothing is added", "--tessdata-dir" not in calls[-1][0])
+finally:
+    ocr.subprocess.run = real_run
+    os.environ.pop("TESSDATA_PREFIX", None)
+
+# the real program with the real data
+real_exe, real_arg, real_state, real_why = m.locate_tesseract()
+if real_exe:
+    check("the Tesseract that is installed is found, with its data folder", real_state == "ok" and m.tesseract_where[1])
+    sample = np.full((60, 300), 255, np.uint8)
+    cv2.putText(sample, "AB 12", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, 0, 2)
+    os.environ["TESSDATA_PREFIX"] = r"C:\wrong\place"
+    try:
+        check("a wrong TESSDATA_PREFIX in our own environment doesn't break a real read",
+              ocr.Tesseract(real_exe, tessdata=real_arg or None).read_line(sample).strip() == "AB 12")
+    finally:
+        os.environ.pop("TESSDATA_PREFIX", None)
+
+    # a data folder under Cyrillic and Chinese letters (outside a Western code page; an accent is not enough)
+    odd = Path(tempfile.mkdtemp()) / "\u041f\u0440\u0438\u0432\u0435\u0442 \u540d\u524d"
+    (odd / "tessdata").mkdir(parents=True)
+    (odd / "tessdata" / "eng.traineddata").write_bytes((Path(m.tesseract_where[1]) / "eng.traineddata").read_bytes())
+    m.PLATFORM.tessdata_candidates = lambda exe: [odd / "tessdata"]
+    m.PLATFORM.tesseract_candidates = lambda home, app: [Path(real_exe)]
+    try:
+        exe, arg, state, why = m.locate_tesseract()
+        if state == "ok":
+            check("Cyrillic/CJK data folder: a real read works through the folder as given or its short name",
+                  ocr.Tesseract(exe, tessdata=arg or None).read_line(sample).strip() == "AB 12")
+        else:
+            check("Cyrillic/CJK data folder with no short name: no_eng with the path reason, no crash",
+                  state == "no_eng" and why == "path")
+    finally:
+        m.PLATFORM.tesseract_candidates, m.PLATFORM.tessdata_candidates = saved_cands, saved_data
+        m.tesseract_state, m.tesseract_why = "missing", ""
+
+# Windows: a data folder under letters outside the PC's code page needs its 8.3 short name; without one it is refused
+# (a fake eng.traineddata is enough: the choice is made before Tesseract is ever started)
+if sys.platform == "win32":
+    import ctypes
+    kernel = ctypes.windll.kernel32
+    odd_root = Path(tempfile.mkdtemp()) / "Привет 名前"
+    (odd_root / "tessdata").mkdir(parents=True)
+    (odd_root / "tessdata" / "eng.traineddata").write_bytes(big)
+    odd_exe = odd_root / "tesseract.exe"
+    odd_exe.write_bytes(b"")
+    saved_cands, saved_data = m.PLATFORM.tesseract_candidates, m.PLATFORM.tessdata_candidates
+    m.PLATFORM.tesseract_candidates = lambda home, app: [odd_exe]
+    probe = ctypes.create_unicode_buffer(1024)
+    has_short = kernel.GetShortPathNameW(str(odd_root / "tessdata"), probe, 1024) > 0 and probe.value != str(odd_root / "tessdata")
+    try:
+        exe, arg, state, why = m.locate_tesseract()
+        if has_short:
+            check("odd letters, 8.3 names on: the data folder is handed over by a short name that only has code-page letters",
+                  state == "ok" and arg and arg != str(odd_root / "tessdata") and arg.encode("mbcs").decode("mbcs") == arg
+                  and (Path(arg) / "eng.traineddata").is_file())
+        else:
+            print("     (this PC has no 8.3 names for that folder: the short-name case is only tested with a fake answer)")
+
+        def short_name(answer):
+            def fake(path, buf, size):
+                if answer:
+                    buf.value = answer if answer != "same" else path
+                    return len(buf.value)
+                return 0
+            return fake
+
+        for what, answer in (("8.3 names switched off (the long name comes back)", "same"), ("the call failing", "")):
+            kernel.GetShortPathNameW = short_name(answer)
+            try:
+                exe, arg, state, why = m.locate_tesseract()
+            finally:
+                del kernel.GetShortPathNameW
+            m.tesseract_state, m.tesseract_why = state, why
+            check(f"odd letters and {what}: no Tesseract, state no_eng, the path reason, and the player is told to move the folder",
+                  exe is None and state == "no_eng" and why == "path" and "unusual characters" in m.tesseract_note())
+        check("...the real call is back afterwards", kernel.GetShortPathNameW is not None and not hasattr(kernel.GetShortPathNameW, "__code__"))
+    finally:
+        m.PLATFORM.tesseract_candidates, m.PLATFORM.tessdata_candidates = saved_cands, saved_data
+        m.tesseract_state, m.tesseract_why = "missing", ""
+
+# macOS rules, run on any OS: the methods are cut out of platforms/macos.py (it can only be imported on a Mac)
+tree = ast.parse((Path(m.__file__).parent / "platforms" / "macos.py").read_text(encoding="utf-8"))
+cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "MacPlatform")
+wanted = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in ("tessdata_candidates", "tessdata_arg")]
+space = {"Path": Path}
+exec(compile(ast.Module(body=wanted, type_ignores=[]), "macos.py", "exec"), space)
+mac = types.SimpleNamespace(**{k: (lambda f: lambda *a: f(None, *a))(v) for k, v in space.items() if k != "Path" and callable(v)})
+brew = Path("/opt/homebrew/bin/tesseract")
+check("macOS looks next to the program (Homebrew layout) first, then in Homebrew's prefixes",
+      [p.as_posix() for p in mac.tessdata_candidates(brew)]
+      == ["/opt/homebrew/share/tessdata", "/opt/homebrew/share/tessdata", "/usr/local/share/tessdata"])
+check("macOS passes --tessdata-dir only for a folder that isn't Tesseract's own default",
+      mac.tessdata_arg(brew, Path("/opt/homebrew/share/tessdata")) == ""
+      and Path(mac.tessdata_arg(brew, Path("/usr/local/share/tessdata"))).as_posix() == "/usr/local/share/tessdata")
+cellar = Path("/opt/homebrew/Cellar/tesseract/5.5.0/bin/tesseract")      # (a versioned Homebrew folder, if that is the program found)
+check("macOS: a program inside a versioned Cellar folder looks in that version's own share/tessdata first, passing nothing",
+      mac.tessdata_candidates(cellar)[0].as_posix() == "/opt/homebrew/Cellar/tesseract/5.5.0/share/tessdata"
+      and mac.tessdata_arg(cellar, mac.tessdata_candidates(cellar)[0]) == "")
+macports = Path("/opt/local/bin/tesseract")
+check("macOS: MacPorts' program finds /opt/local/share/tessdata beside it",
+      mac.tessdata_candidates(macports)[0].as_posix() == "/opt/local/share/tessdata")
+
+check("Tesseract is given 15 s before it counts as stuck (a real run takes well under 1 s)",
+      ocr.Tesseract("tesseract").timeout == 15)
+
+print("\nALL PASSED" if not failures else f"\n{failures} FAILED")
+sys.exit(1 if failures else 0)

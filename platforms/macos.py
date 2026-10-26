@@ -126,6 +126,14 @@ class MacPlatform(Platform):
                 Path("/opt/homebrew/bin/tesseract"), Path("/usr/local/bin/tesseract"),      # Homebrew
                 Path("/opt/local/bin/tesseract"), *on_path]                                 # MacPorts
 
+    def tessdata_candidates(self, exe):
+        return [exe.parent.parent / "share" / "tessdata",            # Homebrew's and our own layout
+                Path("/opt/homebrew/share/tessdata"), Path("/usr/local/share/tessdata")]
+
+    def tessdata_arg(self, exe, folder):
+        # Tesseract's own default is <program>/../share/tessdata: only anything else is passed
+        return "" if folder == exe.parent.parent / "share" / "tessdata" else str(folder)
+
     def claim_single_instance(self, key, title, old_titles=()):
         self._lock = open(Path(tempfile.gettempdir()) / f"MapleEXP-{key}.lock", "w")   # macOS unlocks it at exit
         try:
@@ -185,6 +193,25 @@ class MacPlatform(Platform):
 
     def create_hotkeys(self, on_press):
         return MacHotkeys(on_press)
+
+    def register_fonts(self, paths):
+        # Available to this program only (process scope). If anything about it fails, the overlay
+        # just uses the system's own fonts.
+        try:
+            ct = ctypes.CDLL("/System/Library/Frameworks/CoreText.framework/CoreText")
+            _cf.CFURLCreateFromFileSystemRepresentation.restype = _vp
+            _cf.CFURLCreateFromFileSystemRepresentation.argtypes = [_vp, ctypes.c_char_p, ctypes.c_long, ctypes.c_bool]
+            ct.CTFontManagerRegisterFontsForURL.restype = ctypes.c_bool
+            ct.CTFontManagerRegisterFontsForURL.argtypes = [_vp, ctypes.c_int, _vp]
+            ok = True
+            for path in paths:
+                raw = str(path).encode()
+                url = _cf.CFURLCreateFromFileSystemRepresentation(None, raw, len(raw), False)
+                ok = bool(ct.CTFontManagerRegisterFontsForURL(url, 1, None)) and ok     # 1: this process only
+                _CFRelease(url)
+            return ok
+        except Exception:
+            return False
 
     def open_folder(self, path):
         subprocess.Popen(["open", str(path)])

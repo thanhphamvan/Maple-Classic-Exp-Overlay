@@ -2,8 +2,9 @@
 //
 //   POST /api/runs    the overlay sends finished runs (only if the player agreed)
 //   GET  /api/stats   best maps for a class and path, level, solo or in a party
+//   GET  /api/ladder  the best maps for each band of 5 levels, for a class
 //   GET  /api/options the classes and paths, how many players each has, and totals
-//   GET  /api/latest  the latest runs shared, for the bar at the top of the site
+//   GET  /api/recent  the latest runs shared, for the bar at the top of the site
 //   everything else   the website, from public/ (served by Cloudflare without running this)
 //
 // Anyone can send anything to a public server, so nothing is taken on trust: every run is
@@ -13,22 +14,45 @@
 // with runs far from what other players get (same map, class, level, solo or party) left out.
 // Posts must be JSON, so other websites can't make their visitors' browsers send runs.
 
+import { canonicalMap, isListed } from "./mapnames.js";
+import { handleReports } from "./reports.js";
+
 const MIN_PLAYERS = 3;              // different players needed before a map is ranked
+const MAX_MAPS = 40;                // ranked maps in one answer
 const MAX_EARLY = 8;                // maps with fewer players shown (greyed out) as early data
 const LATEST = 12;                  // runs in the bar at the top of the site
 const LATEST_DAYS = 14;             // how far back it looks
 const BAND = [0.5, 2.0];            // runs outside this share of the median are outliers
-const LEVEL_WINDOW = 5;             // "around your level": within this many levels
+const LEVEL_WINDOW = 5;             // "around your level" for the latest-runs bar: within this many levels
+const RADII = [3, 5];               // the levels either way a map's numbers come from: the smallest that has MIN_PLAYERS
+const MAX_REVIEW = 500;             // names not on the game's map list that are kept for review
 const MAX_PER_REQUEST = 50;
+const MAX_MESOS_HR = 2e7;          // mesos an hour: more than any player makes
+// The most % of a level an hour a run can gain, from this level up (a run's own level). Past the lists below the
+// limit is the old EXP-an-hour one. Chosen well above what real players get (see server/README.md to check them).
+const PCT_CAPS = [[150, 100], [100, 150], [60, 200], [30, 300]];
+const pctCap = (level) => (PCT_CAPS.find(([from]) => level >= from) || [0, null])[1];
 const RUN_SECONDS = [890, 3720];   // a run is 15 minutes (an hour from 0.9.3, still taken)
-const MAX_PER_INSTALL_DAY = 100;    // more than a day's worth of 15-minute runs can't be real
+const MAX_PER_INSTALL_DAY = 70;     // a day holds 96 runs of 15 minutes and nobody farms 24 hours
+const MAX_MAPS_PER_INSTALL_DAY = 12; // nobody farms a dozen different maps in a day
+const MAX_NEW_INSTALLS_DAY = 300;   // brand-new players in a day: more is a flood, not a crowd (they try again tomorrow)
+const MAX_RUNS_DAY = 6000;          // runs from new players in a day (the free database allows 100,000 writes a day)
+const MAX_REVIEW_PER_DAY = 50;      // names for review added in a day
+const VET_HOURS = 24;               // a new player's runs count after this long...
+const VET_RUNS = 4;                 // ...and this many runs (until then they're kept but not shown anywhere)
+const UNLISTED_DAYS = 2;            // a map not on the game's list shows only once players shared it on this many days
 const MAX_PER_IP_DAY = 400;
 const MAX_INSTALLS_PER_IP_DAY = 6;  // copies of the overlay sharing from one connection a day (a party)
 const MAX_BODY = 200_000;           // bytes in one post (50 runs are about 25,000)
 const DAYS_BACK = 60;               // how old a run can be when it's sent (and up to 2 days ahead)
+const RECENT_DAYS = 60;             // the map figures and the ladder use runs received this recently
+// Overlays older than MESOS_VERSION counted mesos at shops and trades: from MESOS_RULE_FROM (UTC, "" = not yet)
+// their runs are taken with EXP only. Mesos already stored stay.
+const MESOS_VERSION = "0.9.11";
+const MESOS_RULE_FROM = "2026-10-29T00:00:00Z";      // one week after the 0.9.11-beta release
 // How long answers are kept (see cached()): new runs show up on the site within a few minutes.
 const EDGE_SECONDS = 60;            // in Cloudflare's cache, where the visitor is
-const KEEP = { stats: 120, latest: 120, options: 600 };   // in the database, for everyone
+const KEEP = { stats: 120, latest: 120, options: 600, ladder: 21600 };   // (the ladder changes slowly, and it reads a lot)   // in the database, for everyone
 
 // The four classes, each split into paths named after the job they end in (4th job). A run
 // counts for the path its job is on. 1st-job runs come before the path is picked, and play
@@ -67,6 +91,11 @@ export const CLASSES = {
   },
 };
 
+// Every job the overlay can read from the status bar (its JOBS list). Anything else isn't a job.
+const OTHER_JOBS = ["Beginner", "Pirate", "Brawler", "Marauder", "Buccaneer", "Gunslinger", "Outlaw", "Corsair",
+  "Warrior", "Bowman", "Thief"];
+export const KNOWN_JOBS = new Set([...OTHER_JOBS, ...Object.values(CLASSES).flatMap((c) => [...c.first, ...Object.values(c.paths).flat()])]);
+
 // EXP needed to finish each level in MapleStory Classic World (index 0 = level 1): the same
 // table as the overlay's (maple_exp.py), so a run can't claim more EXP than its levels hold.
 const EXP_TABLE = [
@@ -104,14 +133,20 @@ export function jobsFor(name, path) {
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    const now = clock(request, url);
     try {
-      if (request.method === "POST" && url.pathname === "/api/runs") return await postRuns(request, env);
-      if (request.method === "GET" && url.pathname === "/api/stats") return await getStats(url, env, ctx);
-      if (request.method === "GET" && url.pathname === "/api/options") {
-        return await cached(url, env, ctx, "options", KEEP.options, () => getOptions(env));
+      if (url.pathname === "/api/health" || url.pathname === "/api/report") {
+        return await handleReports(request, env, now, url, { connectionCode, connectionPart });
       }
-      if (request.method === "GET" && url.pathname === "/api/latest") {
-        return await cached(url, env, ctx, "latest", KEEP.latest, () => getLatest(env));
+      if (request.method === "POST" && url.pathname === "/api/runs") return await postRuns(request, env, now);
+      if (request.method === "GET" && url.pathname === "/api/stats") return await getStats(url, env, ctx, now);
+      if (request.method === "GET" && url.pathname === "/api/ladder") return await getLadder(url, env, ctx, now);
+      if (request.method === "GET" && url.pathname === "/api/options") {
+        return await cached(url, env, ctx, "options", KEEP.options, () => getOptions(env, now));
+      }
+      // (/api/latest is what pages open before 2026-10-19 ask for; it's a static file now, see public/api/latest)
+      if (request.method === "GET" && (url.pathname === "/api/recent" || url.pathname === "/api/latest")) {
+        return await cached(url, env, ctx, "latest", KEEP.latest, () => getLatest(env, now));
       }
       if (url.pathname.startsWith("/api/")) {
         return json({ error: "not found" }, ["GET", "POST"].includes(request.method) ? 404 : 405);
@@ -160,7 +195,11 @@ export function checkRun(r, now = Date.now()) {
   const mesos = inRange(r.mesos ?? 0, -1e10, 1e11);
   const mesosSeconds = inRange(r.mesos_seconds ?? 0, 0, RUN_SECONDS[1]);
   if (!map || !job || !started || !minutes(started)) return { why: "missing map, class or start time" };
+  if (!KNOWN_JOBS.has(job)) return { why: "not a job" };
   if (WEB_ADDRESS.test(map) || WEB_ADDRESS.test(job)) return { why: "not a map name" };
+  const named = canonicalMap(map);                   // the game's spelling (fixes OCR slips like "ist" for "1st")
+  if (named.town) return { why: "town" };            // nobody farms in a town: the overlay was on a stale name
+  if (named.junk) return { why: "not a map name" };    // a menu or a misread with no real word in it
   const ago = now / 60000 - minutes(started);       // (the overlay sends its local time)
   if (ago > DAYS_BACK * 1440 || ago < -2 * 1440) return { why: "start time out of range" };
   if (!levelStart || !levelEnd || !party) return { why: "bad level or party size" };
@@ -169,12 +208,15 @@ export function checkRun(r, now = Date.now()) {
   if (exp === null || mesos === null || mesosSeconds === null) return { why: "bad EXP or mesos" };
   const expHr = exp / seconds * 3600;
   if (expHr > 5e6 || !expPossible(levelStart, levelEnd, exp)) return { why: "impossible EXP for those levels" };
-  // Mesos/hr only when the mesos were seen for at least 10 minutes of the run.
-  const mesosHr = mesosSeconds >= 600 ? Math.max(0, mesos) / mesosSeconds * 3600 : null;
-  if (mesosHr !== null && mesosHr > 5e7) return { why: "impossible mesos/hr" };
+  const cap = pctCap(levelStart), pct = pctPerHour({ exp_hr: expHr, level_start: levelStart, level_end: levelEnd });
+  if (cap && pct > cap) return { why: "impossible EXP for that level" };
+  // Mesos/hr only when the mesos were seen for at least 10 minutes of the run, and nothing about them is odd.
+  const trusted = mesos >= 0 && mesosSeconds <= seconds && !oldMesos(r.version, now);
+  const mesosHr = trusted && mesosSeconds >= 600 ? mesos / mesosSeconds * 3600 : null;
+  if (mesosHr !== null && mesosHr > MAX_MESOS_HR) return { why: "impossible mesos/hr" };
   return {
     run: {
-      map, job, started, level_start: levelStart, level_end: levelEnd, party, exp, seconds,
+      map: named.name, unlisted: !named.listed, job, started, level_start: levelStart, level_end: levelEnd, party, exp, seconds,
       exp_hr: expHr, mesos, mesos_seconds: mesosSeconds, mesos_hr: mesosHr,
       version: text(r.version, 24) || "?",
     },
@@ -196,7 +238,29 @@ async function connectionCode(ip, day, salt) {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 32);
 }
 
-async function postRuns(request, env) {
+/** The server's idea of "now": the real time, except that a LOCAL test server takes it from an X-Test-Now header
+ * (milliseconds), so the tests can show what a day later looks like. Never honoured on the live site. */
+function clock(request, url) {
+  if (url.hostname === "localhost" || url.hostname === "127.0.0.1") {
+    const t = Number(request.headers.get("x-test-now"));
+    if (Number.isFinite(t) && t > 0) return t;
+  }
+  return Date.now();
+}
+
+/** The part of an internet address that stands for one connection: the whole of an IPv4 address, but
+ * only the first 64 bits of an IPv6 one (one home gets billions of IPv6 addresses to rotate through). */
+export function connectionPart(ip) {
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(ip);
+  if (mapped) return mapped[1];
+  if (!ip.includes(":")) return ip;                  // IPv4 (or "?")
+  const [head, tail] = ip.toLowerCase().split("::");
+  const a = head ? head.split(":") : [], b = tail === undefined ? [] : tail ? tail.split(":") : [];
+  const groups = tail === undefined ? a : [...a, ...Array(Math.max(0, 8 - a.length - b.length)).fill("0"), ...b];
+  return groups.slice(0, 4).map((g) => g.padStart(4, "0")).join(":");
+}
+
+async function postRuns(request, env, now) {
   if (!(request.headers.get("content-type") || "").toLowerCase().startsWith("application/json")) {
     return json({ error: "send JSON" }, 415);
   }
@@ -212,64 +276,113 @@ async function postRuns(request, env) {
   const install = typeof body?.install === "string" && /^[0-9a-f]{16}$/.test(body.install) ? body.install : null;
   if (!install || !Array.isArray(body.runs)) return json({ error: "expected {install, runs: [...]}" }, 400);
 
-  const now = new Date();
-  const day = now.toISOString().slice(0, 10);
-  const ipHash = await connectionCode(request.headers.get("CF-Connecting-IP") || "?", day, env.IP_SALT);
+  // Everything that can be checked from the runs alone is checked BEFORE the database is touched, so a flood of
+  // garbage costs one cheap call and no reads or writes.
+  const checked = body.runs.slice(0, MAX_PER_REQUEST).map((raw) => {
+    const started = typeof raw?.started === "string" ? raw.started.slice(0, 16) : null;
+    return { started, ...checkRun(raw, now) };
+  });
+  const results = checked.map((c) => (c.run ? null : { started: c.started, ok: false, why: c.why }));
+  if (!checked.some((c) => c.run)) return json({ received: 0, results }, 200, false);
+
+  const day = new Date(now).toISOString().slice(0, 10);
+  const ipHash = await connectionCode(connectionPart(request.headers.get("CF-Connecting-IP") || "?"), day, env.IP_SALT);
   const counts = await env.DB.prepare(
     `SELECT (SELECT COUNT(*) FROM runs WHERE install = ?1 AND received_day = ?2) AS mine,
             (SELECT COUNT(*) FROM runs WHERE ip_hash = ?3 AND received_day = ?2) AS ip,
             (SELECT COUNT(DISTINCT install) FROM runs WHERE ip_hash = ?3 AND received_day = ?2) AS installs,
-            (SELECT COUNT(*) FROM runs WHERE ip_hash = ?3 AND received_day = ?2 AND install = ?1) AS here`
+            (SELECT COUNT(*) FROM runs WHERE ip_hash = ?3 AND received_day = ?2 AND install = ?1) AS here,
+            (SELECT banned FROM installs WHERE install = ?1) AS banned,
+            (SELECT COUNT(*) FROM installs WHERE install = ?1) AS known,
+            COALESCE((SELECT runs FROM daily WHERE day = ?2), 0) AS day_runs,
+            COALESCE((SELECT new_installs FROM daily WHERE day = ?2), 0) AS day_new`
   ).bind(install, day, ipHash).first();
+  const refuse = (why, retry = false) => checked.forEach((c, i) => {
+    if (c.run) results[i] = { started: c.started, ok: false, why, ...(retry ? { retry: true } : {}) };
+  });
+  if (counts.banned) { refuse("refused"); return json({ received: 0, results }, 200, false); }
+  // A flood of brand-new installs (made-up players) or of runs can't use up the database's daily writes: over the
+  // limit, new installs wait for tomorrow (known ones carry on).
+  if (!counts.known && (counts.day_new >= MAX_NEW_INSTALLS_DAY || counts.day_runs >= MAX_RUNS_DAY)) {
+    refuse("too many new players today", true);
+    return json({ received: 0, results }, 200, false);
+  }
   let mine = counts.mine, fromIp = counts.ip;
   // A connection that has already shared for a few copies of the overlay today can't add
   // more (made-up players to push a map past MIN_PLAYERS). They're sent again tomorrow.
   const crowded = counts.installs >= MAX_INSTALLS_PER_IP_DAY && !counts.here;
-  // This install's runs, to catch runs that overlap in time (one person can't farm two at once).
+  // This install's runs, to catch runs that overlap in time (one person can't farm two at once), and the maps it
+  // has farmed today (nobody farms a dozen maps in a day).
   const { results: earlier } = await env.DB.prepare(
-    "SELECT started, seconds FROM runs WHERE install = ?1 ORDER BY started DESC LIMIT 2000"
+    "SELECT started, seconds, map, received_day FROM runs WHERE install = ?1 ORDER BY started DESC LIMIT 2000"
   ).bind(install).all();
   const taken = earlier.map((e) => ({ at: minutes(e.started), long: e.seconds / 60 }));
+  const mapsToday = new Set(earlier.filter((e) => e.received_day === day).map((e) => e.map));
   // Two runs overlap if each starts before the other ends. Start times are to the minute, and
   // the next run starts as one ends, so a minute's leeway.
   const overlaps = (a, b) => a.at < b.at + b.long - 1 && b.at < a.at + a.long - 1;
 
-  const results = [];
-  for (const raw of body.runs.slice(0, MAX_PER_REQUEST)) {
-    const started = typeof raw?.started === "string" ? raw.started.slice(0, 16) : null;
-    const { run, why } = checkRun(raw, now.getTime());
-    if (!run) {
-      results.push({ started, ok: false, why });
-      continue;
-    }
+  let saved = 0;
+  for (let i = 0; i < checked.length; i++) {
+    const { run, started } = checked[i];
+    if (!run) continue;
     const at = { at: minutes(run.started), long: run.seconds / 60 };
     if (taken.some((t) => t.at === at.at)) {
-      results.push({ started, ok: true, already: true });       // sent before: fine
+      results[i] = { started, ok: true, already: true };       // sent before: fine
       continue;
     }
     if (taken.some((t) => overlaps(t, at))) {
-      results.push({ started, ok: false, why: "overlaps another run" });
+      results[i] = { started, ok: false, why: "overlaps another run" };
+      continue;
+    }
+    if (!mapsToday.has(run.map) && mapsToday.size >= MAX_MAPS_PER_INSTALL_DAY) {
+      results[i] = { started, ok: false, why: "too many different maps in a day" };
       continue;
     }
     if (mine >= MAX_PER_INSTALL_DAY || fromIp >= MAX_PER_IP_DAY || crowded) {
-      results.push({ started, ok: false, why: crowded ? "too many players on one connection today" : "too many runs today",
-        retry: true });
+      results[i] = { started, ok: false, why: crowded ? "too many players on one connection today" : "too many runs today",
+        retry: true };
       continue;
     }
-    const saved = await env.DB.prepare(
+    const insert = await env.DB.prepare(
       `INSERT OR IGNORE INTO runs (received, received_day, install, ip_hash, started, map, job, level_start,
          level_end, party, exp, seconds, exp_hr, mesos, mesos_seconds, mesos_hr, version)
        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)`
-    ).bind(now.toISOString(), day, install, ipHash, run.started, run.map, run.job, run.level_start,
+    ).bind(new Date(now).toISOString(), day, install, ipHash, run.started, run.map, run.job, run.level_start,
       run.level_end, run.party, run.exp, run.seconds, run.exp_hr, run.mesos, run.mesos_seconds,
       run.mesos_hr, run.version).run();
-    if (saved.meta.changes) await addToSummaries(env, run, install);
+    if (insert.meta.changes) {
+      await addToSummaries(env, run, install);
+      if (run.unlisted) await noteForReview(env, run.map, new Date(now).toISOString(), day);
+      saved++;
+    }
     taken.push(at);
+    mapsToday.add(run.map);
     mine++;
     fromIp++;
-    results.push({ started, ok: true });
+    results[i] = { started, ok: true };
+  }
+  if (saved) {                                       // the install's record (its age and run count are what vet it)
+    await env.DB.batch([
+      env.DB.prepare("INSERT OR IGNORE INTO installs (install, first_seen, runs, banned) VALUES (?1, ?2, 0, 0)")
+        .bind(install, new Date(now).toISOString()),
+      env.DB.prepare("UPDATE installs SET runs = runs + ?2 WHERE install = ?1").bind(install, saved),
+      env.DB.prepare(`INSERT INTO daily (day, runs, new_installs) VALUES (?1, ?2, ?3)
+                      ON CONFLICT (day) DO UPDATE SET runs = runs + excluded.runs, new_installs = new_installs + excluded.new_installs`)
+        .bind(day, saved, counts.known ? 0 : 1),
+    ]);
   }
   return json({ received: results.filter((r) => r.ok).length, results }, 200, false);
+}
+
+/** A map name that isn't on the game's list (an event map, a new map, or a misread) is kept as
+ * it is and noted here, so it can be looked at: SELECT from map_review (the query is in schema.sql).
+ * Capped (in all, and per day), so nobody can fill it up with made-up names. */
+function noteForReview(env, map, at, day) {
+  return env.DB.prepare(
+    `INSERT OR IGNORE INTO map_review (map, first_seen) SELECT ?1, ?2
+     WHERE (SELECT COUNT(*) FROM map_review) < ?3 AND (SELECT COUNT(*) FROM map_review WHERE first_seen >= ?4) < ?5`
+  ).bind(map, at, MAX_REVIEW, day, MAX_REVIEW_PER_DAY).run();
 }
 
 /** Adds a newly saved run to the small summary tables (see schema.sql), so the site can
@@ -311,6 +424,18 @@ function perPlayer(runs, field) {
   return [...by.values()].map(median);
 }
 
+/** Each player's EXP/hr, the level they were at (the median of their runs) and 1 if they're a new player (only
+ * when the page asked for them), lowest EXP/hr first: [[exp_hr, level, new], ...]. No ids. */
+function playerDots(runs) {
+  const by = new Map();
+  for (const r of runs) {
+    if (!by.has(r.install)) by.set(r.install, { exp: [], level: [], fresh: r.confirmed === 0 });
+    by.get(r.install).exp.push(r.exp_hr);
+    by.get(r.install).level.push(r.level_start);
+  }
+  return [...by.values()].map((p) => [median(p.exp), Math.round(median(p.level)), p.fresh ? 1 : 0]).sort((a, b) => a[0] - b[0]);
+}
+
 /** 3 significant figures (74,213 -> 74,200): plenty for a dot on a chart. */
 const roughly = (n) => Number(n.toPrecision(3));
 
@@ -326,24 +451,33 @@ export function summarize(runs) {
   const usual = (r) => r.exp_hr >= BAND[0] * typical && r.exp_hr <= BAND[1] * typical;
   const kept = runs.filter(usual), left = runs.filter((r) => !usual(r));
   const players = new Set(kept.map((r) => r.install)).size;
-  const exp = perPlayer(kept, "exp_hr"), mesos = perPlayer(kept, "mesos_hr");
-  const sorted = (values) => values.map(roughly).sort((a, b) => a - b);
+  const exp = perPlayer(kept, "exp_hr"), mesos = perPlayer(kept, "mesos_hr"), pct = perPlayer(kept, "pct_hr");
+  const dots = playerDots(kept), unusual = playerDots(left);
   return {
     ranked: players >= MIN_PLAYERS,
     exp_hr: Math.round(median(exp)),
     exp_hr_low: Math.round(quantile(exp, 0.25)),
     exp_hr_high: Math.round(quantile(exp, 0.75)),
     mesos_hr: mesos.length ? Math.round(median(mesos)) : null,
+    pct_hr: pct.length ? Math.round(median(pct) * 100) / 100 : null,           // % of a level per hour
+    pct_hr_low: pct.length ? Math.round(quantile(pct, 0.25) * 100) / 100 : null,
+    pct_hr_high: pct.length ? Math.round(quantile(pct, 0.75) * 100) / 100 : null,
+    hours_per_level: pct.length && median(pct) > 0 ? Math.round(1000 / median(pct)) / 10 : null,
     players,
     runs: kept.length,
     hours: Math.round(kept.reduce((sum, r) => sum + r.seconds, 0) / 360) / 10,
     outliers: left.length,
-    dots: sorted(exp),
-    unusual: sorted(perPlayer(left, "exp_hr")),
+    dots: dots.map((d) => roughly(d[0])),
+    dot_levels: dots.map((d) => d[1]),                   // the level of each dot, in the same order
+    new_players: dots.filter((d) => d[2]).length,        // players who don't count yet (only with "include new players")
+    dot_new: dots.map((d) => d[2]),
+    unusual: unusual.map((d) => roughly(d[0])),
+    unusual_levels: unusual.map((d) => d[1]),
+    unusual_new: unusual.map((d) => d[2]),
   };
 }
 
-async function getStats(url, env, ctx) {
+async function getStats(url, env, ctx, now) {
   const name = url.searchParams.get("class"), path = url.searchParams.get("path") || null;
   const jobs = jobsFor(name, path);
   const level = parseInt(url.searchParams.get("level"), 10);
@@ -353,51 +487,192 @@ async function getStats(url, env, ctx) {
   if (!jobs || !(level >= 1 && level <= 250) || !party) {
     return json({ error: "give class (and path), level (1-250) and party (solo or party)" }, 400);
   }
-  return cached(url, env, ctx, `stats/${name}/${path || ""}/${level}/${party}`, KEEP.stats,
-    () => findMaps(env, name, path, jobs, level, party));
+  const withNew = wantsNew(url);
+  return cached(url, env, ctx, `stats3/${name}/${path || ""}/${level}/${party}${withNew ? "/new" : ""}`, KEEP.stats,
+    () => findMaps(env, name, path, jobs, level, party, now, withNew));
 }
 
-async function findMaps(env, name, path, jobs, level, party) {
-  const { results: runs } = await env.DB.prepare(
-    `SELECT install, map, seconds, exp_hr, mesos_hr FROM runs
-     WHERE job IN (${jobs.map((_, i) => `?${i + 3}`).join(", ")}) AND party ${party === "solo" ? "= 1" : ">= 2"}
-       AND level_start BETWEEN ?1 AND ?2`
-  ).bind(level - LEVEL_WINDOW, level + LEVEL_WINDOW, ...jobs).all();
-  const byMap = new Map();
-  for (const r of runs) {
-    if (!byMap.has(r.map)) byMap.set(r.map, []);
-    byMap.get(r.map).push(r);
+/** Who counts: not banned, seen for VET_HOURS, and at least VET_RUNS runs. The SQL pieces: `from` joins the
+ * installs table, `where` is the condition, `args` its two values (put at the numbers given). */
+const vetting = (now, withNew = false) => withNew ? { cutoff: "9999", runs: 0 }
+  : { cutoff: new Date(now - VET_HOURS * 3600e3).toISOString(), runs: VET_RUNS };
+
+/** "Include new players" (new=1): everyone who isn't banned. Their runs are marked (confirmed = 0) so the page can say
+ * so, and a map name that isn't on the game's list never comes from them. */
+const wantsNew = (url) => url.searchParams.get("new") === "1";
+const onlyListed = (rows) => rows.filter((r) => r.confirmed || isListed(r.map));
+const VETTED = (n1, n2) => `i.banned = 0 AND i.runs >= ?${n1} AND i.first_seen <= ?${n2}`;
+
+/** In how many different days were these (listed-or-not) maps shared by players who count? */
+async function daysSeen(env, maps, now) {
+  const v = vetting(now), days = new Map();
+  for (let i = 0; i < maps.length; i += 80) {
+    const part = maps.slice(i, i + 80);
+    const { results } = await env.DB.prepare(
+      `SELECT r.map, COUNT(DISTINCT r.received_day) AS days FROM runs r JOIN installs i ON i.install = r.install
+       WHERE ${VETTED(1, 2)} AND r.map IN (${part.map((_, j) => `?${j + 3}`).join(", ")}) GROUP BY r.map`
+    ).bind(v.runs, v.cutoff, ...part).all();
+    for (const r of results) days.set(r.map, r.days);
   }
-  // Ranked maps, best first. Maps with fewer players are early data: shown, but not ranked,
-  // most players first (so one made-up player can't put a map at the top), and only maps at
-  // least 2 players have shared somewhere (so one person can't show a made-up map name).
-  const named = byMap.size ? await sharedByTwo(env, [...byMap.keys()]) : new Set();
+  return days;
+}
+
+/** A map name that is on the game's list shows as soon as it has numbers; one that isn't (an event map, a new
+ * map, or made-up text) shows only when ranked AND shared on UNLISTED_DAYS different days. */
+function visibleMap(f, ranked, days) {
+  return isListed(f.map) || (ranked && (days.get(f.map) || 0) >= UNLISTED_DAYS);
+}
+
+/** % of its level's EXP a run gets per hour (its own level, or the middle of two if it levelled):
+ * comparable between levels, which is what lets a map's numbers come from a few levels either side. */
+export function pctPerHour(r) {
+  const need = (EXP_TABLE[r.level_start - 1] + EXP_TABLE[Math.min(r.level_end, r.level_start + 10) - 1]) / 2;
+  return need > 0 ? r.exp_hr / need * 100 : null;
+}
+
+const soloOf = (r) => r.party === 1;
+
+/** [0, 9, 11] for "0.9.11-beta"; [] when it isn't a version. */
+const versionKey = (v) => (typeof v === "string" && v.match(/^\d+(\.\d+)*/)?.[0].split(".").map(Number)) || [];
+
+function olderThan(a, b) {
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    if ((a[i] || 0) !== (b[i] || 0)) return (a[i] || 0) < (b[i] || 0);
+  }
+  return false;
+}
+
+/** A run from an overlay that counted shop and trade mesos, received once that rule is on. */
+const oldMesos = (version, now) => MESOS_RULE_FROM !== "" && now >= Date.parse(MESOS_RULE_FROM)
+  && olderThan(versionKey(version), versionKey(MESOS_VERSION));
+
+const recentCutoff = (now) => new Date(now - RECENT_DAYS * 864e5).toISOString();
+
+/**
+ * The best maps for a class and level. Each map's numbers come from the players at the fewest
+ * levels either side of yours (RADII: 3, then 5) that give it MIN_PLAYERS players, so a
+ * busy level stays precise and a quiet one still fills in (the map says how wide it had to go).
+ * Everything the page shows, including EXP/hr by party size and by level, is
+ * worked out here from the same rows: one request and one query.
+ */
+async function findMaps(env, name, path, jobs, level, party, now, withNew = false) {
+  const widest = RADII[RADII.length - 1], v = vetting(now, withNew), real = vetting(now), n = jobs.length;
+  const { results } = await env.DB.prepare(
+    `SELECT r.install, r.map, r.seconds, r.exp_hr, r.mesos_hr, r.level_start, r.level_end, r.party, r.started, r.received,
+            (i.runs >= ?${n + 5} AND i.first_seen <= ?${n + 6}) AS confirmed
+     FROM runs r JOIN installs i ON i.install = r.install
+     WHERE ${VETTED(n + 3, n + 4)} AND r.job IN (${jobs.map((_, i) => `?${i + 3}`).join(", ")})
+       AND r.level_start BETWEEN ?1 AND ?2 AND r.received >= ?${n + 7}`
+  ).bind(level - widest, level + widest, ...jobs, v.runs, v.cutoff, real.runs, real.cutoff, recentCutoff(now)).all();
+  const rows = onlyListed(results).map((r) => ({ ...r, pct_hr: pctPerHour(r) }));
+  const mine = rows.filter((r) => (party === "solo") === soloOf(r));
+  const theirs = rows.filter((r) => (party === "solo") !== soloOf(r));
+  const grouped = (list) => {
+    const by = new Map();
+    for (const r of list) {
+      if (!by.has(r.map)) by.set(r.map, []);
+      by.get(r.map).push(r);
+    }
+    return by;
+  };
+  const myMaps = grouped(mine), theirMaps = grouped(theirs);
+  const within = (list, radius) => list.filter((r) => Math.abs(r.level_start - level) <= radius);
+
+  const found = [];
+  for (const [map, list] of myMaps) {
+    let used = widest, s = null;
+    for (const radius of RADII) {                        // the narrowest range that has enough players
+      const part = within(list, radius);
+      const got = part.length ? summarize(part) : null;
+      if (got && (got.ranked || radius === widest)) { s = got; used = radius; break; }
+    }
+    if (!s) continue;
+    // EXP/hr for each party size (solo, 2 to 6) at the same levels, from both sides (solo and party rows)
+    const both = [...within(list, used), ...within(theirMaps.get(map) || [], used)];
+    const byParty = [];
+    for (let size = 1; size <= 6; size++) {
+      const each = both.filter((r) => r.party === size);
+      const got = each.length ? summarize(each) : null;
+      if (got) byParty.push({ party: size, players: got.players, exp_hr: got.exp_hr });
+    }
+    const levels = [];
+    for (let l = level - widest; l <= level + widest; l++) {
+      const here = list.filter((r) => r.level_start === l);
+      const each = perPlayer(here, "exp_hr");
+      if (each.length) levels.push({ level: l, players: each.length, exp_hr: roughly(median(each)) });
+    }
+    found.push({
+      map, ...s, levels: [Math.max(1, level - used), level + used], widened: used > RADII[0],
+      by_party: byParty, by_level: levels,
+    });
+  }
+  // Ranked maps, best first. Maps with fewer players are early data: shown, but not ranked, most players first.
+  // Only players who count are in any of this (see vetting), and a map name that isn't on the game's list shows
+  // only once it's ranked and was shared on UNLISTED_DAYS different days.
+  const odd = found.filter((f) => !isListed(f.map)).map((f) => f.map);
+  const days = odd.length ? await daysSeen(env, odd, now) : new Map();
   const maps = [], early = [];
-  for (const [map, list] of byMap) {
-    const { ranked, ...s } = summarize(list);
-    if (ranked) maps.push({ map, ...s });
-    else if (named.has(map)) early.push({ map, ...s });
+  for (const { ranked, ...f } of found) {
+    if (!visibleMap(f, ranked, days)) continue;
+    (ranked ? maps : early).push(f);
   }
-  maps.sort((a, b) => b.exp_hr - a.exp_hr);
+  maps.sort((a, b) => a.widened - b.widened || b.exp_hr - a.exp_hr);      // those at your level first
+  maps.length = Math.min(maps.length, MAX_MAPS);        // (the answer's size and cost stay bounded)
   early.sort((a, b) => b.players - a.players || b.runs - a.runs || b.exp_hr - a.exp_hr);
+  const newest = rows.reduce((m, r) => (r.received > m ? r.received : m), "");
   return json({
-    class: name, path, jobs, party, levels: [Math.max(1, level - LEVEL_WINDOW), level + LEVEL_WINDOW],
-    min_players: MIN_PLAYERS, maps, early: early.slice(0, MAX_EARLY), maps_waiting_for_players: early.length,
+    class: name, path, jobs, party, levels: [Math.max(1, level - RADII[0]), level + RADII[0]], ranges: RADII,
+    min_players: MIN_PLAYERS, with_new: withNew, maps, early: early.slice(0, MAX_EARLY), maps_waiting_for_players: early.length,
+    newest_run: newest ? `${newest.slice(0, 16)}Z` : null,
   });
 }
 
-/** Which of these maps at least 2 different players have shared (any class, level or party). */
-async function sharedByTwo(env, maps) {
-  const named = new Set();
-  for (let i = 0; i < maps.length; i += 90) {              // (a query takes at most 100 values)
-    const part = maps.slice(i, i + 90);
+// ---------------------------------------------------------------- the leveling ladder
+
+const LADDER_BAND = 5;                       // levels in a band of the ladder
+const LADDER_ROWS = 20000;            // the most runs read for one ladder (a limit on what one answer costs)
+
+/** For a class (and path), solo or party: the best maps in each band of 5 levels. */
+async function getLadder(url, env, ctx, now) {
+  const name = url.searchParams.get("class"), path = url.searchParams.get("path") || null;
+  const jobs = jobsFor(name, path);
+  const asked = url.searchParams.get("party") || "solo";
+  const party = asked === "solo" || asked === "1" ? "solo" : asked === "party" || /^[2-6]$/.test(asked) ? "party" : null;
+  if (!jobs || !party) return json({ error: "give class (and path) and party (solo or party)" }, 400);
+  const withNew = wantsNew(url);
+  return cached(url, env, ctx, `ladder/${name}/${path || ""}/${party}${withNew ? "/new" : ""}`, KEEP.ladder, async () => {
+    const v = vetting(now, withNew), real = vetting(now), n = jobs.length;
     const { results } = await env.DB.prepare(
-      `SELECT map FROM map_players WHERE map IN (${part.map((_, j) => `?${j + 1}`).join(", ")})
-       GROUP BY map HAVING COUNT(*) >= 2`
-    ).bind(...part).all();
-    for (const r of results) named.add(r.map);
-  }
-  return named;
+      `SELECT r.install, r.map, r.seconds, r.exp_hr, r.mesos_hr, r.level_start, r.level_end,
+              (i.runs >= ?${n + 4} AND i.first_seen <= ?${n + 5}) AS confirmed
+       FROM runs r JOIN installs i ON i.install = r.install
+       WHERE ${VETTED(n + 2, n + 3)} AND r.job IN (${jobs.map((_, i) => `?${i + 2}`).join(", ")})
+         AND r.party ${party === "solo" ? "= 1" : ">= 2"} AND r.received >= ?${n + 6}
+       ORDER BY r.received DESC LIMIT ?1`
+    ).bind(LADDER_ROWS, ...jobs, v.runs, v.cutoff, real.runs, real.cutoff, recentCutoff(now)).all();
+    const bands = new Map();
+    for (const r of onlyListed(results)) {
+      const from = Math.floor(r.level_start / LADDER_BAND) * LADDER_BAND;
+      if (!bands.has(from)) bands.set(from, new Map());
+      const maps = bands.get(from);
+      if (!maps.has(r.map)) maps.set(r.map, []);
+      maps.get(r.map).push({ ...r, pct_hr: pctPerHour(r) });
+    }
+    const out = [];
+    for (const from of [...bands.keys()].sort((a, b) => a - b)) {
+      const ranked = [];
+      for (const [map, list] of bands.get(from)) {
+        const s = summarize(list);
+        if (s?.ranked) ranked.push({ map, exp_hr: s.exp_hr, pct_hr: s.pct_hr, mesos_hr: s.mesos_hr, players: s.players, ...(withNew ? { new_players: s.new_players } : {}) });
+      }
+      ranked.sort((a, b) => b.exp_hr - a.exp_hr);
+      if (ranked.length) out.push({ from, to: from + LADDER_BAND - 1, maps: ranked.slice(0, 3) });
+    }
+    const odd = [...new Set(out.flatMap((b) => b.maps.map((m) => m.map)))].filter((m) => !isListed(m));
+    const days = odd.length ? await daysSeen(env, odd, now) : new Map();
+    for (const b of out) b.maps = b.maps.filter((m) => visibleMap(m, true, days));
+    return json({ class: name, path, party, band: LADDER_BAND, min_players: MIN_PLAYERS, with_new: withNew, bands: out.filter((b) => b.maps.length) });
+  });
 }
 
 /**
@@ -407,17 +682,18 @@ async function sharedByTwo(env, maps) {
  * from what other players get on that map (solo or party, around that level). Rounded, and
  * nothing about who it was.
  */
-async function getLatest(env) {
+async function getLatest(env, now) {
   const since = new Date(Date.now() - LATEST_DAYS * 864e5).toISOString().slice(0, 10);
   const shown = new Set(Object.keys(CLASSES).flatMap((name) => jobsFor(name)));
+  const v = vetting(now);
   const { results: recent } = await env.DB.prepare(
-    `SELECT install, received, map, job, level_start, party, exp_hr, mesos_hr FROM runs
-     WHERE received >= ?1 ORDER BY received DESC, started DESC LIMIT 200`
-  ).bind(since).all();                                       // (runs are sent a few at a time)
-  const named = await sharedByTwo(env, [...new Set(recent.map((r) => r.map))]);
+    `SELECT r.install, r.received, r.map, r.job, r.level_start, r.party, r.exp_hr, r.mesos_hr
+     FROM runs r JOIN installs i ON i.install = r.install
+     WHERE ${VETTED(2, 3)} AND r.received >= ?1 ORDER BY r.received DESC, r.started DESC LIMIT 200`
+  ).bind(since, v.runs, v.cutoff).all();                     // (runs are sent a few at a time)
   const picked = [], players = new Set();
-  for (const r of recent) {
-    if (!shown.has(r.job) || !named.has(r.map) || players.has(r.install)) continue;
+  for (const r of recent) {                                  // (only maps on the game's list: it's the front page)
+    if (!shown.has(r.job) || !isListed(r.map) || players.has(r.install)) continue;
     players.add(r.install);
     picked.push(r);
     if (picked.length >= LATEST * 2) break;
@@ -426,9 +702,11 @@ async function getLatest(env) {
   const maps = [...new Set(picked.map((r) => r.map))];
   const levels = picked.map((r) => r.level_start);
   const { results: others } = maps.length ? await env.DB.prepare(
-    `SELECT install, map, level_start, party, exp_hr FROM runs
-     WHERE map IN (${maps.map((_, i) => `?${i + 3}`).join(", ")}) AND level_start BETWEEN ?1 AND ?2`
-  ).bind(Math.min(...levels) - LEVEL_WINDOW, Math.max(...levels) + LEVEL_WINDOW, ...maps).all() : { results: [] };
+    `SELECT r.install, r.map, r.level_start, r.party, r.exp_hr FROM runs r JOIN installs i ON i.install = r.install
+     WHERE ${VETTED(maps.length + 3, maps.length + 4)} AND r.map IN (${maps.map((_, i) => `?${i + 3}`).join(", ")})
+       AND r.level_start BETWEEN ?1 AND ?2 AND r.received >= ?${maps.length + 5}`
+  ).bind(Math.min(...levels) - LEVEL_WINDOW, Math.max(...levels) + LEVEL_WINDOW, ...maps, v.runs, v.cutoff,
+         recentCutoff(now)).all() : { results: [] };
   const usual = (r) => {
     const like = others.filter((o) => o.map === r.map && (o.party >= 2) === (r.party >= 2) &&
       Math.abs(o.level_start - r.level_start) <= LEVEL_WINDOW);
@@ -445,14 +723,18 @@ async function getLatest(env) {
   return json({ runs });
 }
 
-async function getOptions(env) {
+async function getOptions(env, now) {
+  const v = vetting(now);
   const [{ results }, { results: [totals] }] = await env.DB.batch([
-    env.DB.prepare("SELECT job, install, runs FROM job_players"),
+    env.DB.prepare(`SELECT j.job, j.install, j.runs FROM job_players j JOIN installs i ON i.install = j.install
+                    WHERE ${VETTED(1, 2)}`).bind(v.runs, v.cutoff),
     env.DB.prepare(
       `SELECT COALESCE((SELECT runs FROM totals WHERE id = 1), 0) AS runs,
               ROUND(COALESCE((SELECT seconds FROM totals WHERE id = 1), 0) / 3600.0, 1) AS hours,
-              (SELECT COUNT(DISTINCT install) FROM job_players) AS players,
-              (SELECT COUNT(DISTINCT map) FROM map_players) AS maps`),
+              (SELECT COUNT(DISTINCT j.install) FROM job_players j JOIN installs i ON i.install = j.install WHERE ${VETTED(1, 2)}) AS players,
+              (SELECT COUNT(DISTINCT j.install) FROM job_players j JOIN installs i ON i.install = j.install WHERE i.banned = 0) AS players_all,
+              (SELECT COUNT(DISTINCT m.map) FROM map_players m JOIN installs i ON i.install = m.install WHERE ${VETTED(1, 2)}) AS maps`)
+      .bind(v.runs, v.cutoff),
   ]);
   const count = (jobs) => {
     const want = new Set(jobs), players = new Set();
@@ -471,7 +753,8 @@ async function getOptions(env) {
       name: path, steps: [c.first[0], ...jobs], ...count(jobsFor(name, path)),   // steps: 1st job to 4th
     })),
   }));
-  return json({ classes, ...totals });
+  const { players_all, ...rest } = totals;
+  return json({ classes, ...rest, players_new: Math.max(0, players_all - totals.players) });   // (kept, not shown yet)
 }
 
 // ---------------------------------------------------------------- helpers

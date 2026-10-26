@@ -164,6 +164,8 @@ for gh in (7, 28):
         with Pipeline(gh=gh) as p:
             p.platform.flat_screenshot_cost = flat
             shots, readings = [], []
+            # The synthetic scene has no name row; its inferred location can fall outside the window.
+            p.reader.next_name_read = float("inf")
             for step in range(12):
                 e, pct = LEVEL_30[min(step // 3, len(LEVEL_30) - 1)]
                 p.show(Scene(gh=gh).exp(e, pct).inventory().party(3))
