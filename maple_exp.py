@@ -49,7 +49,7 @@ import mss
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
-from capture import ScreenCapture, as_capture, grab  # noqa: F401
+from capture import ScreenCapture, as_capture, capture_window, grab  # noqa: F401
 import digits_v2
 import exp_font
 import healthlog
@@ -1977,8 +1977,12 @@ class ScreenReader:
             self._forget_places()
         rect = self._game_rect()
         self.last_rect = rect
-        if rect and self.mode == "window" and PLATFORM.flat_screenshot_cost and type(capture) is ScreenCapture:
-            capture = self.capture = ScreenCapture(_OneShot(capture.sct, rect))
+        if rect and self.mode == "window" and type(capture) is ScreenCapture:
+            window = capture_window(PLATFORM, self.hwnd, rect)
+            if window is not None:
+                capture = self.capture = window
+            elif PLATFORM.flat_screenshot_cost:
+                capture = self.capture = ScreenCapture(_OneShot(capture.sct, rect))
         if self.mode == "region":
             reading = self._read_region(capture, rect)
         elif not self.hwnd and PLATFORM.missing_permission():
@@ -6455,14 +6459,18 @@ class App:
             return None
 
     def _save_report_screen(self):
-        """The game window as the overlay sees it (this window blacked out), shrunk, as a JPEG."""
+        """A fresh game-window picture, or a masked screen copy, shrunk as a JPEG."""
         rect = self.reader.last_rect
         if not rect:
             return None
         try:
-            with mss.mss() as sct:
-                # (always a screen copy, whatever the reader uses: it shows what is on screen, this window hidden)
-                shot = self.reader._hide_own(grab(sct, *rect), screen_copy=True)
+            reader = self.reader
+            window = capture_window(PLATFORM, reader.hwnd, rect) if reader.mode == "window" else None
+            if window is not None:
+                shot = window.grab(*rect)
+            else:
+                with mss.mss() as sct:
+                    shot = reader._hide_own(grab(sct, *rect), screen_copy=True)
             if not shot:
                 return None
             img = Image.fromarray(cv2.cvtColor(shot[0], cv2.COLOR_BGR2RGB))

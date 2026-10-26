@@ -1,7 +1,7 @@
 """Where the reader's pictures of the screen come from.
 
 The reader asks a Capture for a rectangle in SCREEN coordinates and gets it back as (bgr, left, top), or
-None when it is off the monitors. Today the only source is a copy of the screen (ScreenCapture), which shows
+None when it is outside the source. ScreenCapture copies the screen, which shows
 whatever window is on top, this app's included. A source that can see the game through other windows
 (window capture) says so with `sees_through_windows`, so the reader doesn't skip areas this app covers."""
 
@@ -50,3 +50,40 @@ class ScreenCapture(Capture):
 def as_capture(source):
     """A Capture from either a Capture or a bare mss-like object (the tests pass a fake screen)."""
     return source if isinstance(source, Capture) else ScreenCapture(source)
+
+
+class WindowCapture(Capture):
+    """One immutable game-window frame per look, independent of windows covering it.
+
+    Requests are clipped to this window, never filled with unrelated desktop pixels.
+    The returned origin reflects that clipping, including negative display coordinates.
+    """
+    name = "window"
+    sees_through_windows = True
+
+    def __init__(self, rect, bgra):
+        self.rect = tuple(rect)
+        self.frame = cv2.cvtColor(bgra, cv2.COLOR_BGRA2BGR)
+
+    def grab(self, left, top, width, height):
+        x, y, w, h = self.rect
+        x0, y0 = max(left, x), max(top, y)
+        x1, y1 = min(left + width, x + w), min(top + height, y + h)
+        if x1 - x0 < 8 or y1 - y0 < 8:
+            return None
+        return self.frame[y0-y:y1-y, x0-x:x1-x], x0, y0
+
+
+def capture_window(platform, handle, rect):
+    """Try a fresh window frame; any failure leaves the caller on screen capture."""
+    if not handle or not rect or not platform.captures_window_alone:
+        return None
+    try:
+        whole = platform.capture_window(handle, *rect)
+        if (not isinstance(whole, np.ndarray) or whole.dtype != np.uint8
+                or whole.shape != (rect[3], rect[2], 4)):
+            return None
+        return WindowCapture(rect, whole)
+    except Exception:
+        # Unsupported API, permission change, closing window or invalid pixel buffer.
+        return None

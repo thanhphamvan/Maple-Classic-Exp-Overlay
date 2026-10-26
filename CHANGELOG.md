@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased (fork)
+
+- Detect Nexon's Mac launcher game window above the menu-bar layer and ignore tiny launcher windows.
+- On macOS, try one picture of the game window per look so overlapping windows do not obscure readings. Fall back to the existing screen capture if the API is unavailable, returns an invalid picture, or raises an exception. Selected-area mode still reads the screen.
+- Bug-report game pictures use the same window-capture approach, with overlay masking on screen-capture fallback.
+
 ## 0.9.13-beta
 
 **Fewer reading problems**

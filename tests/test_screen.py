@@ -22,6 +22,7 @@ assert Path(os.environ["MAPLE_EXP_DATA"]) == m.DATA_DIR, "tests must run on thei
 
 # These tests measure separate grabs; the macOS shared-frame path is tested in test_pipeline.py.
 m.PLATFORM.flat_screenshot_cost = False
+m.PLATFORM.captures_window_alone = False  # fake window IDs; window capture is tested in test_capture.py
 
 FRAMES = Path(__file__).parent / "frames"
 PARTS = json.loads((FRAMES / "screen_parts.json").read_text())

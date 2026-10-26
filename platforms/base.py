@@ -125,6 +125,13 @@ class Platform(ABC):
     def client_rect(self, handle):
         """The game area of the window on screen, or None (also when it's minimized)."""
 
+    captures_window_alone = False
+
+    def capture_window(self, handle, left, top, width, height):
+        """The window alone as a uint8 BGRA image in screen points, or None if unavailable.
+        Callers must also handle exceptions (permissions, missing APIs, or a vanished window)."""
+        return None
+
     @abstractmethod
     def own_window_rect(self, root):
         """The overlay's own window on screen, frame included, from its tkinter root; or None."""

@@ -277,9 +277,11 @@ py -3 -m pip install -r requirements.txt
 run.bat
 ```
 
-**On macOS** (from source only, with the game running through CrossOver, Whisky, Parallels or a game stream): macOS support was written by thanhphamvan, who tried it on a real Mac with the game. I don't own a Mac, so I can't test it myself: GitHub's automatic tests run on a real Mac, but not with the game. If you try it, please tell me how it goes.
+**On macOS** (from source only, with the game running in Nexon's MapleStory Launcher for Mac, CrossOver, Whisky, Parallels or a game stream): macOS support was written by thanhphamvan, who tried it on a real Mac with the game. I don't own a Mac, so I can't test it myself: GitHub's automatic tests run on a real Mac, but not with the game. If you try it, please tell me how it goes.
 
-**How to run it on a Mac:** `brew install tesseract`, then `python3 -m pip install -r requirements.txt` and `python3 maple_exp.py`. The first time, allow your Terminal (or Python) in **System Settings > Privacy & Security > Screen Recording**, then start it again. The window is found by "MapleStory" in its title; if it isn't, use **Select area**. Hotkeys aren't available on macOS yet.
+**How to run it on a Mac:** `brew install tesseract`, then `python3 -m pip install -r requirements.txt` and `python3 maple_exp.py`. The first time, allow your Terminal (or Python) in **System Settings > Privacy & Security > Screen Recording**, then start it again. The window is found by "MapleStory" in its program name or title; if it isn't, use **Select area**. In window mode, macOS first tries to capture the game window alone so overlapping windows do not obscure it. If capture is unavailable or fails, it falls back to screen capture; keep the game visible in that case. **Select area** always reads the screen. Hotkeys aren't available on macOS yet.
+
+The macOS launcher detection and window-capture approach are adapted from [cpaez33’s PR #11](https://github.com/beanguri/Maple-Classic-Exp-Overlay/pull/11). Live-game fullscreen and mixed-display behavior still need verification.
 
 Everything that differs between Windows and macOS (finding the game window, screen scaling, hotkeys, the one-copy-at-a-time lock) is in `platforms/`: one `Platform` interface in `base.py`, one implementation per OS, and `create_platform()` picks the one for the OS it's on.
 
@@ -301,6 +303,7 @@ py -3 tests/test_screen.py
 py -3 tests/test_ui.py
 py -3 tests/test_ocr_backends.py
 py -3 tests/test_pipeline.py
+py -3 tests/test_capture.py
 py -3 tests/test_ocr.py
 ```
 

@@ -66,6 +66,7 @@ jobs:
           python tests/test_ocr.py
           python tests/test_report.py
           python tests/test_health.py
+          python tests/test_capture.py
           python tests/test_pipeline.py
           python tests/test_ocr_backends.py
       - name: Build

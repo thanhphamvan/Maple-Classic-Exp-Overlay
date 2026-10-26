@@ -12,6 +12,8 @@ import tempfile
 from collections import namedtuple
 from pathlib import Path
 
+import numpy as np
+
 from .base import Hotkeys, Platform
 
 _cg = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
@@ -42,6 +44,8 @@ _CFRelease = _api(_cf.CFRelease, None, _vp)
 _KEYS = {k: _vp.in_dll(_cg, "kCGWindow" + k).value
          for k in ("Number", "OwnerPID", "OwnerName", "Name", "Layer", "Bounds", "IsOnscreen")}
 _ON_SCREEN, _ONLY_THIS, _NO_DESKTOP = 1, 8, 16          # kCGWindowListOption...
+_POPUP = 101  # kCGPopUpMenuWindowLevel
+_IGNORE_FRAMING, _NOMINAL = 1, 16
 _TOPMOST = 19                                           # the window layer of Always on top (tkinter's -topmost)
 
 MacWindow = namedtuple("MacWindow", "number pid owner title layer rect onscreen")
@@ -90,10 +94,32 @@ def window_list(option=_ON_SCREEN | _NO_DESKTOP, number=0):
 
 def is_game(w, own_pid):
     """Could this window be MapleStory's?"""
-    # Normal windows up to always-on-top ones: not the Dock, menu bar and the like above them.
-    if not 0 <= w.layer <= _TOPMOST or w.pid == own_pid or not w.rect or w.owner.lower() in _NOT_GAME:
+    if w.layer < 0 or w.pid == own_pid or not w.rect or w.owner.lower() in _NOT_GAME:
         return False
-    return "maplestory" in w.title.lower().replace(" ", "") or "maplestory" in w.owner.lower()
+    # Nexon's own Mac app ("MapleStory Classic World") puts the game above the menu bar's layer.
+    if "maplestory" in w.owner.lower().replace(" ", ""):
+        return w.layer < _POPUP
+    # Normal windows up to always-on-top ones: not the Dock, menu bar and the like above them.
+    return w.layer <= _TOPMOST and "maplestory" in w.title.lower().replace(" ", "")
+
+
+_window_image_api = None
+
+
+def _window_capture_api():
+    """Load optional CoreGraphics capture symbols only when window capture is requested."""
+    global _window_image_api
+    if _window_image_api is None:
+        _CreateImage = _api(_cg.CGWindowListCreateImage, _vp, _CGRect, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32)
+        _ImageWidth, _ImageHeight, _ImageRowBytes, _ImageBits = (_api(f, ctypes.c_size_t, _vp) for f in (
+            _cg.CGImageGetWidth, _cg.CGImageGetHeight, _cg.CGImageGetBytesPerRow, _cg.CGImageGetBitsPerPixel))
+        _ImageInfo = _api(_cg.CGImageGetBitmapInfo, ctypes.c_uint32, _vp)
+        _ImageData = _api(_cg.CGImageGetDataProvider, _vp, _vp)
+        _CopyData = _api(_cg.CGDataProviderCopyData, _vp, _vp)
+        _DataBytes = _api(_cf.CFDataGetBytePtr, _vp, _vp)
+        _DataLength = _api(_cf.CFDataGetLength, ctypes.c_long, _vp)
+        _window_image_api = dict(locals())
+    return _window_image_api
 
 
 class MacHotkeys(Hotkeys):
@@ -164,7 +190,8 @@ class MacPlatform(Platform):
         for w in window_list():
             if is_game(w, os.getpid()):
                 rect = self.client_rect(w.number)
-                found.append((rect[2] * rect[3] if rect else 0, w.number))
+                if rect:
+                    found.append((rect[2] * rect[3], w.number))
         return max(found)[1] if found else None
 
     def window_exists(self, number):
@@ -178,6 +205,33 @@ class MacPlatform(Platform):
             return None
         x, y, width, height = (round(v) for v in w.rect)
         return (x, y, width, height) if width >= 100 and height >= 100 else None
+
+    captures_window_alone = True
+
+    def capture_window(self, number, left, top, width, height):
+        api = _window_capture_api()
+        image = api["_CreateImage"](_CGRect(left, top, width, height), _ONLY_THIS, number, _IGNORE_FRAMING | _NOMINAL)
+        if not image:
+            return None
+        data = None
+        try:
+            info = api["_ImageInfo"](image)                 # BGRA: 32-bit little-endian, alpha (or nothing) first
+            if ((api["_ImageWidth"](image), api["_ImageHeight"](image), api["_ImageBits"](image)) != (width, height, 32)
+                    or info & 0x7000 != 0x2000 or info & 0x1F not in (2, 4, 6)):
+                return None                          # (cut by the screen's edge, or another pixel layout)
+            data = api["_CopyData"](api["_ImageData"](image))
+            if not data:
+                return None
+            length, address = api["_DataLength"](data), api["_DataBytes"](data)
+            stride = api["_ImageRowBytes"](image)
+            if not address or stride < width * 4 or length < (height - 1) * stride + width * 4:
+                return None
+            rows = (ctypes.c_ubyte * length).from_address(address)
+            return np.ndarray((height, width, 4), np.uint8, rows, strides=(stride, 4, 1)).copy()
+        finally:
+            if data:
+                _CFRelease(data)
+            _CFRelease(image)
 
     def own_window_rect(self, root):
         x, y = root.winfo_rootx() + 1, root.winfo_rooty() + 1
