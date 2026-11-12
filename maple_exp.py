@@ -53,6 +53,7 @@ from capture import ScreenCapture, as_capture, capture_window, grab  # noqa: F40
 import digits_v2
 import exp_font
 import healthlog
+import kpq_macro
 import level_ocr
 import ocr
 import potions
@@ -132,7 +133,8 @@ LEVEL_FAILS_FOR_FALLBACK = 3    # badge reads that failed in a row before typing
 DEFAULTS = {"gap_seconds": 15, "transparency": 0, "topmost": True,
             "check_updates": True, "skip_version": "", "ui_scale": 100, "compact": False, "hotkeys_on": True,
             "details": False, "compact_shape": "square", "seen_version": "",
-            "potions_on": True, "potion_prices": {}, "shadow_reader": True}
+            "potions_on": True, "potion_prices": {}, "shadow_reader": True,
+            "kpq_delay_mean": 0.45, "kpq_delay_sigma": 0.15, "kpq_max_minutes": 20}   # (KPQ macro: waits in seconds)
 SHAPE_LABELS = {"square": "Square", "wide": "Wide", "bar": "Bar"}
 SHAPE_BLURBS = {"square": "The narrow card: the big number, the level bar and Start/Pause.",
                 "wide": "Longer sideways: the level bar on top and four numbers in a row.",
@@ -288,6 +290,7 @@ def load_config():
               "share_health": lambda v: type(v) is bool,     # (same: the daily health report)
               "health_id": healthlog.good_id,
               "exp_v2_spots": good_v2_spots,                  # (where reader v2 found the bar, by window size)
+              "kpq_yes": lambda v: ints(v, 2),                # (the KPQ macro's Yes button, from the game window's corner)
               "reports_sent": lambda v: isinstance(v, dict) and isinstance(v.get("day"), str) and type(v.get("n")) is int and v["n"] >= 0}
     for key, ok in checks.items():
         if key in cfg and not (cfg[key] is None and key == "log_size") and not ok(cfg[key]):    # (a null log_size is saved on purpose)
@@ -4298,6 +4301,7 @@ class App:
         self._price_table = None
         self.q = queue.Queue()
         self.stop_evt = threading.Event()
+        self.kpq = None                 # the KPQ macro while it runs
         self.last_capture = None
 
         # The typeface is bundled with the overlay and made available to this program only.
@@ -4368,7 +4372,8 @@ class App:
         self.theme = Theme(self.root, self._px_per_pt * 0.75, ASSETS / "fonts", self._own_fonts, PLATFORM.font)
         callbacks = dict(settings=self.open_settings, compact=lambda: self.set_compact(not self.compact),
                          log=self.toggle_log, start=self.toggle, reset=self.reset, logging=self._logging_clicked,
-                         best=self.open_best_maps, menu=self._open_menu, details=self._details_changed)
+                         best=self.open_best_maps, menu=self._open_menu, details=self._details_changed,
+                         kpq=self._kpq_clicked, kpq_yes=self._kpq_set_yes)
         self.view = self.main = MainView(self.root, self.theme, callbacks, details=bool(self.cfg.get("details")))
         self.view.grid(row=0, column=0, sticky="n")
         if self.compact:
@@ -4392,6 +4397,75 @@ class App:
         PopupMenu(self.theme, anchor, [
             ("Follow the game" if self.reader.mode == "region" else "Select area", None, self.toggle_area),
             ("View capture", None, self.view_capture)])
+
+    # ---- KPQ macro (personal branch)
+    KPQ_TOWN = "kerning city"
+
+    def _kpq_why_not(self):
+        """Why the KPQ macro can't start right now, or None."""
+        why = PLATFORM.can_send_input()
+        if why:
+            return why
+        if not self.cfg.get("kpq_yes"):
+            return "Set the Yes spot first: open Lakelis' dialog and press Set Yes."
+        if self.reader.mode != "window" or not tesseract_ok:
+            return "The KPQ macro needs the map name: follow the game window, with Tesseract installed."
+        if not self.reader.hwnd:
+            return "Can't find the game window."
+        if (self.map_name or "").strip().lower() != self.KPQ_TOWN:
+            return f"The KPQ macro only runs in Kerning City (the map is {self.map_name or 'not known yet'})."
+        return None
+
+    def _kpq_clicked(self, on):
+        if not on:
+            if self.kpq:
+                self.kpq.stop("turned off")
+            return
+        why = self._kpq_why_not()
+        if why:
+            self.view.kpq.set(False)
+            self.status.set(why)
+            return
+        self.reader.request_map()
+        cfg = self.cfg
+        self.kpq = kpq_macro.KpqMacro(
+            PLATFORM, lambda: self.reader.hwnd, PLATFORM.client_rect, cfg["kpq_yes"],
+            on_stop=lambda why: self.root.after(0, self._kpq_stopped, why),
+            mean=cfg["kpq_delay_mean"], sigma=cfg["kpq_delay_sigma"], max_minutes=cfg["kpq_max_minutes"])
+        self.kpq.start()
+        self.status.set("KPQ macro on: T, Yes, Esc until the party gets in. To stop it: a screen corner.")
+
+    def _kpq_stopped(self, why):
+        macro, self.kpq = self.kpq, None
+        rounds = f" after {macro.rounds} tries" if macro else ""
+        if getattr(self, "view", None):
+            self.view.kpq.set(False)
+        self.status.set(f"KPQ stopped{rounds}: {why}.")
+
+    def _kpq_stop(self, why):
+        if self.kpq:
+            self.kpq.stop(why)
+
+    def _kpq_set_yes(self, left=3):
+        """Hold the pointer over the Yes button of Lakelis' dialog; its spot (from the game window's
+        corner, so moving the window doesn't matter) is saved after a countdown. Press again to replace it."""
+        if left:
+            self.status.set(f"Hold the pointer over Yes in Lakelis' dialog... {left}")
+            self.root.after(1000, self._kpq_set_yes, left - 1)
+            return
+        rect = PLATFORM.client_rect(self.reader.hwnd) if self.reader.hwnd else None
+        at = PLATFORM.cursor_pos()
+        if not rect or not at:
+            self.status.set("Couldn't set the Yes spot: " + ("can't find the game window." if not rect
+                                                             else "can't read the pointer's position."))
+            return
+        dx, dy = at[0] - rect[0], at[1] - rect[1]
+        if not (0 <= dx < rect[2] and 0 <= dy < rect[3]):
+            self.status.set("Couldn't set the Yes spot: the pointer wasn't over the game window.")
+            return
+        self.cfg["kpq_yes"] = [dx, dy]
+        save_config(self.cfg)
+        self.status.set(f"KPQ Yes spot saved ({dx}, {dy} from the game window's corner).")
 
     def _logging_clicked(self, on):
         if self.skip_log == on:                           # the switch and the state disagree: flip
@@ -5638,6 +5712,8 @@ class App:
             self.map_read = r.map                       # as read (kept on record if renamed)
             # A slightly misread name of the map you're on still counts as that map.
             self.map_name = self.autolog.canonical(r.map, also=(self.map_name, self.session.map))
+            if self.kpq and self.map_name.strip().lower() != self.KPQ_TOWN:
+                self.kpq.stop(f"now in {self.map_name}")       # (the party got in, or you left town)
             waiting = self.session.waiting
             self.session.map_seen(self.map_name)
             self._after_pause_check(waiting)
@@ -6002,6 +6078,7 @@ class App:
         self.view.set_start(text, "pause" if text == "Pause" else "play", "secondary" if text == "Pause" else "primary")
 
     def reset(self):
+        self._kpq_stop("reset")
         self.session.reset()
         self.autolog.reset_clock()
         self._char_print = self._char_seen = self.other_char_at = None      # (what was known about the character is over too)
@@ -6513,6 +6590,7 @@ class App:
             self.cfg["log_size"] = size if size != natural else None
 
     def close(self):
+        self._kpq_stop("closing")
         self._note_flush()
         self.stop_evt.set()
         try:

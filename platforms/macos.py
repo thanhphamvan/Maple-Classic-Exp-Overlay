@@ -9,6 +9,7 @@ import os
 import platform
 import subprocess
 import tempfile
+import time
 from collections import namedtuple
 from pathlib import Path
 
@@ -122,6 +123,35 @@ def _window_capture_api():
     return _window_image_api
 
 
+class _CGPoint(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+
+_KEYCODES = {"t": 17, "esc": 53}                     # macOS virtual key codes (US layout)
+_MOUSE_DOWN, _MOUSE_UP, _MOUSE_MOVED = 1, 2, 5       # kCGEventLeftMouseDown / Up, kCGEventMouseMoved
+_HID_TAP = 0                                         # kCGHIDEventTap
+_input_api_cache = None
+
+
+def _input_api():
+    """CoreGraphics event symbols (and Accessibility's check), loaded on first use."""
+    global _input_api_cache
+    if _input_api_cache is None:
+        ax = ctypes.CDLL("/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
+        _input_api_cache = dict(
+            trusted=_api(ax.AXIsProcessTrusted, ctypes.c_bool),
+            key=_api(_cg.CGEventCreateKeyboardEvent, _vp, _vp, ctypes.c_uint16, ctypes.c_bool),
+            mouse=_api(_cg.CGEventCreateMouseEvent, _vp, _vp, ctypes.c_uint32, _CGPoint, ctypes.c_uint32),
+            post=_api(_cg.CGEventPost, None, ctypes.c_uint32, _vp),
+            post_pid=_api(_cg.CGEventPostToPid, None, ctypes.c_int32, _vp),
+            create=_api(_cg.CGEventCreate, _vp, _vp),
+            location=_api(_cg.CGEventGetLocation, _CGPoint, _vp),
+            displays=_api(_cg.CGGetActiveDisplayList, ctypes.c_int32, ctypes.c_uint32,
+                          ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32)),
+            bounds=_api(_cg.CGDisplayBounds, _CGRect, ctypes.c_uint32))
+    return _input_api_cache
+
+
 class MacHotkeys(Hotkeys):
     """No hotkeys on macOS yet: keys pressed in the game can't be seen without the
     Accessibility permission. The buttons work as usual."""
@@ -205,6 +235,66 @@ class MacPlatform(Platform):
             return None
         x, y, width, height = (round(v) for v in w.rect)
         return (x, y, width, height) if width >= 100 and height >= 100 else None
+
+    def can_send_input(self):
+        try:
+            if _input_api()["trusted"]():
+                return None
+        except Exception as e:
+            return f"Can't send keys to the game ({e})."
+        return ("Can't send keys to the game. Allow this app (or your Terminal) in System Settings >"
+                " Privacy & Security > Accessibility, then restart it.")
+
+    def send_key(self, number, key):
+        """To the game's program by its process id, so it arrives even if the overlay has focus."""
+        code = _KEYCODES.get(key)
+        w = next(iter(window_list(_ONLY_THIS, number)), None) if code is not None else None
+        if not w or not w.pid:
+            return False
+        api = _input_api()
+        for down in (True, False):
+            event = api["key"](None, code, down)
+            if not event:
+                return False
+            try:
+                api["post_pid"](w.pid, event)
+            finally:
+                _CFRelease(event)
+            if down:
+                time.sleep(0.03)
+        return True
+
+    def click(self, x, y):
+        """Through the system's event tap: the pointer really moves there (and the game comes to the front)."""
+        api, at = _input_api(), _CGPoint(x, y)
+        for kind in (_MOUSE_MOVED, _MOUSE_DOWN, _MOUSE_UP):
+            event = api["mouse"](None, kind, at, 0)          # kCGMouseButtonLeft
+            if not event:
+                return False
+            try:
+                api["post"](_HID_TAP, event)
+            finally:
+                _CFRelease(event)
+            time.sleep(0.03)
+        return True
+
+    def cursor_pos(self):
+        api = _input_api()
+        event = api["create"](None)
+        if not event:
+            return None
+        try:
+            p = api["location"](event)
+            return round(p.x), round(p.y)
+        finally:
+            _CFRelease(event)
+
+    def display_rects(self):
+        api, ids, n = _input_api(), (ctypes.c_uint32 * 16)(), ctypes.c_uint32()
+        if api["displays"](16, ids, ctypes.byref(n)) != 0:
+            return []
+        rects = (api["bounds"](ids[i]) for i in range(n.value))
+        return [(round(r.x), round(r.y), round(r.w), round(r.h)) for r in rects]
 
     captures_window_alone = True
 

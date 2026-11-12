@@ -132,6 +132,27 @@ class Platform(ABC):
         Callers must also handle exceptions (permissions, missing APIs, or a vanished window)."""
         return None
 
+    # ---- sending input to the game (the KPQ macro); off unless a platform has it
+    def can_send_input(self):
+        """None if keys and clicks can be sent to the game, else why not."""
+        return f"Sending keys to the game isn't available on {self.name}."
+
+    def send_key(self, handle, key):
+        """Presses and lets go of one key ('t', 'esc') in the game window's program. True if sent."""
+        return False
+
+    def click(self, x, y):
+        """A left click at this screen point (in points). True if sent."""
+        return False
+
+    def cursor_pos(self):
+        """The mouse pointer's screen point (in points), or None."""
+        return None
+
+    def display_rects(self):
+        """Every display as (x, y, width, height) in screen points (for the macro's corner stop)."""
+        return []
+
     @abstractmethod
     def own_window_rect(self, root):
         """The overlay's own window on screen, frame included, from its tkinter root; or None."""

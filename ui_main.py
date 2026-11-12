@@ -747,6 +747,11 @@ class MainView(tk.Frame):
         self.best_btn = Button(foot, theme, text="Best maps", icon="link", kind="ghost", height=30, radius=10, size=12,
                                command=cb["best"], bg=bg)
         self.best_btn.grid(row=0, column=1, sticky="e")
+        self.kpq = Toggle(foot, theme, "KPQ spam", False, cb["kpq"], bg, alt="KPQ off")
+        self.kpq.grid(row=1, column=0, sticky="w", pady=(g.px(4), 0))
+        self.kpq_yes_btn = Button(foot, theme, text="Set Yes", kind="ghost", height=26, radius=9, size=11,
+                                  command=cb["kpq_yes"], bg=bg)
+        self.kpq_yes_btn.grid(row=1, column=1, sticky="e", pady=(g.px(4), 0))
         self.message = Message(self, theme, bg)
         self.message.grid(row=7, column=0, padx=g.px(SIDE + 2), pady=pad(2, 14), sticky="we")
         self.foot_widgets = [self.tiles_row, self.more_btn, self.details, self.reset_btn, self.menu_btn, foot]
