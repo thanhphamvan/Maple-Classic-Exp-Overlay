@@ -299,8 +299,8 @@ def grab_box(window_w, window_h, last=None, margin=8):
     scales = [last.scale] if last is not None else [s for _, s in ui_layout.candidate_scales(window_h)]
     boxes = [_bar_box(window_w, window_h, s, margin, layout) for s in scales for layout in FIND_LAYOUTS]
     x0, y0 = min(b[0] for b in boxes), min(b[1] for b in boxes)
-    x1 = max(b[2] for b in boxes)
-    return max(x0, 0), max(y0, 0), x1 - max(x0, 0), window_h - max(y0, 0)
+    x1 = min(max(b[2] for b in boxes), window_w)       # (inside the window: a part reaching past it can't be cut from
+    return max(x0, 0), max(y0, 0), x1 - max(x0, 0), window_h - max(y0, 0)   # a picture of the window alone, macOS)
 
 
 def bar_from_look(look, window_w, window_h):

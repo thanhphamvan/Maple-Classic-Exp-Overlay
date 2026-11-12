@@ -910,7 +910,9 @@ for scale in m.UI_SCALES:
                 app.view._toggle_details()
             app._update_display()
             root.update()
-            if root.winfo_reqheight() > root.winfo_screenheight():      # (taller than the screen itself: 200% full with details, flagged B13-2)
+            # (taller than the screen can show it: 200% full with details, flagged B13-2; on macOS the menu bar
+            # and the Dock take some of the screen, and Tk's maxsize() says what's left)
+            if root.winfo_reqheight() > min(root.winfo_screenheight(), root.maxsize()[1]):
                 continue
             box_bad += [f"{scale}% {shape} {'compact' if compact else 'full'}: {c}" for c in sticking_out(root)]
 app.set_shape(m.SHAPES[0])

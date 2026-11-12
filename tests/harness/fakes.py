@@ -116,7 +116,7 @@ class FakePlatform(Platform):
     calls counts each method used, so tests can see how often the OS is asked."""
 
     name = "Fake OS"
-    flat_screenshot_cost = False            # (set True to look as macOS does)
+    captures_window_alone = False           # (set True to look as macOS does: capture_window pictures the game alone)
 
     def __init__(self, screen):
         self.screen = screen
@@ -185,6 +185,20 @@ class FakePlatform(Platform):
         if not g or g.handle != handle or g.minimized:
             return None
         return g.rect
+
+    def capture_window(self, handle, left, top, width, height):
+        """The game window alone (nothing on top of it), as a BGRA picture of that screen rectangle inside it, or
+        None. Counted as one of the screen's grabs: it is one picture, as on macOS, whatever its size."""
+        self._count("capture_window")
+        g = self._game
+        if not self.captures_window_alone or not g or g.handle != handle or g.minimized:
+            return None
+        x, y, w, h = g.rect
+        if left < x or top < y or left + width > x + w or top + height > y + h:
+            return None
+        self.screen.grabs += 1
+        self.screen.pixels += width * height
+        return cv2.cvtColor(g.image[top - y:top - y + height, left - x:left - x + width], cv2.COLOR_BGR2BGRA)
 
     def own_window_rect(self, root):
         return self.overlay.rect if self.overlay else None

@@ -21,10 +21,6 @@ import maple_exp as m  # noqa: E402
 import party_v3  # noqa: E402
 assert Path(os.environ["MAPLE_EXP_DATA"]) == m.DATA_DIR, "tests must run on their own temp data folder, never on real data"
 
-# These tests measure separate grabs; the macOS shared-frame path is tested in test_pipeline.py.
-m.PLATFORM.flat_screenshot_cost = False
-m.PLATFORM.captures_window_alone = False  # fake window IDs
-
 FRAMES = Path(__file__).parent / "frames"
 PARTS = json.loads((FRAMES / "screen_parts.json").read_text())
 rnd = random.Random(1)

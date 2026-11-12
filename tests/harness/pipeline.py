@@ -38,6 +38,8 @@ class Pipeline:
             c.__enter__()
         templates = m.DigitTemplates.load() if self.templates == "game" else self.templates
         self.reader = m.ScreenReader(templates, text_ocr=self.text_ocr)
+        # (as App._worker: a platform that pictures the game window alone gets a WindowCapture, else the screen)
+        self.window_capture = m.WindowCapture(self.screen, self.platform, lambda: self.reader.own_rect)
         self.session = m.Session(self.gap)
         self.party, self._party_seen = None, (None, 0)
         if self.overlay:
@@ -65,7 +67,7 @@ class Pipeline:
 
     def poll(self, seconds=m.POLL_SECONDS):
         """One look at the screen, then the clock moves on to the next one. Returns the Reading."""
-        r = self.reader.read(self.screen)
+        r = self.reader.read(self.window_capture if self.platform.captures_window_alone else self.screen)
         now = self.clock.now
         t = self.session.exp
         if r.mesos is not None:

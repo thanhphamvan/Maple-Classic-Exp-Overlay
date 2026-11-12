@@ -141,10 +141,16 @@ c.check(f"two different answers: both kept as guesses; a % that can't be one (1 
 c.check("no text OCR: no guesses, and nothing is asked",
         m.ocr_candidates(cv2.imread(str(FRAMES / "exp_win-1280x720.png")), lay, ocr.NoTextOCR()) == [])
 with Pipeline(gh=7, templates=None, text_ocr=FakeTextOCR(["68601", "68601", "7168", "7168"])) as p:
+    p.reader.set_shadow(False)          # (reader v2 decides the EXP bar on its own font: this is today's reader, its backup)
     p.show(Scene(gh=7))
     r = p.poll()
     c.check(f"with no font examples the reader falls back to the text OCR, but doesn't fully trust it "
             f"({r.text}, confident {r.confident})", r.candidates == [(68601, 71.68)] and not r.confident)
+with Pipeline(gh=7, templates=None, text_ocr=FakeTextOCR([])) as p:
+    p.show(Scene(gh=7))
+    r = p.poll()
+    c.check(f"...while reader v2 (on by default) reads the bar by itself, no font examples or text OCR needed "
+            f"({r.text}, confident {r.confident})", r.confident and r.text == f"{EXP:,} [{PCT:.2f}%]")
 
 c.section("map name reader, with a fake text OCR")
 gh = 11

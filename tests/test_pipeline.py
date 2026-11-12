@@ -112,10 +112,13 @@ for gh in SIZES:
         p.show(Scene(gh=gh).inventory(alpha=0.6))
         got = [p.poll().mesos for _ in range(6)]
         c.check(f"   see-through inventory: never a wrong number ({got})", all(v in (None, MESOS) for v in got))
+# (today's party reader: reader v3, which decides, matches the whole party window's frame by its shape at the game's
+# real UI scales, so it is tested on real screenshots in test_v2 and test_screen; these scenes paste bare rows)
 for gh in (7, 28):
     sizes = []
     for members in range(1, 7):
         with Pipeline(gh=gh) as p:
+            p.reader.set_shadow(False)
             p.show(Scene(gh=gh).party(members) if members > 1 else Scene(gh=gh))
             for _ in range(2):                          # believed once seen twice
                 p.poll()
@@ -155,14 +158,14 @@ with Pipeline(gh=7) as p:
     c.check(f"moving the game window mid-run loses nothing (gained {p.session.exp.gained}, should be 170)",
             p.session.exp.gained == 170)
 
-# ---- one screenshot a look, where a screenshot costs the same at any size (macOS)
-c.section("one screenshot a look (macOS)")
+# ---- one picture of the game window a look, where it can be pictured alone and costs the same at any size (macOS)
+c.section("one picture of the game window a look (macOS)")
 FIELDS = ("where", "candidates", "confident", "text", "map", "note", "mesos", "party", "mesos_at")
 for gh in (7, 28):
     runs = {}
-    for flat in (False, True):
+    for alone in (False, True):
         with Pipeline(gh=gh) as p:
-            p.platform.flat_screenshot_cost = flat
+            p.platform.captures_window_alone = alone
             shots, readings = [], []
             # The synthetic scene has no name row; its inferred location can fall outside the window.
             p.reader.next_name_read = float("inf")
@@ -174,13 +177,13 @@ for gh in (7, 28):
                 p.screen.reset_counts()
                 readings.append(p.poll())
                 shots.append(p.screen.grabs)
-            runs[flat] = (readings, shots)
+            runs[alone] = (readings, shots)
     same = all(getattr(a, k) == getattr(b, k) for a, b in zip(runs[False][0], runs[True][0]) for k in FIELDS)
-    c.check(f"EXP digits {gh} px: reads just the same from one shot of the window as from a shot of each part", same)
-    c.check(f"   one screenshot a look instead of {max(runs[False][1])} at most ({runs[True][1]})",
+    c.check(f"EXP digits {gh} px: reads just the same from one picture of the window as from a shot of each part", same)
+    c.check(f"   one picture a look instead of {max(runs[False][1])} screenshots at most ({runs[True][1]})",
             max(runs[True][1]) == 1 and sum(runs[True][1]) < sum(runs[False][1]))
 with Pipeline(gh=7, at=(100, 60)) as p:
-    p.platform.flat_screenshot_cost = True
+    p.platform.captures_window_alone = True
     p.show(Scene(gh=7))
     p.poll()
     p.reader.use_region({"left": 40, "top": 30, "width": 300, "height": 100})      # partly outside the window
