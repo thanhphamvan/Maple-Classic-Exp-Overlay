@@ -53,7 +53,7 @@ def run(started, exp_hr, level=31, map_name="The Land of Wild Boar II", job="Ban
     return {"date": started[:10], "started": started, "map": map_name, "map_read": map_name, "class": job,
             "level_start": level, "level_end": level, "party": party, "exp": exp_hr * seconds / 3600,
             "seconds": seconds, "mesos": mesos_hr * seconds / 3600, "mesos_seconds": seconds,
-            "version": "0.9.4-beta", "seal": "x" * 24}
+            "version": "0.9.11-beta", "seal": "x" * 24}
 
 
 def day(n):
@@ -421,7 +421,7 @@ check("...so is an advert", bad(map_read="Join our discord for free mesos now") 
       and bad(map_read="Visit discord.gg slash maple fans") == "not a map name" and bad(map_read="Best prices telegram channel") == "not a map name")
 check("...and a real map with the word 'free' in it is fine", call("/api/runs", {"install": who, "runs": [run(f"{day(15)}T12:00", 50000, map_name="Free Market 3")]})["results"][0].get("why") == "town")
 check("a run gaining 100 levels' worth of mesos an hour is refused",
-      bad(mesos=9e9) == "impossible mesos/hr")
+      bad(mesos=9e9, version="0.9.14-beta") == "impossible mesos/hr")   # (a current version: old ones' mesos are ignored from 2026-10-29)
 check("a Lv 200 run claiming 5% of the table's end a minute is refused", bad(level_start=200, level_end=200, exp=2e9) in
       ("impossible EXP for that level", "impossible EXP for those levels"))
 dozen = install()
@@ -533,9 +533,11 @@ def when(hours_ahead, minute=0):
 
 
 def stored(hours_ahead, minute, who, **kw):
-    """Sends one run (as if `hours_ahead` hours from now) and returns its (mesos_hr, exp_hr) as stored."""
+    """Sends one run (as if `hours_ahead` hours from now) and returns its (mesos_hr, exp_hr) as stored. It comes from
+    an overlay new enough that its mesos count after MESOS_RULE_FROM too, unless `version` says otherwise."""
     started = when(hours_ahead - 1, minute)
-    r = call("/api/runs", {"install": who, "runs": [dict(run(started, 50000), **kw)]}, later=hours_ahead)
+    sent = dict(run(started, 50000), **{"version": f"{MESOS_VERSION}-beta", **kw})
+    r = call("/api/runs", {"install": who, "runs": [sent]}, later=hours_ahead)
     rows = sql(f"SELECT mesos_hr, exp_hr FROM runs WHERE install = '{who}' AND started = '{started}'")
     return (rows[0]["mesos_hr"], rows[0]["exp_hr"]) if r.get("received") == 1 and rows else ("not stored", r)
 
@@ -559,18 +561,40 @@ if RULE_FROM:
     check(f"from then on, an overlay older than {MESOS_VERSION} gives no mesos/hr ({after}), its EXP still counts",
           after is None and exp_hr > 0)
     current, _ = stored(to_rule + 24, 15, old, version=f"{MESOS_VERSION}-beta")
-    newer, _ = stored(to_rule + 24, 30, old, version="1.0.0")
-    unknown, _ = stored(to_rule + 24, 45, old, version="?")
-    check(f"...{MESOS_VERSION} and newer keep theirs ({current}, {newer}), an unknown version doesn't ({unknown})",
+    newer, _ = stored(to_rule + 24, 30, old, version="0.9.14-beta")
+    unknown, _ = stored(to_rule + 24, 45, old, version=None)      # (0.9.0-0.9.2 send no version)
+    check(f"...{MESOS_VERSION} and newer keep theirs ({current}, {newer}), a run with no version doesn't ({unknown})",
           current is not None and newer is not None and unknown is None)
 else:
     print("(skipped: MESOS_RULE_FROM isn't set)")
+
+# ---- only released versions (src/released.js): a changed copy's runs are refused for good, a newer version's wait
+who = install()
+got, r = stored(50, 0, who, version="0.9.14-myfork")
+res = (r.get("results") or [{}])[0] if got == "not stored" else {}
+check(f"a changed copy's run (0.9.14-myfork) is refused for good, not stored ({res})",
+      got == "not stored" and res.get("ok") is False and "retry" not in res)
+got, r = stored(50, 15, who, version="0.9.99-beta")
+res = (r.get("results") or [{}])[0] if got == "not stored" else {}
+check(f"a run from a version newer than any released one waits (retry), not stored ({res})",
+      got == "not stored" and res.get("ok") is False and res.get("retry") is True)
+got, _ = stored(50, 30, who, version=None)
+rows = sql(f"SELECT version FROM runs WHERE install = '{who}'")
+check(f"a run with no version (0.9.0-0.9.2) is taken as before, stored as '?' ({got}, {rows})",
+      got != "not stored" and [x["version"] for x in rows] == ["?"])
+got, _ = stored(50, 45, who, version="0.9.3-beta")
+check(f"a run from an old released version is taken ({got})", got != "not stored")
+mixed = call("/api/runs", {"install": who, "runs": [dict(run(when(51, 0), 50000), version="0.9.14-beta"),
+                                                    dict(run(when(51, 15), 50000), version="0.9.13-beta; DROP")]}, later=52)
+check(f"in one batch the released run is taken and the changed copy's refused ({mixed})",
+      mixed.get("received") == 1 and [x.get("ok") for x in mixed.get("results", [])] == [True, False])
 
 
 def players_at(map_name, level, hours_ahead, job="Fighter", n=3, **kw):
     for _ in range(n):
         call("/api/runs", {"install": install(), "runs": [dict(run(when(hours_ahead - 6, 15 * i), 45000, level=level,
-                                                                  map_name=map_name, job=job), **kw) for i in range(4)]},
+                                                                  map_name=map_name, job=job),
+                                                              **{"version": f"{MESOS_VERSION}-beta", **kw}) for i in range(4)]},
              later=hours_ahead)
 
 

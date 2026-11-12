@@ -3,7 +3,7 @@
     wrangler d1 execute classicexp --local --persist-to .wrangler/test-state --file schema.sql
     wrangler d1 execute classicexp --local --persist-to .wrangler/test-state --file schema_reports.sql
     wrangler pages dev public --ip 127.0.0.1 --port 8791 --persist-to .wrangler/test-state \
-        --binding IP_SALT=local-test --binding REPORTS_TEST={"healthSite":8,"reportSite":7,"purgeEvery":1}
+        --binding IP_SALT=local-test --binding REPORTS_TEST={"healthSite":40,"reportSite":7,"purgeEvery":1}
     python server/test_reports.py http://127.0.0.1:8791
 
 Then a short second run WITHOUT the IP_SALT binding (fresh database again):
@@ -25,7 +25,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 HOST = urlparse(BASE)
 failures = 0
 
-with open(os.path.join(HERE, "..", "tests", "health_contract.json"), encoding="utf-8") as f:
+with open(os.path.join(HERE, "..", "tests", "health_contract_v2.json"), encoding="utf-8") as f:
     CONTRACT = json.load(f)
 # The server's test clock: noon UTC on the contract's "today".
 NOW = int(datetime.fromisoformat(CONTRACT["today"] + "T12:00:00+00:00").timestamp() * 1000)
@@ -83,6 +83,7 @@ def with_change(base, change):
     return body
 
 
+OLD_SHAPES = [c for c in CONTRACT["health_valid"] if not c["name"].startswith(("v2:", "0.9.16:"))]    # 0.9.13's examples, kept in the file
 health_full = CONTRACT["health_valid"][0]["body"]
 report_ok = CONTRACT["report_valid"][0]["body"]
 
@@ -104,16 +105,42 @@ def fresh():
 
 
 # ---- the shared contract: every valid case is taken, every invalid one is named
-for case in CONTRACT["health_valid"]:
-    status, a = post("/api/health", case["body"], ip=fresh())
+for i, case in enumerate(CONTRACT["health_valid"]):
+    # The v2 examples share the first one's id and day, which the server (rightly) answers as a repeat: give each its own id.
+    body = case["body"] if i == 0 else dict(case["body"], id="%016x" % (0xa00 + i))
+    status, a = post("/api/health", body, ip=fresh())
     check(f"health valid: {case['name']}", status == 200 and a == {"ok": True})
 for case in CONTRACT["health_invalid"]:
     before = everything()
     status, a = post("/api/health", with_change(health_full, case["change"]), ip=fresh())
     check(f"health invalid {case['field']}: {list(case['change'])[0]}", status == 400 and a.get("error") == case["field"])
 check("invalid health reports wrote nothing", everything() == before)
+for case in OLD_SHAPES:
+    body = dict(case["body"], id="e" + case["body"]["id"][1:])   # a new id: the shared examples above are already stored
+    status, a = post("/api/health", body, ip=fresh())
+    check(f"0.9.13 shape still accepted: {case['name']}", status == 200 and a == {"ok": True})
+v2_all = next(dict(c["body"], id="%016x" % (0xa00 + i)) for i, c in enumerate(CONTRACT["health_valid"])
+              if c["name"] == "v2: every new key")
+check("a v2 body is stored whole (new keys kept)", json.loads(sql(
+    "SELECT body FROM health_reports WHERE id = '%s'" % v2_all["id"])[0]["body"]) == v2_all)
+# The read-only deploy check (ticket 18): a body with "ui" and a bad id. An old server names "ui"; this one names "id".
+before = everything()
+status, a = post("/api/health", dict(health_full, id="BAD", ui=CONTRACT["health_valid"][3]["body"]["ui"]), ip=fresh())
+check("deploy check: new server names the bad id, not ui", status == 400 and a.get("error") == "id")
+check("...and stores nothing", everything() == before)
+# The same for 0.9.16's "filter" (F13): an old server names "filter", this one "id".
+status, a = post("/api/health", {"filter": {}}, ip=fresh())
+check("deploy check 0.9.16: {\"filter\": {}} names id, not filter", status == 400 and a.get("error") == "id")
+check("...and stores nothing", everything() == before)
+f16 = next(dict(c["body"], id="%016x" % (0xa00 + i)) for i, c in enumerate(CONTRACT["health_valid"])
+           if c["name"].startswith("0.9.16: filter (with"))
+check("a 0.9.16 body is stored whole (filter kept)", json.loads(sql(
+    "SELECT body FROM health_reports WHERE id = '%s'" % f16["id"])[0]["body"]) == f16)
 check("the stored body is the one sent", json.loads(sql(
     "SELECT body FROM health_reports WHERE id = '0123456789abcdef'")[0]["body"]) == health_full)
+for hid, v in (("f222222222222213", "0.9.13-beta"), ("f222222222222200", "0.9.0-beta")):
+    status, a = post("/api/health", dict(health_full, id=hid, version=v), ip=fresh())
+    check(f"health from a released {v}: taken", status == 200 and a == {"ok": True})
 
 # ---- a repeat of the same id and day: dup answer, nothing written
 before = everything()
@@ -132,9 +159,10 @@ check("...a refused request answers {retry: true}", status == 429 and a == {"ret
 check("...and writes nothing", everything() == before)
 check("a refused report isn't stored", n("health_reports", "id = 'b000000000000000'") == 0)
 
-# ---- site cap (8 in this test run): 3 + 3 so far, two more fit, the next doesn't
-check("health: site cap lets the next two in", all(
-    post("/api/health", dict(health_full, id="c%015x" % i), ip=fresh())[0] == 200 for i in range(2)))
+# ---- site cap (40 in this test run): fill what is left, then the next one is refused
+left = 40 - sql("SELECT n FROM limits WHERE key = 'h:site'")[0]["n"]
+check(f"health: site cap lets the last {left} in", all(
+    post("/api/health", dict(health_full, id="c%015x" % i), ip=fresh())[0] == 200 for i in range(left)))
 before = everything()
 status, a = post("/api/health", dict(health_full, id="d" + "0" * 15), ip="10.7.0.1")
 check("health: over the site cap is refused", status == 429)
@@ -161,12 +189,31 @@ check("GET /api/report: 405", post("/api/report", None, method="GET")[0] == 405)
 check("wrong content type: 415", post("/api/health", health_full, ip=fresh(), content_type="text/plain")[0] == 415)
 check("not JSON: 400", post("/api/health", None, raw=b"{nope", ip=fresh())[0] == 400)
 
+# ---- only released versions (src/released.js): a changed copy is refused for good, a newer health report waits
+for v in ("0.9.14-myfork", "0.9.14", "0.8.0-beta", "0.9.13-beta.1"):
+    before = everything()
+    status, a = post("/api/health", dict(health_full, id="f" + "0" * 15, version=v), ip=fresh())
+    check(f"health from {v}: 400 version", status == 400 and a == {"error": "version"})
+    status, a = post("/api/report", dict(report_ok, version=v), ip=fresh())
+    check(f"Send report from {v}: 400 version", status == 400 and a == {"error": "version"})
+    check("...and neither wrote anything", everything() == before)
+for v in ("0.9.99-beta", "0.10.0-beta", "1.0.0"):          # (newer than any release for a long while)
+    before = everything()
+    status, a = post("/api/health", dict(health_full, id="f" + "1" * 15, version=v), ip=fresh())
+    check(f"health from a newer {v}: try later (429 retry), not dropped", status == 429 and a == {"retry": True, "why": "version"})
+    status, a = post("/api/report", dict(report_ok, version=v), ip=fresh())
+    check(f"Send report from a newer {v}: 400 version", status == 400 and a == {"error": "version"})
+    check("...and neither wrote anything, not even a counter", everything() == before)
+
 # ---- player reports
 for case in CONTRACT["report_invalid"]:
     status, a = post("/api/report", with_change(report_ok, case["change"]), ip=fresh())
     check(f"report invalid {case['field']}: {list(case['change'])[0]}", status == 400 and a.get("error") == case["field"])
-check("report valid: normal", post("/api/report", report_ok, ip=fresh()) == (200, {"ok": True}))
-check("report valid: no details", post("/api/report", CONTRACT["report_valid"][1]["body"], ip=fresh()) == (200, {"ok": True}))
+status, a = post("/api/report", report_ok, ip=fresh())
+first_n = sql("SELECT MAX(n) AS n FROM user_reports")[0]["n"]
+check(f"report valid: normal, answered with its number ({a})", status == 200 and a == {"ok": True, "n": first_n})
+status, a = post("/api/report", CONTRACT["report_valid"][1]["body"], ip=fresh())
+check("report valid: no details (the next number)", status == 200 and a == {"ok": True, "n": first_n + 1})
 check("report: the same id's 3rd today is taken", post("/api/report", report_ok, ip=fresh())[0] == 200)
 before = everything()
 check("report: the 4th from that id is refused", post("/api/report", report_ok, ip=fresh())[0] == 429)

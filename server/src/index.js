@@ -16,6 +16,7 @@
 
 import { canonicalMap, isListed } from "./mapnames.js";
 import { handleReports } from "./reports.js";
+import { olderThan, versionKey, versionStatus } from "./released.js";
 
 const MIN_PLAYERS = 3;              // different players needed before a map is ranked
 const MAX_MAPS = 40;                // ranked maps in one answer
@@ -36,7 +37,17 @@ const RUN_SECONDS = [890, 3720];   // a run is 15 minutes (an hour from 0.9.3, s
 const MAX_PER_INSTALL_DAY = 70;     // a day holds 96 runs of 15 minutes and nobody farms 24 hours
 const MAX_MAPS_PER_INSTALL_DAY = 12; // nobody farms a dozen different maps in a day
 const MAX_NEW_INSTALLS_DAY = 300;   // brand-new players in a day: more is a flood, not a crowd (they try again tomorrow)
-const MAX_RUNS_DAY = 6000;          // runs from new players in a day (the free database allows 100,000 writes a day)
+// Runs the site takes in a day, from everyone (a run writes about 11 database rows and the free database allows
+// 100,000 writes a day, shared with the reports). The less an install has proved, the sooner it runs out of room, so
+// a flood of new or just-vetted installs fills its part first and players with a history can still post.
+const RUN_CAPS = { runsFresh: 3000,     // installs new today, or not yet vetted
+                   runsVetted: 4500,    // vetted (VET_HOURS and VET_RUNS)
+                   runsAll: 6000 };     // established: first seen ESTABLISHED_DAYS ago, ESTABLISHED_RUNS runs on that many days
+const ESTABLISHED_DAYS = 3;
+const ESTABLISHED_RUNS = 20;
+// Answers that miss the cache cost the most to work out (thousands of rows read each on a big database; the free plan
+// allows 5 million reads a day). Over its daily number a question gets the last saved answer, however old, or "busy".
+const READ_CAPS = { statsMiss: 800, ladderMiss: 150 };
 const MAX_REVIEW_PER_DAY = 50;      // names for review added in a day
 const VET_HOURS = 24;               // a new player's runs count after this long...
 const VET_RUNS = 4;                 // ...and this many runs (until then they're kept but not shown anywhere)
@@ -138,15 +149,15 @@ export default {
       if (url.pathname === "/api/health" || url.pathname === "/api/report") {
         return await handleReports(request, env, now, url, { connectionCode, connectionPart });
       }
-      if (request.method === "POST" && url.pathname === "/api/runs") return await postRuns(request, env, now);
+      if (request.method === "POST" && url.pathname === "/api/runs") return await postRuns(request, env, now, url);
       if (request.method === "GET" && url.pathname === "/api/stats") return await getStats(url, env, ctx, now);
       if (request.method === "GET" && url.pathname === "/api/ladder") return await getLadder(url, env, ctx, now);
       if (request.method === "GET" && url.pathname === "/api/options") {
-        return await cached(url, env, ctx, "options", KEEP.options, () => getOptions(env, now));
+        return await cached(url, env, ctx, now, "options", KEEP.options, () => getOptions(env, now));
       }
       // (/api/latest is what pages open before 2026-10-19 ask for; it's a static file now, see public/api/latest)
       if (request.method === "GET" && (url.pathname === "/api/recent" || url.pathname === "/api/latest")) {
-        return await cached(url, env, ctx, "latest", KEEP.latest, () => getLatest(env, now));
+        return await cached(url, env, ctx, now, "latest", KEEP.latest, () => getLatest(env, now));
       }
       if (url.pathname.startsWith("/api/")) {
         return json({ error: "not found" }, ["GET", "POST"].includes(request.method) ? 404 : 405);
@@ -214,6 +225,11 @@ export function checkRun(r, now = Date.now()) {
   const trusted = mesos >= 0 && mesosSeconds <= seconds && !oldMesos(r.version, now);
   const mesosHr = trusted && mesosSeconds >= 600 ? mesos / mesosSeconds * 3600 : null;
   if (mesosHr !== null && mesosHr > MAX_MESOS_HR) return { why: "impossible mesos/hr" };
+  // Only released overlays (released.js). Runs from 0.9.0-0.9.2 carry no version and are taken as before. A version
+  // newer than any released one waits ("retry": the site may not be deployed yet); any other is refused for good.
+  const status = r.version == null ? "ok" : versionStatus(r.version);
+  if (status === "later") return { why: "version not known yet", retry: true };
+  if (status === "refused") return { why: "not an official version of the overlay" };
   return {
     run: {
       map: named.name, unlisted: !named.listed, job, started, level_start: levelStart, level_end: levelEnd, party, exp, seconds,
@@ -238,6 +254,16 @@ async function connectionCode(ip, day, salt) {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 32);
 }
 
+/** The daily limits: the real ones, except that a LOCAL test server can lower them through BUDGET_TEST (JSON such as
+ * {"runsAll": 12}). Production never sets it. */
+function budget(env, url) {
+  const base = { ...RUN_CAPS, ...READ_CAPS, edgeSeconds: EDGE_SECONDS };
+  if (env.BUDGET_TEST && (url.hostname === "localhost" || url.hostname === "127.0.0.1")) {
+    try { return { ...base, ...JSON.parse(env.BUDGET_TEST) }; } catch { /* use the real ones */ }
+  }
+  return base;
+}
+
 /** The server's idea of "now": the real time, except that a LOCAL test server takes it from an X-Test-Now header
  * (milliseconds), so the tests can show what a day later looks like. Never honoured on the live site. */
 function clock(request, url) {
@@ -260,7 +286,7 @@ export function connectionPart(ip) {
   return groups.slice(0, 4).map((g) => g.padStart(4, "0")).join(":");
 }
 
-async function postRuns(request, env, now) {
+async function postRuns(request, env, now, url) {
   if (!(request.headers.get("content-type") || "").toLowerCase().startsWith("application/json")) {
     return json({ error: "send JSON" }, 415);
   }
@@ -282,7 +308,8 @@ async function postRuns(request, env, now) {
     const started = typeof raw?.started === "string" ? raw.started.slice(0, 16) : null;
     return { started, ...checkRun(raw, now) };
   });
-  const results = checked.map((c) => (c.run ? null : { started: c.started, ok: false, why: c.why }));
+  const results = checked.map((c) => (c.run ? null
+    : { started: c.started, ok: false, why: c.why, ...(c.retry ? { retry: true } : {}) }));
   if (!checked.some((c) => c.run)) return json({ received: 0, results }, 200, false);
 
   const day = new Date(now).toISOString().slice(0, 10);
@@ -293,6 +320,8 @@ async function postRuns(request, env, now) {
             (SELECT COUNT(DISTINCT install) FROM runs WHERE ip_hash = ?3 AND received_day = ?2) AS installs,
             (SELECT COUNT(*) FROM runs WHERE ip_hash = ?3 AND received_day = ?2 AND install = ?1) AS here,
             (SELECT banned FROM installs WHERE install = ?1) AS banned,
+            (SELECT first_seen FROM installs WHERE install = ?1) AS first_seen,
+            (SELECT runs FROM installs WHERE install = ?1) AS total,
             (SELECT COUNT(*) FROM installs WHERE install = ?1) AS known,
             COALESCE((SELECT runs FROM daily WHERE day = ?2), 0) AS day_runs,
             COALESCE((SELECT new_installs FROM daily WHERE day = ?2), 0) AS day_new`
@@ -301,10 +330,12 @@ async function postRuns(request, env, now) {
     if (c.run) results[i] = { started: c.started, ok: false, why, ...(retry ? { retry: true } : {}) };
   });
   if (counts.banned) { refuse("refused"); return json({ received: 0, results }, 200, false); }
-  // A flood of brand-new installs (made-up players) or of runs can't use up the database's daily writes: over the
-  // limit, new installs wait for tomorrow (known ones carry on).
-  if (!counts.known && (counts.day_new >= MAX_NEW_INSTALLS_DAY || counts.day_runs >= MAX_RUNS_DAY)) {
-    refuse("too many new players today", true);
+  // A flood of made-up players can't use up the database's daily writes: the day's runs have a limit for everyone,
+  // and the less an install has proved the lower the limit it meets (see RUN_CAPS). Refused runs are sent again tomorrow.
+  const caps = budget(env, url);
+  const limit = await runLimit(env, counts, install, now, caps);
+  if (!counts.known && counts.day_new >= MAX_NEW_INSTALLS_DAY || counts.day_runs >= limit) {
+    refuse(counts.known ? "busy today, try again tomorrow" : "too many new players today", true);
     return json({ received: 0, results }, 200, false);
   }
   let mine = counts.mine, fromIp = counts.ip;
@@ -337,6 +368,10 @@ async function postRuns(request, env, now) {
     }
     if (!mapsToday.has(run.map) && mapsToday.size >= MAX_MAPS_PER_INSTALL_DAY) {
       results[i] = { started, ok: false, why: "too many different maps in a day" };
+      continue;
+    }
+    if (counts.day_runs + saved >= limit) {
+      results[i] = { started, ok: false, why: "busy today, try again tomorrow", retry: true };
       continue;
     }
     if (mine >= MAX_PER_INSTALL_DAY || fromIp >= MAX_PER_IP_DAY || crowded) {
@@ -373,6 +408,21 @@ async function postRuns(request, env, now) {
     ]);
   }
   return json({ received: results.filter((r) => r.ok).length, results }, 200, false);
+}
+
+/** How many runs the site takes today from this install's kind. Only looks at the install's history on a busy day
+ * (when the day is already past the lowest limit). */
+async function runLimit(env, counts, install, now, caps) {
+  if (!counts.known || counts.day_runs < caps.runsFresh) return caps.runsFresh;
+  const v = vetting(now);
+  if (counts.total < v.runs || counts.first_seen > v.cutoff || counts.day_runs < caps.runsVetted) {
+    return counts.total >= v.runs && counts.first_seen <= v.cutoff ? caps.runsVetted : caps.runsFresh;
+  }
+  const old = new Date(now - ESTABLISHED_DAYS * 864e5).toISOString();
+  if (counts.total < ESTABLISHED_RUNS || counts.first_seen > old) return caps.runsVetted;
+  const { days } = await env.DB.prepare("SELECT COUNT(DISTINCT received_day) AS days FROM runs WHERE install = ?1")
+    .bind(install).first();
+  return days >= ESTABLISHED_DAYS ? caps.runsAll : caps.runsVetted;
 }
 
 /** A map name that isn't on the game's list (an event map, a new map, or a misread) is kept as
@@ -488,7 +538,7 @@ async function getStats(url, env, ctx, now) {
     return json({ error: "give class (and path), level (1-250) and party (solo or party)" }, 400);
   }
   const withNew = wantsNew(url);
-  return cached(url, env, ctx, `stats3/${name}/${path || ""}/${level}/${party}${withNew ? "/new" : ""}`, KEEP.stats,
+  return cached(url, env, ctx, now, `stats3/${name}/${path || ""}/${level}/${party}${withNew ? "/new" : ""}`, KEEP.stats,
     () => findMaps(env, name, path, jobs, level, party, now, withNew));
 }
 
@@ -531,16 +581,6 @@ export function pctPerHour(r) {
 }
 
 const soloOf = (r) => r.party === 1;
-
-/** [0, 9, 11] for "0.9.11-beta"; [] when it isn't a version. */
-const versionKey = (v) => (typeof v === "string" && v.match(/^\d+(\.\d+)*/)?.[0].split(".").map(Number)) || [];
-
-function olderThan(a, b) {
-  for (let i = 0; i < Math.max(a.length, b.length); i++) {
-    if ((a[i] || 0) !== (b[i] || 0)) return (a[i] || 0) < (b[i] || 0);
-  }
-  return false;
-}
 
 /** A run from an overlay that counted shop and trade mesos, received once that rule is on. */
 const oldMesos = (version, now) => MESOS_RULE_FROM !== "" && now >= Date.parse(MESOS_RULE_FROM)
@@ -640,7 +680,7 @@ async function getLadder(url, env, ctx, now) {
   const party = asked === "solo" || asked === "1" ? "solo" : asked === "party" || /^[2-6]$/.test(asked) ? "party" : null;
   if (!jobs || !party) return json({ error: "give class (and path) and party (solo or party)" }, 400);
   const withNew = wantsNew(url);
-  return cached(url, env, ctx, `ladder/${name}/${path || ""}/${party}${withNew ? "/new" : ""}`, KEEP.ladder, async () => {
+  return cached(url, env, ctx, now, `ladder/${name}/${path || ""}/${party}${withNew ? "/new" : ""}`, KEEP.ladder, async () => {
     const v = vetting(now, withNew), real = vetting(now), n = jobs.length;
     const { results } = await env.DB.prepare(
       `SELECT r.install, r.map, r.seconds, r.exp_hr, r.mesos_hr, r.level_start, r.level_end,
@@ -769,6 +809,24 @@ function json(data, status = 200, anySite = true) {
   return new Response(JSON.stringify(data), { status, headers: jsonHeaders(anySite) });
 }
 
+/** May this question be worked out fresh? Stats and ladder answers have a daily number of cache misses (kept in the
+ * limits table, one row each per day); the others are cheap and always may. Over the number nothing is written. If the
+ * count can't be read or written the answer is worked out anyway (a broken counter must not shut the site). */
+async function missAllowed(env, key, now, caps) {
+  const kind = key.startsWith("stats3/") ? "stats" : key.startsWith("ladder/") ? "ladder" : null;
+  if (!kind) return true;
+  const day = new Date(now).toISOString().slice(0, 10), row = `c:${kind}`;
+  try {
+    const used = (await env.DB.prepare("SELECT n FROM limits WHERE day = ?1 AND key = ?2").bind(day, row).first())?.n || 0;
+    if (used >= caps[`${kind}Miss`]) return false;
+    await env.DB.prepare("INSERT INTO limits (day, key, n) VALUES (?1, ?2, 1) ON CONFLICT (day, key) DO UPDATE SET n = n + 1")
+      .bind(day, row).run();
+  } catch (e) {
+    console.error(e);
+  }
+  return true;
+}
+
 /**
  * An answer kept for a while, so the database isn't asked again for every visitor: first in
  * Cloudflare's cache where the visitor is (a minute at most), then in the database itself,
@@ -777,16 +835,20 @@ function json(data, status = 200, anySite = true) {
  * itself, so extra bits in the address can't skip the cache. (Not when testing locally,
  * unless CACHE_LOCALLY is set.)
  */
-async function cached(url, env, ctx, key, seconds, make) {
+async function cached(url, env, ctx, clockNow, key, seconds, make) {
   if (!env.CACHE_LOCALLY && (url.hostname === "localhost" || url.hostname === "127.0.0.1")) return make();
   const edge = caches.default;
   const id = new Request(`${url.origin}/__cache/${encodeURIComponent(key)}`);
   const hit = await edge.match(id);
   if (hit) return hit;
-  const now = Date.now();
+  const now = clockNow;
+  const caps = budget(env, url);
   const kept = await env.DB.prepare("SELECT body, at FROM answers WHERE key = ?1").bind(key).first();
   let body = kept && now - kept.at < seconds * 1000 ? kept.body : null;
-  if (body === null) {
+  if (body === null && !(await missAllowed(env, key, now, caps))) {
+    if (kept) body = kept.body;                       // over today's number of fresh answers: the last saved one, however old
+    else return json({ error: "busy", busy: true }, 503);
+  } else if (body === null) {
     const fresh = await make();
     if (fresh.status !== 200) return fresh;
     body = await fresh.text();
@@ -794,7 +856,7 @@ async function cached(url, env, ctx, key, seconds, make) {
       .bind(key, body, now).run());
   }
   const response = new Response(body, { headers: {
-    ...jsonHeaders(), "cache-control": `public, max-age=${Math.min(EDGE_SECONDS, seconds)}` } });
+    ...jsonHeaders(), "cache-control": `public, max-age=${Math.min(caps.edgeSeconds, seconds)}` } });
   ctx.waitUntil(edge.put(id, response.clone()));
   return response;
 }

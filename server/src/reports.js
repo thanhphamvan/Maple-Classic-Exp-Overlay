@@ -1,5 +1,5 @@
 // Health reports (POST /api/health) and player reports (POST /api/report). Numbers and text only; nothing here is
-// ever served back. Contract: the shared examples in tests/health_contract.json.
+// ever served back. Contract: the shared examples in tests/health_contract_v2.json.
 //
 // How the limits stay atomic: one env.DB.batch() (a transaction) runs, in order,
 //   1. the INSERT of the report row, with a WHERE that checks every counter is under its cap;
@@ -8,9 +8,13 @@
 // bump after it is skipped too, and a refused request writes nothing. The answer comes from the INSERT's
 // meta.changes: 1 = stored, 0 = over a limit (429).
 
+import { versionStatus } from "./released.js";
+
 const DAY = 86400000;
 const KEEP_REPORTS_DAYS = 90;
 const KEEP_LIMITS_DAYS = 3;
+const KEEP_IP_DAYS = 2;
+const BLANK_PER_PURGE = 5000;
 const CAPS = { healthConn: 3, healthSite: 5000, reportId: 3, reportConn: 3, reportSite: 200, purgeEvery: 100 };
 
 const HEALTH_MAX_BYTES = 4096;
@@ -18,13 +22,21 @@ const REPORT_MAX_BYTES = 16384;
 
 const HEALTH_KEYS = ["id", "version", "day", "os", "screens", "game", "capture", "tesseract", "seconds_tracking",
   "looks", "exp"];
-const HEALTH_OPTIONAL = ["level", "map", "class", "mesos", "potions", "errors", "ms", "shadow"];
+const HEALTH_OPTIONAL = ["level", "map", "class", "mesos", "potions", "errors", "ms", "shadow", "ui", "shadow_mesos",
+  "shadow_party", "shadow_why", "filter"];
 const EXP_KEYS = ["read", "tesseract", "unclear", "not_found", "covered", "no_window", "percent_only"];
 const PAIRS = {            // the optional "tried / read" counters and their exact keys
   level: ["read", "unclear"], map: ["read", "unread"], class: ["read", "unread"],
   mesos: ["read", "unclear"], potions: ["read", "unclear"],
 };
 const SHADOW_KEYS = ["agree", "disagree", "v2_only", "old_only", "neither", "skipped", "errors"];
+// Added for 0.9.14 (all optional, so 0.9.13's reports stay valid). The counts are only range-checked here, and for
+// ui and shadow_why also <= looks; no cross-sums, so a client counting slip can never lose a whole day.
+const UI_KEYS = ["default", "ideal", "keyboard", "controller"];
+const WHY_KEYS = ["not_found", "unclear"];
+// Added for 0.9.16 (optional, so older reports stay valid): looks by the game's "Default Ratio (Filter Applied)" state.
+const FILTER_KEYS = ["on", "off", "unknown", "no_effect"];
+const MS_KEYS = ["look_avg", "look_p95", "v2_avg", "mesos_v2_avg", "party_v2_avg"];
 
 const VERSION = /^\d+\.\d+\.\d+(-[a-z0-9.]+)?$/;
 const HEX_ID = /^[0-9a-f]{16}$/;
@@ -82,11 +94,18 @@ export function badHealthField(b, today) {
   }
   if (Object.hasOwn(b, "ms")) {
     const m = b.ms, ms = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 10000;
-    if (!isObject(m) || Object.keys(m).some((k) => !["look_avg", "look_p95", "v2_avg"].includes(k)) ||
-        !ms(m.look_avg) || !ms(m.look_p95) || (Object.hasOwn(m, "v2_avg") && !ms(m.v2_avg))) return "ms";
+    if (!isObject(m) || Object.keys(m).some((k) => !MS_KEYS.includes(k)) ||
+        !ms(m.look_avg) || !ms(m.look_p95) ||
+        MS_KEYS.slice(2).some((k) => Object.hasOwn(m, k) && !ms(m[k]))) return "ms";
   }
   if (Object.hasOwn(b, "shadow") && (!sameKeys(b.shadow, SHADOW_KEYS) || !SHADOW_KEYS.every((k) => count(b.shadow[k])))) {
     return "shadow";
+  }
+  for (const name of ["shadow_mesos", "shadow_party"]) {
+    if (Object.hasOwn(b, name) && (!sameKeys(b[name], SHADOW_KEYS) || !SHADOW_KEYS.every((k) => count(b[name][k])))) return name;
+  }
+  for (const [name, keys] of [["ui", UI_KEYS], ["shadow_why", WHY_KEYS], ["filter", FILTER_KEYS]]) {
+    if (Object.hasOwn(b, name) && (!sameKeys(b[name], keys) || !keys.every((k) => isInt(b[name][k], 0, b.looks)))) return name;
   }
   return null;
 }
@@ -156,6 +175,12 @@ export async function handleReports(request, env, now, url, tools) {
   const today = new Date(now).toISOString().slice(0, 10);
   const bad = isHealth ? badHealthField(body, today) : badReportField(body);
   if (bad) return reply({ error: bad }, 400);
+  // Only released overlays (released.js). A health report from a version newer than any released one waits (the site
+  // may not be deployed yet: the overlay keeps the day and tries tomorrow); any other unknown version is refused for
+  // good (the overlay drops that day). A Send report is refused either way (the window points to GitHub).
+  const status = versionStatus(body.version);
+  if (status === "later" && isHealth) return reply({ retry: true, why: "version" }, 429);
+  if (status !== "ok") return reply({ error: "version" }, 400);
 
   const limit = caps(env, url);
   const conn = await tools.connectionCode("reports " + tools.connectionPart(request.headers.get("CF-Connecting-IP") || "?"),
@@ -171,7 +196,8 @@ export async function handleReports(request, env, now, url, tools) {
   return answer;
 }
 
-/** Old rows go: reports after 90 days, the daily counters after 3. */
+/** Old rows go: reports after 90 days, the daily counters after 3. The runs' connection codes are blanked after
+ * KEEP_IP_DAYS (the per-connection limits only look at today), a few thousand per purge so one never takes long. */
 function purgeStatements(env, now) {
   const reports = new Date(now - KEEP_REPORTS_DAYS * DAY).toISOString();
   const limits = new Date(now - KEEP_LIMITS_DAYS * DAY).toISOString().slice(0, 10);
@@ -179,6 +205,8 @@ function purgeStatements(env, now) {
     env.DB.prepare("DELETE FROM health_reports WHERE received < ?1").bind(reports),
     env.DB.prepare("DELETE FROM user_reports WHERE received < ?1").bind(reports),
     env.DB.prepare("DELETE FROM limits WHERE day < ?1").bind(limits),
+    env.DB.prepare("UPDATE runs SET ip_hash = '' WHERE id IN (SELECT id FROM runs WHERE ip_hash != '' AND received < ?1 LIMIT ?2)")
+      .bind(new Date(now - KEEP_IP_DAYS * DAY).toISOString(), BLANK_PER_PURGE),
   ];
 }
 
@@ -212,9 +240,13 @@ async function storeReport(env, b, today, conn, stamp, limit) {
      SELECT ?1, ?2, ?3, ?4, ?5, ?6
      WHERE COALESCE((SELECT n FROM limits WHERE day = ?7 AND key = ?8), 0) < ?9
        AND COALESCE((SELECT n FROM limits WHERE day = ?7 AND key = ?10), 0) < ?11
-       AND COALESCE((SELECT n FROM limits WHERE day = ?7 AND key = 'r:site'), 0) < ?12`
+       AND COALESCE((SELECT n FROM limits WHERE day = ?7 AND key = 'r:site'), 0) < ?12
+     RETURNING n`
   ).bind(b.id, stamp, conn, b.version, b.message.trim(), b.details, today, idKey, limit.reportId, connKey,
     limit.reportConn, limit.reportSite);
   const results = await env.DB.batch([insert, bump(env, today, idKey), bump(env, today, connKey), bump(env, today, "r:site")]);
-  return results[0].meta.changes === 1 ? reply({ ok: true }) : reply({ retry: true }, 429);
+  // The report's number goes back to the player ("report #n"), so they can name it on GitHub or Reddit without
+  // showing the health ID (that would tie their name to 90 days of health reports).
+  const n = results[0].results?.[0]?.n;
+  return results[0].meta.changes === 1 ? reply(Number.isInteger(n) ? { ok: true, n } : { ok: true }) : reply({ retry: true }, 429);
 }

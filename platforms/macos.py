@@ -1,8 +1,9 @@
 """macOS: MapleStory runs in a Windows layer (CrossOver, Whisky, Parallels...) or a game
 stream, so its window is found through CoreGraphics by its title or program name. A window
 is known by its window number, and positions are in points: the units mss screenshots and
-tkinter use too. Window titles (and screenshots of other programs) need the Screen Recording
-permission."""
+tkinter use too. The game is pictured from its window alone, so windows on top of it (the
+overlay's included) don't get in the way. Window titles (and screenshots of other programs)
+need the Screen Recording permission."""
 import ctypes
 import fcntl
 import os
@@ -42,12 +43,20 @@ _NumberValue = _api(_cf.CFNumberGetValue, ctypes.c_bool, _vp, ctypes.c_long, _vp
 _StringValue = _api(_cf.CFStringGetCString, ctypes.c_bool, _vp, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32)
 _BoolValue = _api(_cf.CFBooleanGetValue, ctypes.c_bool, _vp)
 _CFRelease = _api(_cf.CFRelease, None, _vp)
+_CreateImage = _api(_cg.CGWindowListCreateImage, _vp, _CGRect, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32)
+_ImageWidth, _ImageHeight, _ImageRowBytes, _ImageBits = (_api(f, ctypes.c_size_t, _vp) for f in (
+    _cg.CGImageGetWidth, _cg.CGImageGetHeight, _cg.CGImageGetBytesPerRow, _cg.CGImageGetBitsPerPixel))
+_ImageInfo = _api(_cg.CGImageGetBitmapInfo, ctypes.c_uint32, _vp)
+_ImageData = _api(_cg.CGImageGetDataProvider, _vp, _vp)
+_CopyData = _api(_cg.CGDataProviderCopyData, _vp, _vp)
+_DataBytes = _api(_cf.CFDataGetBytePtr, _vp, _vp)
+_DataLength = _api(_cf.CFDataGetLength, ctypes.c_long, _vp)
 _KEYS = {k: _vp.in_dll(_cg, "kCGWindow" + k).value
          for k in ("Number", "OwnerPID", "OwnerName", "Name", "Layer", "Bounds", "IsOnscreen")}
 _ON_SCREEN, _ONLY_THIS, _NO_DESKTOP = 1, 8, 16          # kCGWindowListOption...
-_POPUP = 101  # kCGPopUpMenuWindowLevel
-_IGNORE_FRAMING, _NOMINAL = 1, 16
+_IGNORE_FRAMING, _NOMINAL = 1, 16                      # kCGWindowImage...: no shadow, points not Retina pixels
 _TOPMOST = 19                                           # the window layer of Always on top (tkinter's -topmost)
+_POPUP = 101                                            # kCGPopUpMenuWindowLevel
 
 MacWindow = namedtuple("MacWindow", "number pid owner title layer rect onscreen")
 
@@ -104,25 +113,6 @@ def is_game(w, own_pid):
     return w.layer <= _TOPMOST and "maplestory" in w.title.lower().replace(" ", "")
 
 
-_window_image_api = None
-
-
-def _window_capture_api():
-    """Load optional CoreGraphics capture symbols only when window capture is requested."""
-    global _window_image_api
-    if _window_image_api is None:
-        _CreateImage = _api(_cg.CGWindowListCreateImage, _vp, _CGRect, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32)
-        _ImageWidth, _ImageHeight, _ImageRowBytes, _ImageBits = (_api(f, ctypes.c_size_t, _vp) for f in (
-            _cg.CGImageGetWidth, _cg.CGImageGetHeight, _cg.CGImageGetBytesPerRow, _cg.CGImageGetBitsPerPixel))
-        _ImageInfo = _api(_cg.CGImageGetBitmapInfo, ctypes.c_uint32, _vp)
-        _ImageData = _api(_cg.CGImageGetDataProvider, _vp, _vp)
-        _CopyData = _api(_cg.CGDataProviderCopyData, _vp, _vp)
-        _DataBytes = _api(_cf.CFDataGetBytePtr, _vp, _vp)
-        _DataLength = _api(_cf.CFDataGetLength, ctypes.c_long, _vp)
-        _window_image_api = dict(locals())
-    return _window_image_api
-
-
 class _CGPoint(ctypes.Structure):
     _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
 
@@ -167,7 +157,6 @@ class MacHotkeys(Hotkeys):
 
 class MacPlatform(Platform):
     name = "macOS"
-    flat_screenshot_cost = True             # ~8 ms of the window server's CPU a shot, small or big
 
     def version(self):
         return f"macOS {platform.mac_ver()[0]}"
@@ -187,8 +176,9 @@ class MacPlatform(Platform):
                 Path("/opt/homebrew/share/tessdata"), Path("/usr/local/share/tessdata")]
 
     def tessdata_arg(self, exe, folder):
-        # Tesseract's own default is <program>/../share/tessdata: only anything else is passed
-        return "" if folder == exe.parent.parent / "share" / "tessdata" else str(folder)
+        # Always passed: a Tesseract built elsewhere (Homebrew's, or the one inside the downloaded app) looks in the
+        # folder it was compiled for, not beside itself, so inside the app it wouldn't find its data otherwise.
+        return str(folder)
 
     def claim_single_instance(self, key, title, old_titles=()):
         self._lock = open(Path(tempfile.gettempdir()) / f"MapleEXP-{key}.lock", "w")   # macOS unlocks it at exit
@@ -220,7 +210,7 @@ class MacPlatform(Platform):
         for w in window_list():
             if is_game(w, os.getpid()):
                 rect = self.client_rect(w.number)
-                if rect:
+                if rect:                               # not the launcher's 1x1 window
                     found.append((rect[2] * rect[3], w.number))
         return max(found)[1] if found else None
 
@@ -299,25 +289,20 @@ class MacPlatform(Platform):
     captures_window_alone = True
 
     def capture_window(self, number, left, top, width, height):
-        api = _window_capture_api()
-        image = api["_CreateImage"](_CGRect(left, top, width, height), _ONLY_THIS, number, _IGNORE_FRAMING | _NOMINAL)
+        image = _CreateImage(_CGRect(left, top, width, height), _ONLY_THIS, number, _IGNORE_FRAMING | _NOMINAL)
         if not image:
             return None
         data = None
         try:
-            info = api["_ImageInfo"](image)                 # BGRA: 32-bit little-endian, alpha (or nothing) first
-            if ((api["_ImageWidth"](image), api["_ImageHeight"](image), api["_ImageBits"](image)) != (width, height, 32)
+            info = _ImageInfo(image)                 # BGRA: 32-bit little-endian, alpha (or nothing) first
+            if ((_ImageWidth(image), _ImageHeight(image), _ImageBits(image)) != (width, height, 32)
                     or info & 0x7000 != 0x2000 or info & 0x1F not in (2, 4, 6)):
                 return None                          # (cut by the screen's edge, or another pixel layout)
-            data = api["_CopyData"](api["_ImageData"](image))
+            data = _CopyData(_ImageData(image))
             if not data:
                 return None
-            length, address = api["_DataLength"](data), api["_DataBytes"](data)
-            stride = api["_ImageRowBytes"](image)
-            if not address or stride < width * 4 or length < (height - 1) * stride + width * 4:
-                return None
-            rows = (ctypes.c_ubyte * length).from_address(address)
-            return np.ndarray((height, width, 4), np.uint8, rows, strides=(stride, 4, 1)).copy()
+            rows = (ctypes.c_ubyte * _DataLength(data)).from_address(_DataBytes(data))
+            return np.ndarray((height, width, 4), np.uint8, rows, strides=(_ImageRowBytes(image), 4, 1)).copy()
         finally:
             if data:
                 _CFRelease(data)

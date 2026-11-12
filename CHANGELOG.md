@@ -1,10 +1,69 @@
 # Changelog
 
-## Unreleased (fork)
+## 0.9.16-beta
 
-- Detect Nexon's Mac launcher game window above the menu-bar layer and ignore tiny launcher windows.
-- On macOS, try one picture of the game window per look so overlapping windows do not obscure readings. Fall back to the existing screen capture if the API is unavailable, returns an invalid picture, or raises an exception. Selected-area mode still reads the screen.
-- Bug-report game pictures use the same window-capture approach, with overlay masking on screen-capture fallback.
+**No Reset**
+- A new switch, **No Reset**, next to Log this run (also in Settings, and as a hotkey you can set; it has no key by default). It's for farming that moves between maps: changing maps no longer pauses or starts new numbers. A break with no EXP still pauses as usual, and the numbers carry on after it. The status pill says "· No Reset" while it's on.
+- A log line made with it on names every map it covered ("Map A/Map B"). A 15-minute run with No Reset on at any moment counts in your log but stays on your PC: it's never shared with the best-maps site.
+
+**The game's "Default Ratio (Filter Applied)"**
+- The overlay notices by itself, after a few seconds, when this game setting is on, and then reads the EXP number, party size, map name, mesos and potion counts the way the game draws them with it.
+- Checked on recordings of real play with the setting switched on and off at five window sizes, two of them kept aside and never used for tuning: no wrong number caused by the setting.
+- While it isn't known yet whether the setting is on, a party list that can only be seen the filtered way is never read as solo.
+
+**Fewer wrong numbers (with or without the setting)**
+- Map name: a name that isn't on the game's map list is only taken when every try reads it the same. At some sizes (for example a 1920x1200 window) this means the map name is shown as not read more often, instead of misspelled.
+- Mesos: a front digit hidden under the mouse cursor is far less often read as a smaller amount. In a storage window, only your own amount is read (or nothing, when it can't tell which one is yours).
+- The status no longer turns red with "Can't read the EXP bar" right after a level-up, while the bar is under about 0.2% (thanks to cpaez33).
+
+**Mac download (a test)**
+- Each release now also has a Mac download for macOS 14 or newer, for Apple Silicon and for Intel, built by GitHub like the Windows one and checked the same way. It comes from fabriciorby's work; cpaez33 made it find the game opened by Nexon's Mac app, read the game window on its own (windows on top of it don't get in the way), and say when the Screen Recording permission is missing.
+- I don't have a Mac, so I haven't tested it myself. See On macOS in the README, and please tell me if it works.
+
+**Health reports (only if you said yes)**
+- They also count how many looks saw the game's "Default Ratio (Filter Applied)" on, off, not known yet, or at a size where it changes nothing. Still numbers only. See Privacy in the README.
+
+## 0.9.15-beta
+
+**EXP and party size, read the new way**
+- The EXP number is now read with the game's own font (the reader that ran as a test since 0.9.13 and agreed with the old one on almost every look). When it can't read the bar, the older reader still does, with the same checks as before.
+- The party size is now counted by the exact shape of the party list's HP bars and the panel's lines around them. The older count is still used at UI sizes the new one can't read (fullscreen 900-1024 pixels tall with UI Size Default).
+- If the party list is covered or gone for a moment, the last party size is kept for about 15 seconds, and the status line says "Can't see the party list: party size kept at N". If it can't be read at all, no party size is guessed.
+- A 15-minute run is only shared once the overlay has read your party size (before that, "solo" was only a default). Such a run still counts in your log.
+- Both new readers were checked on recordings of real play (0 wrong EXP numbers on 152 pictures in 56 kinds of picture damage; 1 party size off by a first look out of 1,507 pictures, against 11 for the old count).
+
+**Clearer messages and bug reports**
+- If the bottom of the game window is off every screen, the status says so instead of "can't find the EXP bar".
+- The warning that the game window is bigger than your screen no longer shows when it fits on another screen (a portrait screen next to a wide one, for example).
+- Send to the developer shows a report number after sending, with buttons for GitHub issues and Reddit if you'd like a reply.
+- A bug report now says how the potion bar was read: the layout, the UI size, each slot's item and count (or why it wasn't read), the potion cost line and which shipped items have your own price (never the prices).
+
+**For people who change the code**
+- The README explains what to change before sharing a changed copy (its own website address and version). The website takes runs, health reports and bug reports only from released versions of the overlay.
+
+## 0.9.14-beta
+
+**Potions on every bar**
+- Potion counts now work on the controller bar (Standard or Cross-Style) as well as the keyboard bar, with the game's UI Size on Default or Ideal. The overlay recognises the bar by itself, and you can switch while it runs.
+- Counts are read with the game's own font. Skill icons on the bar aren't mistaken for potions, and a count whose last digits are hidden (like "22" for "224" under the mouse cursor) isn't counted as drinking.
+- If the potion cost can't be worked out, it says why instead of showing 0: "Potion bar not seen" (no bar for a minute) or "No price for: ..." (type a price under Settings, Potions, Prices).
+
+**Your level**
+- The orange LV badge (used when the EXP bar shows only a %) is read with the game's own font instead of the text reader.
+
+**Steadier**
+- Your log is never saved over while antivirus or OneDrive holds the file for a moment; changes wait and are saved once it can be read.
+- Settings is never taller than your screen and scrolls when needed (the bottom buttons were out of reach on 1080p). A Size too big for your screen uses the biggest that fits there; your choice is kept for a bigger screen.
+- A monitor plugged in or out while the overlay runs is noticed within a minute.
+- A log or settings file saved by another editor (with a BOM), a hand-edited number no play could reach, a damaged map list, or odd release notes no longer break anything.
+- The log window is never taller than your screen, and long values in Details are cut with "…".
+- A bug report's picture of the whole game (it can show chat and names) is deleted 5 minutes after the report opens, or at the next start.
+
+**Health reports (only if you said yes)**
+- They also count how many looks were at each game UI size (Default or Ideal) and potion bar layout (keyboard or controller), and how often new test readers for mesos and party size agree with the current ones. Still numbers only: never amounts, names or pictures. See Privacy in the README.
+
+**Best-maps website**
+- The top 5 maps show first, with Show more maps under them. Early data (fewer than 3 players) is hidden until you untick Hide early data. A map's details show EXP/hr by party size.
 
 ## 0.9.13-beta
 
@@ -146,12 +205,6 @@
 **Fixed**
 - Mesos: a small change across a digit boundary, like 9,980 to 10,020, is now counted instead of dropped (thanks to TaylorAdamCA).
 - Typing "!" in a note or a map name no longer triggers the Shift+1 hotkey.
-
-**Lighter**
-- **About half the CPU while tracking**, and almost none between kills: the EXP bar and mesos aren't read again while they look exactly as they did. Reads just the same as before.
-- Reading the map name and your class takes about a quarter of the CPU it did (Tesseract reads all its tries in one go, instead of starting once for each).
-- Each step works on one CPU core instead of all of them, which for these small pictures was only extra work.
-- On macOS, one screenshot of the game a look instead of two or three (each costs the same there, at any size).
 
 **Safer**
 - Downloads are now built by GitHub from this code, never on a PC, from exact package files checked against their SHA-256. Each one gets an attestation anyone can check (`gh attestation verify`), and its SHA-256 is on the release page and on the build's page (the same one in all three places). See "Where the download comes from" in the README.

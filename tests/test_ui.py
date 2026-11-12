@@ -180,6 +180,8 @@ root = m.tk.Tk()
 m.save_config({**m.DEFAULTS, "hotkeys_on": False, "check_updates": False, "share_runs": False, "pos": POS})
 app = m.App(root, m.DigitTemplates.load())
 t, meso = app.tracker, app.meso
+real_max_ui_scale = app._max_ui_scale
+app._max_ui_scale = lambda: m.UI_SCALES[-1]              # (these checks draw every Size; the cap for small screens is checked below)
 sizes_ok, widths = True, {}
 for scale in m.UI_SCALES:
     try:
@@ -389,8 +391,9 @@ for top in opened:
             texts.append(str(w0.cget("text")))
         except Exception:
             pass
-check("this version's What's new window opens and speaks of health reports",
-      len(opened) == 1 and any("Health reports" in t for t in texts))
+first_head = next(x[1] for x in m.WHATS_NEW[m.VERSION][0][2] if isinstance(x, tuple) and x[0] == "head")
+check(f"this version's What's new window opens with its first heading ({first_head})",
+      len(opened) == 1 and any(first_head in t for t in texts))
 for top in opened:
     top.destroy()
 
@@ -539,6 +542,12 @@ check("a bug report says why the class wasn't read", "Class not read: this windo
 check("it saves a picture, and the details as a text file", files["picture"].exists() and files["details"].exists())
 check("...with the whole story in the text file", all(w in files["details"].read_text(encoding="utf-8")
                                                       for w in ("== Game window ==", "== What it found ==", "== What happened")))
+game_pic = m.DATA_DIR / "bug-report-game.jpg"
+game_pic.write_bytes(b"x")
+app._forget_report_screen()
+check("the whole-game picture of a bug report (it can show chat and names) is deleted again", not game_pic.exists())
+app._forget_report_screen()
+check("...and deleting it twice (or when it was never made) is fine", not game_pic.exists())
 check("the web address a report is opened with stays short enough",
       len(m.urllib.parse.urlencode({"title": "x", "body": text})) < 7000)
 check("it never contains the Windows user name",
@@ -638,8 +647,9 @@ for dpi in (96, 192):
             while stack:
                 c = stack.pop()
                 stack.extend(c.winfo_children())
+                scrolls = str(c).startswith(str(app._settings_inner))      # (below the window's bottom it scrolls)
                 if c.winfo_ismapped() and (c.winfo_rootx() + c.winfo_width() > sw.winfo_rootx() + sw.winfo_width() + 2
-                                           or c.winfo_rooty() + c.winfo_height() > sw.winfo_rooty() + sw.winfo_height() + 2):
+                                           or not scrolls and c.winfo_rooty() + c.winfo_height() > sw.winfo_rooty() + sw.winfo_height() + 2):
                     fit_bad.append(f"{dpi}dpi {scale}% settings: {c.winfo_class()} sticks out")
         for line in spill(sw):
             fit_bad.append(f"{dpi}dpi {scale}% settings: {line}")
@@ -648,6 +658,63 @@ for dpi in (96, 192):
         app.toggle_log()
 check(f"the log and Settings fit at the smallest and biggest Sizes ({fit_bad[:3]})", not fit_bad)
 app._dpi = 192 if app._dpi not in (96, 120, 144, 192) else app._dpi
+app.cfg["ui_scale"] = 100
+app._apply_ui_scale()
+
+# ---- Settings is never taller than its screen (it scrolls), and Size stops at the biggest that fits (B12-1)
+real_dpi = app._dpi
+app._dpi = 96
+app.cfg["ui_scale"] = 100
+app._apply_ui_scale()
+app.set_compact(False)
+if not app.view.details_open:
+    app.view._toggle_details()
+root.update()
+measured = (root.winfo_reqwidth(), root.winfo_reqheight())
+want = [round(p * 96 / 72) for p in m.MAIN_BIGGEST_PT]
+check(f"the main window's biggest size the Size cap uses matches the real window ({measured} vs {want})",
+      all(abs(a - b) <= 0.1 * b for a, b in zip(measured, want)))
+app.view._toggle_details()
+app._max_ui_scale = real_max_ui_scale
+real_screen = app._screen_box
+cap_bad, settings_bad = [], []
+for screen in ((0, 0, 1920, 1080), (0, 0, 1366, 768), (0, 0, 2560, 1440), (0, 0, 5120, 2880)):
+    app._screen_box = lambda screen=screen: screen
+    for dpi in (96, 120, 144, 192):
+        app._dpi = dpi
+        app.cfg["ui_scale"] = 200
+        app._apply_ui_scale()
+        used, room = app._ui_scale_used, app._screen_room()
+        tall = lambda s: s / 100 * dpi / 72 * m.MAIN_BIGGEST_PT[1]
+        nxt = m.UI_SCALES[m.UI_SCALES.index(used) + 1] if used < m.UI_SCALES[-1] else None
+        if used > m.UI_SCALES[0] and tall(used) > room[1] or nxt and tall(nxt) <= room[1] and nxt / 100 * dpi / 72 * m.MAIN_BIGGEST_PT[0] <= room[0]:
+            cap_bad.append(f"{screen[2]}x{screen[3]} {dpi}dpi: {used}%")
+        if app.cfg["ui_scale"] != 200:
+            cap_bad.append(f"{screen[2]}x{screen[3]} {dpi}dpi: the chosen Size was changed")
+        app.open_settings()
+        sw = app.settings_win
+        sw.update()
+        if sw.winfo_height() > room[1] + 2:
+            settings_bad.append(f"{screen[2]}x{screen[3]} {dpi}dpi {used}%: {sw.winfo_height()} > {room[1]:.0f}")
+        if app._settings_inner.winfo_reqheight() > room[1] + 2 and not app._settings_bar.winfo_ismapped():
+            settings_bad.append(f"{screen[2]}x{screen[3]} {dpi}dpi {used}%: taller than the screen and no scrollbar")
+        sw.destroy()
+        app.settings_win = None
+check(f"Size is used as the biggest that fits the screen (main window full with Details), the chosen one is kept ({cap_bad[:3]})",
+      not cap_bad)
+check(f"Settings is never taller than its screen, and scrolls when it would be ({settings_bad[:3]})", not settings_bad)
+app._screen_box = lambda: (0, 0, 1920, 1080)
+app._dpi = 96
+app.cfg["ui_scale"] = 100
+app._apply_ui_scale()
+app.open_settings()
+app.settings_win.update()
+check("on a 1080p screen at Size 100% Settings scrolls (its bottom buttons can be reached)",
+      app._settings_bar.winfo_ismapped() and app.settings_win.winfo_height() <= app._screen_room()[1] + 2)
+app.settings_win.destroy()
+app.settings_win = None
+app._screen_box = real_screen
+app._dpi = real_dpi
 app.cfg["ui_scale"] = 100
 app._apply_ui_scale()
 
@@ -717,6 +784,53 @@ if app.hotkeys.supported:
     app.settings_win = None
     check("closing Settings leaves hotkeys working", getattr(app.hotkeys, "_paused", True) is False)
 
+# ---- No Reset (0.9.16, N02): the main window's switch, the pill, the hotkey, Settings, the Bar shape, remembered
+app.set_compact(False)
+app.cfg["no_reset"] = False
+app._show_no_reset()
+app.view.no_reset.toggle()                               # (a click)
+root.update()
+check("the No Reset switch turns it on for the numbers and the log, and saves it",
+      app.cfg["no_reset"] is True and app.session.no_reset and app.autolog.no_reset and m.load_config()["no_reset"] is True)
+from types import SimpleNamespace as NS                # (the pill's words, without the game window: a stand-in app)
+pill_for = lambda: m.App._state(NS(reader=NS(mode="window", hwnd=1), rejected=0, level_up_at=None, level=35, cfg=app.cfg,
+                                   tracker=NS(req=1, running=True, elapsed=lambda: 5.0), session=NS(waiting=None)))
+state = pill_for()
+check(f"...the pill says so ({state[1]!r})", state[1].endswith("No Reset"))
+check("...and the status line explains it (runs stay on this PC)", app._status_for("") == m.NO_RESET_ON)
+app._hotkey("no_reset")
+root.update()
+check("the No Reset hotkey turns it off again, switch included", app.cfg["no_reset"] is False and not app.session.no_reset
+      and not app.autolog.no_reset and app.view.no_reset.on is False and pill_for()[1] == "Tracking · Lv 35")
+app.open_settings()
+app.settings_win.update()
+app._no_reset_var.set(True)
+check("the Settings switch turns it on too, the main window's switch follows",
+      app.cfg["no_reset"] is True and app.view.no_reset.on is True)
+app.view.no_reset.toggle()
+check("...and the main window's switch moves the Settings one", app._no_reset_var.get() is False and app.cfg["no_reset"] is False)
+if app.hotkeys.supported:                               # (no hotkeys on a Mac: no Hotkeys section)
+    check("Hotkeys in Settings has a No Reset row, off by default", "no_reset" in app._hotkey_ui["buttons"]
+          and app.cfg["hotkeys"]["no_reset"] == "")
+app.settings_win.destroy()
+app.settings_win = None
+app.set_no_reset(True)
+app.cfg["compact_shape"] = "bar"
+app.set_compact(True)
+app._update_display()
+root.update()
+bar = app.view.strips["bar"]
+check("the Bar shape (no pill) shows a small No Reset word", bar.canvas.itemcget(bar._nr, "text") == "No Reset")
+app.set_no_reset(False)
+app._update_display()
+root.update()
+check("...gone when it's off", bar.canvas.itemcget(bar._nr, "text") == "")
+app.set_compact(False)
+app.set_no_reset(True)
+check("it's remembered after a restart", m.load_config()["no_reset"] is True)
+app.set_no_reset(False)
+app.no_reset_note = app.hotkey_note = None     # (their few-second notes would stand in for the status checks below on a slow machine)
+
 # ---- potion prices in Settings
 app.cfg["potion_prices"] = {}
 app.open_settings()
@@ -769,6 +883,90 @@ check("with potions off there's no net to show", app._net(3600) == ("—", None)
 app.cfg["potions_on"], app.cfg["potion_prices"] = True, {}
 app.session.potions.reset()
 app.meso.per_hour = real_per_hour
+
+# ---- every widget of the main window sits inside it, in every shape, with details open, at every size
+def sticking_out(win):
+    bad, stack = [], list(win.winfo_children())
+    while stack:
+        c = stack.pop()
+        if c.winfo_toplevel() is not win:            # (another window, e.g. a tooltip, has its own box)
+            continue
+        stack.extend(c.winfo_children())
+        if c.winfo_ismapped() and (c.winfo_rootx() + c.winfo_width() > win.winfo_rootx() + win.winfo_width() + 2
+                                   or c.winfo_rooty() + c.winfo_height() > win.winfo_rooty() + win.winfo_height() + 2):
+            bad.append(c.winfo_class())
+    return bad
+box_bad = []
+app.cfg["potions_on"] = True
+app.session.potions.used = {"Mana Elixir": 1234567, "Power Elixir": 7, "Cider": 3}
+for scale in m.UI_SCALES:
+    app.cfg["ui_scale"] = scale
+    app._apply_ui_scale()
+    for shape in m.SHAPES:
+        app.set_shape(shape)
+        for compact in (False, True):
+            app.set_compact(compact)
+            if not compact and not app.view.details_open:
+                app.view._toggle_details()
+            app._update_display()
+            root.update()
+            if root.winfo_reqheight() > root.winfo_screenheight():      # (taller than the screen itself: 200% full with details, flagged B13-2)
+                continue
+            box_bad += [f"{scale}% {shape} {'compact' if compact else 'full'}: {c}" for c in sticking_out(root)]
+app.set_shape(m.SHAPES[0])
+app.set_compact(False)
+if app.view.details_open:
+    app.view._toggle_details()
+app.cfg["ui_scale"] = 100
+app._apply_ui_scale()
+check(f"nothing sticks out of the main window at any size, shape or mode ({box_bad[:3]})", not box_bad)
+shown = app.view.details.itemcget(app.view.details._vals["Potion cost"], "text")
+check("a long potion hint is cut with an ellipsis instead of running into its label", shown.endswith("…") or len(shown) < 20)
+app.session.potions.reset()
+app.cfg["potions_on"] = False
+
+# ---- a log size saved on a bigger screen doesn't outgrow this one
+app.cfg["log_size"] = [root.winfo_screenwidth() + 3000, root.winfo_screenheight() + 3000]
+app.toggle_log()
+root.update()
+check("the log opens no bigger than the screen", root.winfo_width() <= root.winfo_screenwidth() and root.winfo_height() <= root.winfo_screenheight())
+app.toggle_log()
+app.cfg["log_size"] = None
+
+# ---- the potion cost line never says a bare 0 when it can't be trusted (issue #17)
+real_running, real_bar = app.tracker.running, app.potion_bar
+app.cfg["potions_on"], app.cfg["potion_prices"] = True, {}
+app.tracker.running = True
+app.potion_bar = m.potion_bar.PotionLook(True, "keyboard", "default", 1.0, ())
+app._potion_unseen = None
+check("potions off: a dash", (app.cfg.update(potions_on=False), app._potion_cost_text(0.0))[1] == "—")
+app.cfg["potions_on"] = True
+check("bar in sight, nothing used: plain 0", app._potion_cost_text(0.0) == "0")
+app.session.potions.used = {"Red Potion": 20}
+check("bar in sight, priced items: just the cost", app._potion_cost_text(1.0) == "1,000")
+app.session.potions.used = {"Mana Elixir": 3}
+check("an item used with no price says so instead of 0", app._potion_cost_text(1.0) == "No price for: Mana Elixir")
+app.session.potions.used = {"Red Potion": 20, "Mana Elixir": 3}
+check("...and keeps the cost next to the hint", app._potion_cost_text(1.0) == "1,000  ·  No price for: Mana Elixir")
+app.session.potions.used = {"Mana Elixir": 1, "Power Elixir": 1, "Cider": 1}
+check("...three or more are counted", app._potion_cost_text(1.0) == "No price for: Mana Elixir, Power Elixir +1")
+app.cfg["potion_prices"] = {"Mana Elixir": 700, "Power Elixir": 900, "Cider": 5}
+check("a price the player set removes the hint", app._potion_cost_text(1.0) == "1,605")
+app.cfg["potion_prices"] = {}
+app.session.potions.used = {}
+app.potion_bar = m.potion_bar.NOT_SEEN
+app._potion_unseen = None
+check("bar just out of sight: still plain 0", app._potion_cost_text(100.0) == "0")
+check("bar unseen for a while: says so", app._potion_cost_text(100.0 + m.POTION_UNSEEN_AFTER) == "Potion bar not seen")
+app.session.potions.used = {"Red Potion": 2}
+check("...with the cost so far beside it", app._potion_cost_text(200.0) == "100  ·  Potion bar not seen")
+app.potion_bar = m.potion_bar.PotionLook(True, "keyboard", "default", 1.0, ())
+check("the bar back in sight clears it", app._potion_cost_text(201.0) == "100" and app._potion_unseen is None)
+app.potion_bar = m.potion_bar.NOT_SEEN
+app.tracker.running = False
+check("paused: no hint about a bar nobody is watching", app._potion_cost_text(500.0) == "100")
+app.session.potions.reset()
+app.tracker.running, app.potion_bar, app._potion_unseen = real_running, real_bar, None
 
 # ---- towns aren't logged; a minimap that can't be seen pauses
 blank = m.Reading(*([None] * len(m.Reading._fields)))
@@ -959,18 +1157,23 @@ for _ in range(12):
     app._handle(pct_at(50.0, 150))
 check(f"A13-2: a level over the table is said as it is, not as trouble reading ({app.status.get()!r})",
       app.rejected == 0 and "150" in app.status.get() and "trouble" not in app.status.get())
+app.reset()
+just_up = blank._replace(where="Reading", candidates=[(144, 0.04)], confident=True, text="144 [0.04%]")
+for _ in range(12):                                     # just levelled up: too little % to learn the level's EXP from
+    app._handle(just_up)
+check(f"a bar read clearly right after a level-up is calibrating, not a misread ({app.rejected}, {app._state()})",
+      app.rejected == 0 and "trouble" not in app.status.get() and app._state()[0] != "alert")
 
 # ---- A13-4: a badge covered by a window counts as a failure, so the fallback is offered and the status says why
 app.reset()
 app.reader.level, app.reader.level_failures, app.reader.next_level_read = None, 0, 0.0
 app.reader.exp_anchor, app.reader.gh = (100, 100), 11
-real_tess, real_tess_ok, real_blocked = m.TESS, m.tesseract_ok, app.reader._blocked
-m.TESS, m.tesseract_ok = object(), True
+real_blocked = app.reader._blocked
 app.reader._blocked = lambda *a: True
 for _ in range(m.LEVEL_FAILS_FOR_FALLBACK):
     app.reader.next_level_read = 0.0
     app.reader._read_level(None, (0, 0, 1000, 800))
-m.TESS, m.tesseract_ok, app.reader._blocked = real_tess, real_tess_ok, real_blocked
+app.reader._blocked = real_blocked
 app._handle(pct._replace(level=None))
 check(f"A13-4: a covered badge ends in the Level fallback, and the status says the window is in the way "
       f"({app.reader.level_failures}, {app.status.get()!r})",
@@ -1178,6 +1381,36 @@ try:
             check("a 4th report on the day is refused locally, in plain words",
                   len(posted) == 2 and "sent 3 reports today" in d2.status.cget("text"))
         d2.destroy()
+
+    # B03: the number the site gave is shown with the two ways to reach the developer; without it, no number
+    for number, expect in ((17, True), (None, False)):
+        app.cfg["reports_sent"] = {"day": "2000-01-01", "n": 0}
+        before = set(app.root.winfo_children())
+        app.send_report()
+        root.update()
+        d5 = new_windows(before)[0]
+        done = m.ReportOutcome("ok")
+        done.n = number
+        app._report_done(d5, done)
+        root.update()
+        text = d5.status.cget("text")
+        check(f"a sent report {'#17 shows its number and Want a reply?' if expect else 'without a number shows none'}",
+              ("report #17" in text and "Want a reply" in text) == expect and "Sent, thank you" in text)
+        check(f"...{'with a GitHub issues and a Reddit button' if expect else 'and no extra buttons'}",
+              (button(d5, "GitHub issues") != [] and button(d5, "Reddit") != []) == expect)
+        if expect:
+            opened = []
+            real_open = m.webbrowser.open
+            m.webbrowser.open = lambda url, *a, **k: opened.append(url)
+            try:
+                check("...nothing opens until a click", not opened)
+                button(d5, "Reddit")[0].command()
+                button(d5, "GitHub issues")[0].command()
+            finally:
+                m.webbrowser.open = real_open
+            check("...Reddit opens the owner's page, GitHub issues the repo's", opened == [m.REPORT_REDDIT, f"https://github.com/{m.GITHUB_REPO}/issues"])
+        d5.destroy()
+    app.cfg.pop("reports_sent", None)
 
     for outcome, words in (("later", "connected to the internet"), ("message", "leave out links"), ("limit", "sent 3 reports")):
         app.cfg["reports_sent"] = {"day": "2000-01-01", "n": 0}

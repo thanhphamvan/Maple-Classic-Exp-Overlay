@@ -30,7 +30,7 @@ def new_log():
 
 
 def farm(log, t0, seconds, party=1, map_name="Rocky Road II", level=27, every=3, gap_at=None, gap=0, job=None, hidden=False,
-         mesos_at=None, window_at=None, misreads=(), estimated=False):
+         mesos_at=None, window_at=None, misreads=(), estimated=False, party_read=True):
     """100 EXP every `every` seconds (optionally with a pause); returns (end time, logs written).
     mesos_at(t) gives the last inventory look at time t, as the MesoTracker hands it on;
     window_at(t) when a shop, storage or trade window was last seen (or None)."""
@@ -44,7 +44,7 @@ def farm(log, t0, seconds, party=1, map_name="Rocky Road II", level=27, every=3,
         look = mesos_at(t) if mesos_at else None
         seen = window_at(t) if window_at else None
         entry = log.tick(t, map_name, level, party, look, job, hidden=hidden, window_at=seen, misreads=misreads,
-                         estimated=estimated)
+                         estimated=estimated, party_read=party_read)
         log.settle(t, True, look, misreads=misreads)
         if entry:
             logged.append(round(t - t0))
@@ -209,8 +209,8 @@ log.reset_clock()                                                # Pause (the ap
 farm(log, t, 600)
 check("a pause restarts the run", len(log.runs) == 0)
 # ---- hotkeys
-check("hotkeys: Shift+1 to 4 by default", m.DEFAULT_HOTKEYS == {"start": "Shift+1", "reset": "Shift+2",
-                                                               "skip": "Shift+3", "compact": "Shift+4"})
+check("hotkeys: Shift+1 to 4 by default, No Reset without a key", m.DEFAULT_HOTKEYS == {
+    "start": "Shift+1", "reset": "Shift+2", "skip": "Shift+3", "compact": "Shift+4", "no_reset": ""})
 check("a hotkey needs Ctrl, Alt or Shift (or an F key), so it can't block plain typing",
       m.parse_hotkey("Shift+1") == (4, 0x31) and m.parse_hotkey("F5") == (0, 0x74)
       and m.parse_hotkey("A") is None and m.parse_hotkey("Win+1") is None and m.parse_hotkey("Shift+!") is None)
@@ -220,7 +220,7 @@ m.CONFIG_PATH.write_text(json.dumps({"hotkeys": {"start": "Ctrl+Q", "reset": "",
                                      "ui_scale": 3, "compact": "yes"}))
 cfg = m.load_config()
 check(f"hotkeys from the settings file: kept if valid or off, else the default ({cfg['hotkeys']})",
-      cfg["hotkeys"] == {"start": "Ctrl+Q", "reset": "", "skip": "Shift+3", "compact": "Shift+4"})
+      cfg["hotkeys"] == {"start": "Ctrl+Q", "reset": "", "skip": "Shift+3", "compact": "Shift+4", "no_reset": ""})
 check("a size or compact setting edited by hand can't break the window", cfg["ui_scale"] == 100 and cfg["compact"] is False)
 m.CONFIG_PATH.write_text(json.dumps({"compact_shape": "triangle", "seen_version": 5}))
 cfg = m.load_config()
@@ -286,9 +286,69 @@ if sys.platform == "darwin":
           and not macos.is_game(W(3, 12, "Google Chrome", "MapleStory Classic guide", 0, (0, 0, 800, 600), True), 99)
           and not macos.is_game(W(4, 99, "Python", "MapleStory", 0, (0, 0, 800, 600), True), 99)
           and not macos.is_game(W(5, 13, "wine64-preloader", "MapleStory", 25, (0, 0, 800, 600), True), 99))
+    check("Nexon's own Mac app is found above the menu bar's layer, but not as high as pop-up menus",
+          macos.is_game(W(6, 14, "MapleStory Classic World", "", 26, (0, 38, 1366, 796), True), 99)
+          and not macos.is_game(W(7, 14, "MapleStory Classic World", "", 101, (0, 0, 200, 100), True), 99))
     check("macOS windows can be listed", isinstance(macos.window_list(), list))
+    check("a macOS window that isn't there can't be pictured", m.PLATFORM.capture_window(2 ** 31 - 1, 0, 0, 200, 100) is None)
 check("release notes are shown as plain text, keeping names like exp_log.txt",
       m._plain_text("**New**\n- **Time** in `exp_log.txt`, see [README](https://x)") == "New\n• Time in exp_log.txt, see README")
+# B06-1: hostile release notes / version names (a broken or tampered GitHub answer) can't freeze or stretch the overlay
+import time as _t
+slow = 0.0
+for hostile in ("[" * 50000, "\n" * 50000, "\r\n" * 25000, "[a](" * 12500):
+    t0 = _t.perf_counter()
+    m._plain_text(hostile)
+    slow = max(slow, _t.perf_counter() - t0)
+check("release notes made of one character repeated 50,000 times are cleaned in well under a second", slow < 1.0)
+check("...and a huge answer is cut before it is cleaned", len(m._plain_text("a" * 10_000_000)) <= 5000)
+# M05: the release body with three files (Windows zip + two .dmg) and the "Check this download" list, as build.yml's release job writes it
+_h = ["a1" * 32, "b2" * 32, "c3" * 32]
+_f = ["Maple-Classic-Exp-Overlay-v0.9.16-beta.zip", "Maple-Classic-Exp-Overlay-v0.9.16-beta-macOS-AppleSilicon.dmg",
+      "Maple-Classic-Exp-Overlay-v0.9.16-beta-macOS-Intel.dmg"]
+_body = ("**What's new**\r\n- **No Reset** keeps your numbers across maps, see [README](https://x/README.md)\r\n"
+         + "- more lines of notes\r\n" * 40
+         + "\r\n**A test download for Mac, not a release.** Not tested by me on a real Mac.\r\n\r\n---\r\n**Check this download**\r\n"
+         + "".join(f"- SHA-256 of {n}: `{h}` (also in SHA256SUMS.txt)\r\n" for n, h in zip(_f, _h))
+         + "- On Windows, in PowerShell: `Get-FileHash .\\<the file>`. On a Mac, in Terminal: `shasum -a 256 <the file>`\r\n"
+         "- Built by GitHub from this tag. Check a file: `gh attestation verify <the file> --repo beanguri/Maple-Classic-Exp-Overlay`\r\n"
+         "- The same files are on [the build's page](https://github.com/beanguri/Maple-Classic-Exp-Overlay/actions/runs/1), where GitHub shows the same SHA-256 for each.")
+_plain = m._plain_text(_body)
+_lines = _plain.split("\n")
+check("a release body with three files shows every file name and its full hash, one per line",
+      all(f"• SHA-256 of {n}: {h} (also in SHA256SUMS.txt)" in _lines for n, h in zip(_f, _h)))
+check("...with no markdown marks (**, backticks, link addresses) left in it",
+      "**" not in _plain and "`" not in _plain and "](" not in _plain and "https://x" not in _plain)
+check("...the commands in it still read right", "Get-FileHash .\\<the file>" in _plain and "shasum -a 256 <the file>" in _plain
+      and "gh attestation verify <the file> --repo beanguri/Maple-Classic-Exp-Overlay" in _plain)
+check("...a Mac test build's note stays in", "A test download for Mac, not a release. Not tested by me on a real Mac." in _lines)
+check("...and the whole check list fits under the 5000-character cut", len(_plain) < 5000 and _lines[-1].startswith("• The same files are on the build's page"))
+
+
+def _update_answer(tag, body="notes"):
+    class Answer:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self, n=-1): return json.dumps({"tag_name": tag, "body": body}).encode()
+    return lambda *a, **k: Answer()
+
+
+real_urlopen, real_blocked = m.urllib.request.urlopen, m.sharing_blocked
+m.sharing_blocked = lambda: False
+answers = {}
+try:
+    for tag in ("v0.9.99", "v1.0.0-" + "a" * 200000, "v" + "9" * 30 + ".1.1", "v1.0.0-٣٤", "v1.2.3.4", "v1.0.0-beta.2"):
+        m.urllib.request.urlopen = _update_answer(tag)
+        try:
+            answers[tag[:12]] = m.check_for_update()
+        except ValueError:
+            answers[tag[:12]] = "refused"
+finally:
+    m.urllib.request.urlopen, m.sharing_blocked = real_urlopen, real_blocked
+check("an update answer with a normal version is taken", answers["v0.9.99"] and answers["v0.9.99"][0] == "0.9.99")
+check("...a version name of 200,000 characters, a 30-digit number, non-ASCII digits or four parts is refused (it would stretch the window)",
+      all(answers[k] == "refused" for k in ("v1.0.0-aaaaa", "v99999999999", "v1.0.0-٣٤", "v1.2.3.4")))
+check("...a real pre-release name is still taken", answers["v1.0.0-beta."] and answers["v1.0.0-beta."][0] == "1.0.0-beta.2")
 check("how long each line was measured over", [m.fmt_logged(s) for s in (300.4, 1500, 3900)] == ["5 min", "25 min", "1 h 05 min"]
       and [m.fmt_logged(s, short=True) for s in (300.4, 1500, 3900)] == ["5m", "25m", "1h 05m"])
 
@@ -318,7 +378,7 @@ for old in sorted((Path(__file__).parent / "upgrade").iterdir()):
     check(f"updating from {old.name}: every log line, run, rename and setting is kept",
           len(log.entries) == len(before["entries"]) and all(same) and not any(log.edited(e) for e in log.entries)
           and len(log.runs) == len(before.get("runs", []))
-          and all(log.sealed(r, m._SEALED_RUN) or r.get("estimated") for r in log.runs)      # (an estimated run's seal is meant not to verify)
+          and all(log.sealed(r, m._SEALED_RUN) or r.get("estimated") or r.get("party_unread") or r.get("no_reset") for r in log.runs)   # (their seals are meant not to verify)
           and log.aliases == before["aliases"] and not list(folder.glob("exp_log.damaged-*"))
           and (cfg["pos"], cfg["transparency"], cfg["gap_seconds"], cfg["topmost"]) == ([5300, 800], 30, 20, False))
     # the health question is still to come (nothing answers it for them), and an answer, once saved, is kept
@@ -480,7 +540,7 @@ check("runs never carry a note, even with notes on the log lines",
       all("note" not in r for r in log.runs) and "MY-PRIVATE-NOTE" not in json.dumps(log.runs))
 src = inspect.getsource(m)
 check("privacy guard: the overlay reaches the internet in exactly these places (a new one needs a look at what it sends)",
-      src.count("urlopen(") == 4 and src.count("webbrowser.open(") == 3 and "requests." not in src and "socket." not in src)
+      src.count("urlopen(") == 4 and src.count("webbrowser.open(") == 4 and "requests." not in src and "socket." not in src)
 check("Send report never reads the log, notes or the map",
       not any(w in inspect.getsource(x) for x in (m.post_report, m.App.send_report, m.App._submit_report, m.App._report_details)
               for w in ("entries", "autolog", "note_of", "notes_of", '"note"', "map_name")))
@@ -509,6 +569,28 @@ except RuntimeError:
     blocked = True
 m.urllib.request.urlopen = real_urlopen
 check("while testing (MAPLE_EXP_DATA is set) nothing can be sent to the real site", blocked and not sent)
+# B06-2: every sender (runs, health, Send report, update check) refuses while testing, and the runs body is exactly the agreed fields
+sent.clear()
+m.urllib.request.urlopen = capture
+refused = []
+for sender, args in ((m.post_runs, ("0" * 16, log.runs)), (m.post_health, ({},)), (m.post_report, ({"message": "x"},)), (m.check_for_update, ())):
+    try:
+        sender(*args)
+        refused.append(False)
+    except RuntimeError:
+        refused.append(True)
+m.urllib.request.urlopen = real_urlopen
+check("while testing, the run sender, health sender, Send report and update check all refuse and send nothing", all(refused) and not sent)
+sent.clear()
+os.environ["MAPLE_EXP_ALLOW_SHARE"] = "1"
+m.urllib.request.urlopen = capture
+m.post_runs("0" * 16, [dict(r, potions={"Red Potion": 9}, potion_cost=5, note="n", window=True) for r in log.runs])
+m.urllib.request.urlopen = real_urlopen
+os.environ.pop("MAPLE_EXP_ALLOW_SHARE")
+body = json.loads(sent[0][1].decode()) if sent else {}
+check("a shared run carries exactly the agreed fields, and the body only the install ID and the runs",
+      set(body) == {"install", "runs"} and set(body["runs"][0]) == {"date", "started", "map_read", "class", "level_start", "level_end", "party",
+                                                                   "exp", "seconds", "mesos", "mesos_seconds", "version", "seal"})
 check("no test fixture has sharing switched on (a launch on one would send its made-up runs)",
       not any(json.loads(f.read_text(encoding="utf-8")).get("share_runs") for f in (Path(__file__).parent / "upgrade").glob("*/config.json")))
 
@@ -566,6 +648,21 @@ check("damaged settings fall back to the defaults",
       and "log_size" not in cfg and cfg["mode"] == "window")
 m.CONFIG_PATH.write_text("[1, 2", encoding="utf-8")
 check("an unreadable settings file gives the defaults", m.load_config()["topmost"] is True)
+# files that ship with the overlay can be damaged too (a bad copy, an antivirus): never a reason to stop reading
+folder = Path(tempfile.mkdtemp())
+(folder / "maps.txt").write_bytes(b"Henesys\t1\n\xc6\xff\xfe broken\n")
+check("a map list with bytes that aren't text is used as empty, not a crash", m.MapList(folder / "maps.txt").entries == [])
+import numpy as np  # noqa: E402
+for label, arrays in (("the wrong shape", {f"d{d}": np.zeros((3, 5), np.float32) for d in range(10)}),
+                      ("no examples", {f"d{d}": np.zeros((0, m.PH * m.PW), np.float32) for d in range(10)})):
+    np.savez(folder / "learned.npz", canon=np.array(m.CANON), **arrays)
+    md = m.MesosDigits(path=folder / "learned.npz")
+    try:
+        md.templates().scores(np.random.rand(40, 40).astype(np.float32))
+        works = md.complete
+    except Exception:
+        works = False
+    check(f"learned mesos digits with {label} are ignored: the shipped ones are used", works)
 
 # ---- mesos
 t = m.MesoTracker()
@@ -1305,6 +1402,45 @@ s.map_seen("Rocky Road II")
 gains(s, 6.5)
 check("back on the same map, it carries on adding up", s.exp.running and s.exp.gained == gained + 100)
 
+# ---- No Reset (0.9.16, N02): farming across maps keeps one set of numbers
+A, B = "Rocky Road II", "The Swamp of Despair I"
+s = session()
+s.no_reset = True
+s.start(clock[0])
+gains(s, 30)
+looks_at = lambda v: [s.meso.observe(v, clock[0], s.exp.elapsed(), s.exp.running) for _ in range(3)]
+looks_at(150000)
+gained = s.exp.gained
+s.map_seen(B)
+check("No Reset: another map doesn't pause", s.waiting is None and s.exp.running and s.map == B)
+gains(s, 9.5)
+check(f"...and the numbers carry on there ({s.exp.gained})", s.exp.gained == gained + 300 and not s.meso.stale
+      and s.meso.value == 150000)
+s.map_seen(A)
+gains(s, 6.5)
+check("...and back again", s.waiting is None and s.exp.gained == gained + 500 and s.map == A)
+idle(s, 20)
+check("No Reset still pauses when idle", s.waiting == "idle" and not s.exp.running)
+gained = s.exp.gained
+s.map_seen(B)
+check("...a map change while idle makes the mesos count stale (a shop trip may follow), still no new numbers",
+      s.meso.stale and s.exp.gained == gained)
+gains(s, 6.5)
+check(f"...EXP on the other map carries on from the same numbers ({s.exp.gained})",
+      s.waiting is None and s.exp.running and s.exp.gained == gained + 100)
+s.map_blind()
+check("No Reset: a hidden map name doesn't pause", s.waiting is None and s.exp.running)
+s = session()
+s.start(clock[0])
+gains(s, 10)
+gained = s.exp.gained
+s.map_seen(B)
+check("without No Reset, another map pauses (as before)", s.waiting == "map")
+s.no_reset = True                                    # switched on while paused off the map
+gains(s, 6.5)
+check(f"...switched on then, the next EXP carries on without new numbers ({s.exp.gained})",
+      s.exp.running and s.exp.gained == gained + 100 and s.map == B)
+
 # a shop room has its own map name: going in pauses, coming back carries on, and the mesos stay put
 s = session()
 s.start(clock[0])
@@ -1416,91 +1552,326 @@ for read, want in {"Tree Dungeon Forest Up North Vil": "Tree Dungeon Forest Up N
 
 # ---- potion use: a slot's count going down while tracking runs
 import potions  # noqa: E402
+import potion_bar  # noqa: E402
 
 
 def bar(*items):
     """What the potion bar shows: (name, count) in slot order, four to a row."""
-    return [potions.Slot(i % 4, i // 4, name, count) for i, (name, count) in enumerate(items)]
+    return slots_at({i: item for i, item in enumerate(items)})
+
+
+def slots_at(items):
+    """A look at the keyboard bar with these {slot index: (name, count)}; no items is a bar that isn't there."""
+    return potion_bar.PotionLook(bool(items), "keyboard", "default", 1.4, tuple(
+        potion_bar.SlotRead(i, None, "keyboard", name, "consumable", count) for i, (name, count) in sorted(items.items())))
+
+
+def seen(s, slots, after=3):
+    """A look at the potion bar `after` seconds after the last one (the overlay looks every 3 s)."""
+    clock[0] += after
+    s.look_at_bar(slots, clock[0])
 
 
 s = session()
 s.start(clock[0])
 gains(s, 30)
-s.look_at_bar(bar(("Lemon", 326)))
-s.look_at_bar(bar(("Lemon", 325)))
+seen(s, bar(("Lemon", 326)))
+seen(s, bar(("Lemon", 325)))
 check(f"Lemon 326 to 325 is exactly one Lemon used ({s.potions.used})", s.potions.used == {"Lemon": 1})
 
 s = session()
 s.start(clock[0])
 gains(s, 30)
 for n in (40, 39, 90, 89):
-    s.look_at_bar(bar(("Red Potion", n)))
+    seen(s, bar(("Red Potion", n)))
 check(f"a count going up (buying, looting) isn't a use, and the slot starts from the new count ({s.potions.used})",
       s.potions.used == {"Red Potion": 2})
 
 s = session()
 s.start(clock[0])
 gains(s, 30)
-s.look_at_bar(bar(("Orange", 20), ("Blue Potion", 100), ("Red Potion", 50)))
-s.look_at_bar(bar(("Orange", 19), ("Blue Potion", 97), ("Red Potion", 50)))
+seen(s, bar(("Orange", 20), ("Blue Potion", 100), ("Red Potion", 50)))
+seen(s, bar(("Orange", 19), ("Blue Potion", 97), ("Red Potion", 50)))
 check(f"several slots changing between two looks are each counted ({s.potions.used})",
       s.potions.used == {"Orange": 1, "Blue Potion": 3})
 
 s = session()
 s.start(clock[0])
 gains(s, 30)
-s.look_at_bar(bar(("Red Potion", 100)))
+seen(s, bar(("Red Potion", 100)))
 s.pause()
-s.look_at_bar(bar(("Red Potion", 90)))
+seen(s, bar(("Red Potion", 90)))
 s.start(clock[0])
 gains(s, 3.5)
-s.look_at_bar(bar(("Red Potion", 90)))
+seen(s, bar(("Red Potion", 90)))
 check(f"potions used while paused aren't counted ({s.potions.used})", not s.potions.used)
-s.look_at_bar(bar(("Red Potion", 89)))
+seen(s, bar(("Red Potion", 89)))
 check(f"...and counting carries on from the count when tracking resumed ({s.potions.used})", s.potions.used == {"Red Potion": 1})
 
 s = session()
 s.start(clock[0])
 gains(s, 30)
-s.look_at_bar(bar(("Red Potion", 100)))
+seen(s, bar(("Red Potion", 100)))
 s.map_seen("Henesys")                               # a town trip: tracking waits
-s.look_at_bar(bar(("Red Potion", 300)))             # (bought a lot)
+seen(s, bar(("Red Potion", 300)))             # (bought a lot)
 s.map_seen("Rocky Road II")
 gains(s, 6.5)
-s.look_at_bar(bar(("Red Potion", 300)))
-s.look_at_bar(bar(("Red Potion", 298)))
+seen(s, bar(("Red Potion", 300)))
+seen(s, bar(("Red Potion", 298)))
 check(f"a trip to town doesn't count: only what's used after carrying on ({s.potions.used})", s.potions.used == {"Red Potion": 2})
 
 s = session()
 gains(s, 10)
-s.look_at_bar(bar(("Red Potion", 100)))
-s.look_at_bar(bar(("Red Potion", 99)))
+seen(s, bar(("Red Potion", 100)))
+seen(s, bar(("Red Potion", 99)))
 check("nothing counts before Start", not s.potions.used)
 s.start(clock[0])
-s.look_at_bar([])
-s.look_at_bar(bar(("Scroll", None)))
+seen(s, bar())
+seen(s, bar(("Scroll", None)))
 check("a bar with no consumables (or no readable count) does nothing", not s.potions.used)
 
 s = session()
 s.start(clock[0])
 gains(s, 30)
-s.look_at_bar(bar(("Red Potion", 100)))
-s.look_at_bar(bar(("Red Potion", 6)))               # a misread, or a real flood of use?
-s.look_at_bar(bar(("Red Potion", 100)))
+seen(s, bar(("Red Potion", 100)))
+seen(s, bar(("Red Potion", 6)))               # a misread, or a real flood of use?
+seen(s, bar(("Red Potion", 100)))
 check(f"a big drop that doesn't last is a misread, not use ({s.potions.used})", not s.potions.used)
-s.look_at_bar(bar(("Red Potion", 60)))
-s.look_at_bar(bar(("Red Potion", 60)))
+seen(s, bar(("Red Potion", 60)), 15)                  # (40 in 15 s is something drinking can do)
+seen(s, bar(("Red Potion", 60)))
 check(f"a big drop that is seen again is use ({s.potions.used})", s.potions.used == {"Red Potion": 40})
 
 s = session()
 s.start(clock[0])
 gains(s, 30)
-s.look_at_bar(bar(("Red Potion", 100), ("Orange Potion", 50), ("Blue Potion", 80), ("Mystery Food", 9)))
-s.look_at_bar(bar(("Red Potion", 97), ("Orange Potion", 48), ("Blue Potion", 79), ("Mystery Food", 8)))
+seen(s, bar(("Red Potion", 100), ("Orange Potion", 50), ("Blue Potion", 80), ("Mystery Food", 9)))
+seen(s, bar(("Red Potion", 97), ("Orange Potion", 48), ("Blue Potion", 79), ("Mystery Food", 8)))
 PRICES = {"Red Potion": 50, "Orange Potion": 150, "Blue Potion": 220}
 check(f"mesos spent on potions: each kind at its own price, an item with no price costs 0 ({s.potions.cost(PRICES)})",
       s.potions.cost(PRICES) == 3 * 50 + 2 * 150 + 220)
 check("no prices at all costs nothing", s.potions.cost({}) == 0)
+
+# ---- potion counting rules (v2): stacks, layout flips, out of sight, drinking speed, money windows
+import potion_bar  # noqa: E402
+
+
+def plook(layout="keyboard", **slots):
+    """A PotionLook from s<index>=(name, count): None is an empty slot, (name, None) an unreadable count."""
+    style = "keyboard" if layout == "keyboard" else "controller"
+    reads = tuple(potion_bar.SlotRead(int(k[1:]), None, style, *((v[0], "consumable", v[1]) if v else (None, "empty", None)))
+                  for k, v in slots.items())
+    return potion_bar.PotionLook(True, layout, "default", 1.0, reads)
+
+
+class Watch:
+    """A tracker with its own clock: look() moves it on `after` seconds (the overlay looks every 3 s)."""
+
+    def __init__(self):
+        self.t, self.now = potions.PotionTracker(), 1000.0
+
+    def look(self, look, after=3, counting=True, window=False):
+        self.now += after
+        self.t.observe(look, counting, self.now, window)
+        return self.t.used
+
+
+w = Watch()
+w.look(plook(s0=("Red Potion", 100), s1=("Red Potion", 50)))
+w.look(plook(s0=("Red Potion", 99), s1=("Red Potion", 48)))
+check(f"two look-alike stacks in one layout are each their own stack ({w.t.used})", w.t.used == {"Red Potion": 3})
+
+w = Watch()
+w.look(plook(s0=("Red Potion", 100), s1=("Blue Potion", 50)))
+w.look(plook("controller-cross", s3=("Red Potion", 99), s5=("Blue Potion", 50)))
+check(f"a flip to the other layout finds each stack by item and count: one Red used ({w.t.used})", w.t.used == {"Red Potion": 1})
+w.look(plook("controller-cross", s3=("Red Potion", 98), s5=("Blue Potion", 49)))
+w.look(plook(s0=("Red Potion", 98), s1=("Blue Potion", 49)))
+check(f"...and back again, nothing is lost or counted twice ({w.t.used})", w.t.used == {"Red Potion": 2, "Blue Potion": 1})
+w.look(plook(s0=("Red Potion", 97), s1=("Blue Potion", 49)))
+w.look(plook("controller-cross", s3=("Red Potion", 97), s5=("Blue Potion", 49)))
+check(f"...with the same stacks in the same slots each time ({w.t.used})", w.t.used == {"Red Potion": 3, "Blue Potion": 1})
+
+w = Watch()
+w.look(plook(s0=("Red Potion", 100), s1=("Red Potion", 50)))
+w.look(plook("controller-cross", s2=("Red Potion", 50), s4=("Red Potion", 99)))
+check(f"a flip with two look-alike stacks of different counts: the match is by count ({w.t.used})", w.t.used == {"Red Potion": 1})
+
+w = Watch()
+w.look(plook(s0=("Red Potion", 100), s1=("Red Potion", 50)))
+w.look(plook("controller-cross", s2=("Red Potion", 49), s3=("Red Potion", 99)))
+check(f"a flip with two look-alike stacks that both changed is ambiguous: nothing counts ({w.t.used})", not w.t.used)
+w.look(plook("controller-cross", s2=("Red Potion", 49), s3=("Red Potion", 98)))
+check(f"...and it starts over from there ({w.t.used})", w.t.used == {"Red Potion": 1})
+
+w = Watch()
+w.look(plook(s0=("Red Potion", 100), s1=("Blue Potion", 50)))
+w.look(plook("controller-cross", s3=("Blue Potion", 50)))                    # Red is out of sight
+w.look(plook("controller-cross", s3=("Blue Potion", 50)), after=6)
+w.look(plook("controller-cross", s3=("Blue Potion", 50), s4=("Red Potion", 97)))
+check(f"a stack out of sight keeps its count: the drop is counted when it returns ({w.t.used})", w.t.used == {"Red Potion": 3})
+
+w = Watch()
+w.look(plook(s0=("Red Potion", 100)))
+w.look(plook(s0=("Red Potion", None)))                                       # in its slot, count unreadable
+w.look(plook(s0=("Red Potion", 98)))
+check(f"an unreadable count keeps the old count ({w.t.used})", w.t.used == {"Red Potion": 2})
+
+w = Watch()
+w.look(plook("controller-cross", s2=("Red Potion", 100)))
+w.look(plook("controller-cross", s2=("Blue Potion", 50)))                    # the trigger's other set: new items, same spots
+w.look(plook("controller-cross", s2=("Red Potion", 99)))
+check(f"the same spot holding another item (the trigger's second set) isn't the old stack ({w.t.used})",
+      w.t.used == {"Red Potion": 1})
+
+w = Watch()
+w.look(plook(s0=("Red Potion", 100)))
+w.look(plook(s0=("Red Potion", 100), s1=("Red Potion", 100)))                # a second stack of the same item shows up
+w.look(plook(s0=("Red Potion", 99), s1=("Red Potion", 100)))
+check(f"a stack that shows up beside another of the same item is kept apart ({w.t.used})", w.t.used == {"Red Potion": 1})
+
+# two stacks of one item, one of them rising then falling (B01-1: a recorded 3-row bar; the replay's truth once lost one stack's drinks)
+w = Watch()
+for a, b in ((4, 19), (4, 18), (5, 18), (4, 18), (4, 17), (3, 17)):
+    w.look(plook(s1=("Blue Potion", a), s11=("Blue Potion", b)))
+check(f"two stacks of one item: every drop counts, a rise doesn't ({w.t.used})", w.t.used == {"Blue Potion": 4})
+
+# out of sight, then tracking is cut: pause, Reset, map change, idle pause (through the Session, which clears the tracker)
+for how in ("pause", "reset", "map", "idle"):
+    s = session()
+    s.start(clock[0])
+    gains(s, 30)
+    seen(s, bar(("Red Potion", 100)))
+    seen(s, bar())                                                              # the bar is out of sight
+    if how == "pause":
+        s.pause()
+    elif how == "reset":
+        s.reset()
+    elif how == "map":
+        s.map_seen("Henesys")
+        s.map_seen("Rocky Road II")
+    else:
+        clock[0] += 20
+        s.tick(clock[0])
+    seen(s, bar(("Red Potion", 94)))                                         # back, lower
+    if how in ("pause", "reset"):
+        for _ in range(2 if how == "reset" else 0):                         # (Reset forgets the level)
+            s.observe([(EXP0, round(EXP0 / 95700 * 100, 2))], True, clock[0])
+        s.start(clock[0])
+        gains(s, 30)
+    elif how == "map":
+        gains(s, 30)
+    else:
+        gains(s, 12)
+    seen(s, bar(("Red Potion", 94)))
+    seen(s, bar(("Red Potion", 93)))
+    check(f"out of sight across a {how}: what it lost meanwhile isn't counted, only what's used after ({s.potions.used})",
+          s.potions.used == {"Red Potion": 1})
+s = session()
+s.start(clock[0])
+gains(s, 30)
+seen(s, bar(("Red Potion", 100)))
+seen(s, bar())
+seen(s, bar(("Red Potion", 94)), 9)
+check(f"...but out of sight while tracking ran the whole time it is counted ({s.potions.used})", s.potions.used == {"Red Potion": 6})
+w = Watch()
+w.look(plook(s0=("Red Potion", 100)))
+w.look(plook(s0=("Red Potion", 99)), after=65)
+check(f"...unless no look at all was made for a long while (the game was closed) ({w.t.used})", not w.t.used)
+
+# drinking speed: a drop bigger than rate x time since the stack was last counted starts over
+w = Watch()
+w.look(plook(s0=("Red Potion", 100)))
+w.look(plook(s0=("Red Potion", 90)), after=1)                                # 10 in 1 s: too fast
+check(f"10 gone in one second isn't drinking ({w.t.used})", not w.t.used)
+w.look(plook(s0=("Red Potion", 78)), after=3)                                # 12 in 3 s is the limit
+w.look(plook(s0=("Red Potion", 78)), after=3)
+check(f"...12 in three seconds is, once seen twice ({w.t.used})", w.t.used == {"Red Potion": 12})
+w.look(plook(s0=("Red Potion", 65)), after=3)                                # 13 in 3 s: no
+check(f"...13 in three seconds isn't ({w.t.used})", w.t.used == {"Red Potion": 12})
+w = Watch()
+w.look(plook(s0=("Red Potion", 500)))
+w.look(plook("controller-cross", s1=("Blue Potion", 9)), after=600)
+w.look(plook(s0=("Red Potion", 255), s1=("Blue Potion", 9)), after=3)
+w.look(plook(s0=("Red Potion", 255), s1=("Blue Potion", 9)), after=3)
+check(f"even after ten minutes, no more than a minute of drinking can be counted ({w.t.used})", not w.t.used)
+
+# "26 for 326": a number misread by a digit never counts, however it repeats
+w = Watch()
+w.look(plook(s0=("Lemon", 326)))
+for n in (26, 26, 326, 26, 326, 26, 26, 26, 326):
+    w.look(plook(s0=("Lemon", n)))
+check(f"326 read as 26, once or repeatedly, is never use ({w.t.used})", not w.t.used)
+w.look(plook(s0=("Lemon", 325)))
+check(f"...and a real use afterwards still counts ({w.t.used})", w.t.used == {"Lemon": 1})
+w = Watch()
+w.look(plook(s0=("Lemon", 326)))
+w.look(plook(s0=("Lemon", 26)), after=60)
+w.look(plook(s0=("Lemon", 26)), after=60)
+check(f"...also with a long time between the looks ({w.t.used})", not w.t.used)
+
+# the mouse cursor over a count's last digits: 224 reads as 22 or 2 (a leading-digit prefix) and is never use
+w = Watch()
+w.look(plook(s0=("Lemon", 224)))
+for n in (22, 22, 2, 224, 224):                      # the cursor rests over two looks, moves on, comes off
+    w.look(plook(s0=("Lemon", n)))
+check(f"224 read as 22 and 2 while the cursor rests there is never use ({w.t.used})", not w.t.used)
+w.look(plook(s0=("Lemon", 223)))
+check(f"...and a real use afterwards still counts ({w.t.used})", w.t.used == {"Lemon": 1})
+w = Watch()
+w.look(plook(s0=("Lemon", 10)))
+w.look(plook(s0=("Lemon", 1)))
+w.look(plook(s0=("Lemon", 10)))
+check(f"10 read as 1 is never use, at the edge of two digits ({w.t.used})", not w.t.used)
+w = Watch()
+w.look(plook(s0=("Lemon", 13)))
+w.look(plook(s0=("Lemon", 1)), after=300)
+w.look(plook(s0=("Lemon", 13)), after=3)
+check(f"13 read as 1 after a long time out of sight is never use ({w.t.used})", not w.t.used)
+w = Watch()
+w.look(plook(s0=("Lemon", 13)))
+w.look(plook(s0=("Lemon", 1)))
+w.look(plook(s0=("Lemon", 0)))
+check(f"a real drink that ends on a prefix (13 to 1) is not counted: accepted cost, but later use is ({w.t.used})",
+      w.t.used == {"Lemon": 1})
+w = Watch()
+for n in (100, 99, 9):                               # 99 -> 9 is a prefix, 100 -> 99 is not
+    w.look(plook(s0=("Lemon", n)))
+check(f"only a leading-digit prefix re-bases: 100 to 99 counts, 99 to 9 does not ({w.t.used})", w.t.used == {"Lemon": 1})
+
+# a shop, storage or trade window starts everything over
+w = Watch()
+w.look(plook(s0=("Red Potion", 100), s1=("Blue Potion", 50)))
+w.look(plook(s0=("Red Potion", 95), s1=("Blue Potion", 50)), window=True)
+w.look(plook(s0=("Red Potion", 95), s1=("Blue Potion", 50)), window=True)
+w.look(plook(s0=("Red Potion", 94), s1=("Blue Potion", 50)))
+check(f"counts changing while a shop window is open aren't use, and counting goes on from there ({w.t.used})",
+      w.t.used == {"Red Potion": 1})
+w = Watch()
+w.look(plook(s0=("Red Potion", 100)))
+w.look(plook("controller-cross", s1=("Blue Potion", 50)), window=True)       # Red out of sight while a window is open
+w.look(plook(s0=("Red Potion", 94)))
+check(f"a stack out of sight during a money window starts over ({w.t.used})", not w.t.used)
+
+# 0 is a normal count; buying back up
+w = Watch()
+for n in (3, 2, 1, 0, 0):
+    w.look(plook(s0=("Red Potion", n)))
+check(f"a stack used up shows 0 and all of it counted ({w.t.used})", w.t.used == {"Red Potion": 3})
+w.look(plook(s0=("Red Potion", 50)))
+w.look(plook(s0=("Red Potion", 49)))
+check(f"...buying back up from 0 isn't use, the next drink is ({w.t.used})", w.t.used == {"Red Potion": 4})
+
+# the two-look confirmation and the undo
+w = Watch()
+w.look(plook(s0=("Red Potion", 100)))
+w.look(plook(s0=("Red Potion", 80)), after=15)
+check(f"a drop bigger than 10 waits for a second look ({w.t.used})", not w.t.used)
+w.look(plook(s0=("Red Potion", 80)))
+check(f"...and is use when seen again ({w.t.used})", w.t.used == {"Red Potion": 20})
+w = Watch()
+for n in (326, 320, 326):
+    w.look(plook(s0=("Lemon", n)))
+check(f"a small misread that is gone at the next look is taken back ({w.t.used})", sum(w.t.used.values()) == 0)
 
 # ---- potion prices: the shipped defaults, the player's own prices on top
 ITEMS = {"Red Potion": {"price": 50, "unpriced": False}, "Blue Potion": {"price": 220, "unpriced": False},
@@ -1676,19 +2047,19 @@ check(f"an idle pause and then leaving the map makes the mesos count stale ({s.w
 s = session()
 s.start(clock[0])
 gains(s, 30)
-s.look_at_bar(bar(("Lemon", 100)))
-s.look_at_bar([potions.Slot(1, 0, "Lemon", 100)])          # the stack dragged one slot to the right
-s.look_at_bar([potions.Slot(1, 0, "Lemon", 95)])
-s.look_at_bar(bar(("Lemon", 95)))                          # ...and back
-s.look_at_bar(bar(("Lemon", 95)))
+seen(s, bar(("Lemon", 100)))
+seen(s, slots_at({1: ("Lemon", 100)}))          # the stack dragged one slot to the right
+seen(s, slots_at({1: ("Lemon", 95)}))
+seen(s, bar(("Lemon", 95)))                          # ...and back
+seen(s, bar(("Lemon", 95)))
 check(f"a stack moved and moved back counts only what was used ({s.potions.used})", s.potions.used == {"Lemon": 5})
 s = session()
 s.start(clock[0])
 gains(s, 30)
 for n in (326, 320, 326):
-    s.look_at_bar(bar(("Lemon", n)))
+    seen(s, bar(("Lemon", n)))
 check(f"a count misread lower for one look, then back, is no use ({s.potions.used})", sum(s.potions.used.values()) == 0)
-s.look_at_bar(bar(("Lemon", 325)))
+seen(s, bar(("Lemon", 325)))
 check("...a real use afterwards still counts", sum(s.potions.used.values()) == 1)
 
 log, _ = new_log()
@@ -1790,6 +2161,88 @@ tr = pct_tracker(56, 25.0)
 tr.observe_percent(26.0, 56, "badge")
 res = tr.observe_percent(10.0, 56, "badge")
 check(f"...but a % that falls with the same level is still no level-up ({res})", tr.levels == 0)
+
+# ---- a party size never read (the list covered or unreadable since the start): runs stay on this PC (0.9.15, Q10)
+log, path = new_log()
+t, _ = farm(log, 0, 1000, party_read=False)
+check(f"a run whose party size was never read is saved, marked, and never shared ({len(log.runs)} runs)",
+      log.runs and all(r.get("party_unread") for r in log.runs) and log.unshared_runs() == [])
+check("...an older overlay can't share it either (its seal doesn't verify)",
+      all(r["seal"] == "party_unread" and not log.sealed(r, m._SEALED_RUN) for r in log.runs))
+log.save()
+again = m.AutoLog(15, path, path.with_suffix(".txt"))
+check("...and it survives saving and loading", again.runs and all(r.get("party_unread") for r in again.runs)
+      and again.unshared_runs() == [])
+log, _ = new_log()
+t, _ = farm(log, 0, 300, party_read=False)
+t, _ = farm(log, t, 700)                                     # the list is read (the same size) before the run ends
+check("a party size read before the run's end makes it shareable as usual",
+      log.runs and len(log.unshared_runs()) == len(log.runs) and not any(r.get("party_unread") for r in log.runs))
+log, _ = new_log()
+t, _ = farm(log, 0, 1000, estimated=True, party_read=False)
+check("estimated and party never read: kept the estimated seal, both marks, never shared",
+      log.runs and all(r["seal"] == "estimated" and r.get("party_unread") and r.get("estimated") for r in log.runs)
+      and log.unshared_runs() == [])
+
+# ---- No Reset (0.9.16, N02): runs stay on this PC; one log line covers every map ("Map A/Map B")
+A, B = "Rocky Road II", "The Swamp of Despair I"
+
+
+def cross(log, t, seconds, every=120, **kw):
+    """Farms on A and B in turn (every `every` seconds), EXP never stopping."""
+    end, i, logged = t + seconds, 0, []
+    while t < end:
+        t, got = farm(log, t, min(every, end - t), map_name=(A, B)[i % 2], **kw)
+        logged += got
+        i += 1
+    return t, logged
+
+
+log, _ = new_log()
+t, logged = cross(log, 0, 700)
+check(f"without No Reset, maps changed every 2 minutes log nothing (as before: {logged})", not logged and not log.runs)
+log, path = new_log()
+log.set_no_reset(True)
+t, logged = cross(log, 0, 1000)
+maps = {e["map"] for e in log.entries}
+check(f"No Reset: one log line covers both maps ({maps})", logged and maps == {f"{A}/{B}"}
+      and all(log.sealed(e) for e in log.entries))
+check(f"...the run covers both maps, is marked, sealed so nothing can share it ({[r.get('map') for r in log.runs]})",
+      len(log.runs) == 1 and log.runs[0]["map"] == f"{A}/{B}" and log.runs[0].get("no_reset")
+      and log.runs[0]["seal"] == "no_reset" and not log.sealed(log.runs[0], m._SEALED_RUN)
+      and log.unshared_runs() == [] and log.pending is None)
+check("...and it counts as a run done there", log.runs_done(f"{A}/{B}", 1, None) == 1)
+log.save()
+again = m.AutoLog(15, path, path.with_suffix(".txt"))
+check("...it survives saving and loading, still never shared", again.runs and again.unshared_runs() == []
+      and again.entries == log.entries and not list(path.parent.glob("exp_log.damaged-*")))
+check("a 'Map A/Map B' line is never taken as the name of the map you're on",
+      log.canonical(A) == A and log.canonical(f"{A}/{B}x") == f"{A}/{B}x")
+log, _ = new_log()
+log.set_no_reset(True)
+t, _ = farm(log, 0, 100)
+log.set_no_reset(False)                              # switched off during the run
+t, _ = farm(log, t, 1750)
+check(f"switched off during a run: that run stays on this PC, the next one is shared as usual "
+      f"({[r.get('no_reset') for r in log.runs]})",
+      len(log.runs) == 2 and log.runs[0].get("no_reset") and not log.runs[1].get("no_reset")
+      and log.unshared_runs() == [log.runs[1]])
+log, _ = new_log()
+t, _ = farm(log, 0, 300)
+log.set_no_reset(True)                               # switched on during a run, then off again at once
+log.set_no_reset(False)
+t, _ = farm(log, t, 700)
+check("switched on during a run (even for a moment): that run stays on this PC",
+      len(log.runs) == 1 and log.runs[0].get("no_reset") and log.unshared_runs() == [])
+log, _ = new_log()
+log.set_no_reset(True)
+t, _ = farm(log, 0, 1000, estimated=True)
+check("No Reset and estimated: the estimated seal stays (both marks, never shared)",
+      log.runs and log.runs[0]["seal"] == "estimated" and log.runs[0].get("no_reset") and log.unshared_runs() == [])
+long = ["Some Very Long Map Name Number %d In Victoria Island" % i for i in range(9)]
+label = m.AutoLog._maps_label(long)
+check(f"a line over many maps keeps its map name within the log's 200 characters ({len(label)})",
+      len(label) <= 200 and label.startswith(long[0]))
 
 # ---- EXP estimated from a % alone stays on this PC: marked in the log, never shared
 log, path = new_log()
@@ -2012,6 +2465,103 @@ except AssertionError:
     quiet = False
 m.urllib.request.urlopen = real_urlopen
 check("the update check doesn't go online while MAPLE_EXP_DATA is set", quiet)
+
+# ---- B08: a log saved with a BOM (Notepad), hand-edited potion counts, a misread's gain taken back
+log, path = new_log()
+log._add("Rocky Road II", 27, 1, 1000, 300, 0, 0)
+path.write_text("﻿" + path.read_text(encoding="utf-8"), encoding="utf-8")
+log2 = m.AutoLog(15, path, path.with_suffix(".txt"))
+check("a log with a BOM in front still loads (its lines aren't lost)", len(log2.entries) == 1)
+check("...and no copy was kept as 'damaged'", not list(path.parent.glob("exp_log.damaged-*.json")))
+
+# ---- a log that can't be read for a moment (antivirus or OneDrive holding it) is never saved over
+log, path = new_log()
+log._add("Rocky Road II", 27, 1, 1000, 300, 0, 0)
+m.AutoLog(15, path, path.with_suffix(".txt"))._add("Ant Tunnel I", 27, 1, 500, 300, 0, 0)    # another writer adds a line
+real_read, locked = m.Path.read_text, [True]
+
+
+def locked_read(self, *a, **k):
+    if self == path and locked[0]:
+        raise PermissionError(13, "The process cannot access the file")
+    return real_read(self, *a, **k)
+
+
+m.Path.read_text = locked_read
+try:
+    log._add("Sleepy Wood", 27, 1, 700, 300, 0, 0)
+    on_disk = sorted(e["map"] for e in json.loads(real_read(path, encoding="utf-8"))["entries"])
+    check("a log that can't be read right now isn't saved over (the other writer's line stays)",
+          on_disk == ["Ant Tunnel I", "Rocky Road II"])
+    check("...the change is kept in memory meanwhile", any(e["map"] == "Sleepy Wood" for e in log.entries))
+    locked[0] = False
+    log._add("Henesys Hunting Ground I", 27, 1, 100, 300, 0, 0)
+finally:
+    m.Path.read_text = real_read
+on_disk = sorted(e["map"] for e in json.loads(path.read_text(encoding="utf-8"))["entries"])
+check("...and once it reads again both changes land on the file, nothing of the other writer's lost",
+      on_disk == ["Ant Tunnel I", "Henesys Hunting Ground I", "Rocky Road II", "Sleepy Wood"])
+check("...and no copy was kept as 'damaged' for a file that was only busy",
+      not list(path.parent.glob("exp_log.damaged-*.json")))
+
+line = {"date": "2026-10-01", "map": "A", "level": 30, "party": 1, "exp": 5, "seconds": 3, "potion_cost": 5,
+        "potion_seconds": 3}
+check("a potions count that isn't a number leaves the line out", not m.AutoLog._valid(dict(line, potions={"Red": "a"})))
+check("...as does a potions entry that isn't a dict", not m.AutoLog._valid(dict(line, potions="Red")))
+check("potions counts that are numbers are fine", m.AutoLog._valid(dict(line, potions={"Red": 2})))
+check("a line with a number no play could reach (hand-edited) is left out, not shown as 300 digits",
+      not m.AutoLog._valid(dict(line, exp=1e300)) and not m.AutoLog._valid(dict(line, seconds=10**20)))
+tr = m.ExpTracker()
+tr.gained, tr._accum = -160, 120.0
+tr.samples.extend([(0, 100), (60, -60)])
+check("EXP/hr never shows below zero (a misread's gain taken back can dip it)",
+      tr.rate() == 0 and tr.rolling_rate() == 0)
+
+# ---- B11: a settings file saved with a BOM (Notepad), absurd hand-edited numbers
+real_config = m.CONFIG_PATH
+m.CONFIG_PATH = Path(tempfile.mkdtemp()) / "config.json"
+m.CONFIG_PATH.write_text("\ufeff" + json.dumps({"gap_seconds": 20, "ui_scale": 150, "share_health": True}), encoding="utf-8")
+cfg = m.load_config()
+check("settings saved with a BOM in front still load (they don't fall back to the defaults)",
+      (cfg["gap_seconds"], cfg["ui_scale"], cfg.get("share_health")) == (20, 150, True))
+m.CONFIG_PATH.write_text(json.dumps({"pos": [10**30, -10**30], "log_size": [10**9, 10**9], "mesos_box": [10**18] * 6,
+                                     "region": {"left": 0, "top": 0, "width": 10**12, "height": 10**12}, "mode": "region",
+                                     "seen_version": "9" * 10**6}), encoding="utf-8")
+cfg = m.load_config()
+check("absurd positions, sizes and boxes are dropped (a window can't be 10^9 wide)",
+      not any(k in cfg for k in ("pos", "log_size", "mesos_box", "region")) and cfg["mode"] == "window")
+check("an absurdly long version text is dropped", cfg["seen_version"] == "")
+m.CONFIG_PATH.write_text(json.dumps({"pos": [-1800, 40], "log_size": [900, 600], "mesos_box": [1, 2, 3, 4, 5, 6],
+                                     "region": {"left": -1920, "top": 0, "width": 800, "height": 600}, "mode": "region"}), encoding="utf-8")
+cfg = m.load_config()
+check("real positions (even off to the left, on another screen) are kept",
+      cfg["pos"] == [-1800, 40] and cfg["log_size"] == [900, 600] and cfg["region"]["left"] == -1920 and cfg["mode"] == "region")
+m.CONFIG_PATH = real_config
+
+# ---- a PC set to a language with a decimal comma (German, French...) shows the same numbers and dates
+import locale  # noqa: E402
+old_locale = locale.setlocale(locale.LC_ALL)
+locale_entry = {"date": "2026-03-08", "map": "Rocky Road II", "map_read": "Rocky Road II", "level": 27, "party": 1, "class": "Bandit",
+                "exp": 154290, "seconds": 3600.0, "mesos": 3210, "mesos_seconds": 3600.0}
+
+
+def shown_now():
+    return (m.fmt_num(1234567.5), m.fmt_short(1234567), m.fmt_eta(7500), m.fmt_dur(3725), m.format_entry(locale_entry),
+            m.log_row(locale_entry))
+
+
+plain = shown_now()
+other = None
+for name in ("German_Germany.1252", "de_DE.UTF-8", "French_France.1252", "fr_FR.UTF-8"):
+    try:
+        locale.setlocale(locale.LC_ALL, name)
+    except locale.Error:
+        continue
+    other = shown_now()
+    break
+locale.setlocale(locale.LC_ALL, old_locale)
+check("numbers and dates read the same under a decimal-comma language (or that language isn't installed here)",
+      plain[0] == "1,234,568" and plain[1] == "1.23M" and (other is None or other == plain))
 
 print("\nALL PASSED" if not failures else f"\n{failures} FAILED")
 sys.exit(1 if failures else 0)

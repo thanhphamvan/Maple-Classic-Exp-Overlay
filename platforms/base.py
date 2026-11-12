@@ -72,10 +72,6 @@ class Platform(ABC):
     """One OS. create_platform() picks the one the overlay is running on."""
 
     name = "?"
-    # True if a screenshot costs about the same at any size (macOS: the window server makes
-    # one of the whole screen each time). The overlay then takes one of the game window per
-    # look, and cuts the EXP bar, mesos and the rest out of it, instead of one shot of each.
-    flat_screenshot_cost = False
 
     def setup_process(self):
         """Called once at start, before any window or screenshot."""
@@ -125,11 +121,13 @@ class Platform(ABC):
     def client_rect(self, handle):
         """The game area of the window on screen, or None (also when it's minimized)."""
 
+    # True: capture_window pictures the game window alone, so nothing on top of it (this
+    # overlay included) is ever in the way.
     captures_window_alone = False
 
     def capture_window(self, handle, left, top, width, height):
-        """The window alone as a uint8 BGRA image in screen points, or None if unavailable.
-        Callers must also handle exceptions (permissions, missing APIs, or a vanished window)."""
+        """A screen rectangle inside that window as only the window shows it (an (h, w, 4) BGRA
+        array, like mss gives), or None if that can't be done right now."""
         return None
 
     # ---- sending input to the game (the KPQ macro); off unless a platform has it
