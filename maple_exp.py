@@ -1084,10 +1084,10 @@ class _DefaultTextOCR:
     """Follow the application backend unless a reader was given its own backend."""
     @property
     def available(self):
-        return tesseract_ok and TESS is not None
+        return tesseract_ok         # (the one switch upstream checks; main() sets TESS with it)
 
     def read_lines(self, images, chars=None):
-        return TESS.read_lines(images, chars) if self.available else [""] * len(images)
+        return TESS.read_lines(images, chars) if self.available and TESS is not None else [""] * len(images)
 
 
 def _default_text_ocr():
